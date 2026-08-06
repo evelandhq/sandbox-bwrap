@@ -214,17 +214,18 @@ production topology uses the unprivileged systemd path below.
 - `pnpm test` — unit tests, run anywhere, including macOS (process execution is
   injectable; no bwrap and no Linux needed). This is what CI runs on every push, and it
   includes the eve floor/latest compatibility typechecks.
-- `pnpm tsx src/integration/bwrap-backend-smoke.ts` — the contract test against **real**
-  bwrap. It must run on Linux, as an unprivileged user, on a host that has the AppArmor
-  profile loaded and `/workspace` created (see [Requirements](#requirements)). It prints
-  `BWRAP SMOKE OK` on success. Running it under systemd's deployed-agent constraints
-  (`NoNewPrivileges=yes`, `ProtectSystem=strict`) is the configuration this backend is
-  designed for and the one worth reproducing when you change anything in `src/process.ts`
-  or `src/args.ts`.
-
-Eveland drives that same smoke test inside a Lima VM as part of its own systemd
-integration suite; if you are changing this backend for Eveland, running it there
-exercises the deploy-host path end to end.
+- `bash infra/smoke.sh` — the contract test against **real** bwrap, on macOS or Linux.
+  It provisions a Lima VM (`brew install lima`), streams this worktree in, and runs the
+  test as an unprivileged user under the systemd hardening a deployed eve agent actually
+  gets — `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`. Prints
+  `BWRAP SMOKE OK`. Run this before pushing anything that touches `src/args.ts` or
+  `src/process.ts`: CI's smoke job covers the unprivileged-user case but not the systemd
+  constraints, and argv that looks right is not the same as a kernel that accepts it.
+- `pnpm tsx src/integration/bwrap-backend-smoke.ts` — the same test, run directly. Needs
+  a Linux host that already has the AppArmor profile loaded and `/workspace` created
+  (see [Requirements](#requirements)), and should be run as an unprivileged user: root
+  is exempt from the userns sysctl, so a root-only pass proves nothing about a real
+  deployment.
 
 ## License
 

@@ -1,0 +1,79 @@
+# Lima VM for the real-bwrap contract test.
+# Start via infra/smoke.sh, which also streams the source in and runs the test.
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+cpus: 2
+memory: "4GiB"
+disk: "20GiB"
+# No host filesystem is exposed to the guest. infra/smoke.sh streams the
+# repository's tracked, non-ignored files over stdin instead, so host state
+# outside this repository never enters the VM.
+mounts: []
+# States the intent, but do not rely on it: Lima 2.1.4 injects the proxy into
+# the guest's /etc/environment regardless of this setting. The provision script
+# below is what actually removes it.
+propagateProxyEnv: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+
+      # Lima copies the host's proxy settings into /etc/environment (inside
+      # #LIMA-START/#LIMA-END markers) at VM creation, rewriting a loopback
+      # address to the host gateway -- 127.0.0.1:8118 becomes 192.168.5.2:8118.
+      # A host-local proxy is not reachable from the guest, so every apt and
+      # curl below then dies with "Could not connect to 192.168.5.2:8118" and
+      # the VM still reports READY; the first visible symptom is a much later
+      # "corepack: command not found", which reads like a broken image rather
+      # than a host setting. propagateProxyEnv: false does not prevent this in
+      # Lima 2.1.4, so strip it here instead: from /etc/environment, and from
+      # this script's own environment since it already inherited the values.
+      # `limactl shell` still injects them per session, but infra/smoke.sh runs
+      # everything through sudo, which resets the environment.
+      # The guest reaches the internet through Lima's NAT directly.
+      sed -i '/proxy=/Id' /etc/environment
+      unset http_proxy https_proxy ftp_proxy no_proxy
+      unset HTTP_PROXY HTTPS_PROXY FTP_PROXY NO_PROXY
+
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y apparmor bash bubblewrap ca-certificates curl
+      curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+      apt-get install -y nodejs
+      corepack enable
+
+      # The test must run as an unprivileged user: root is exempt from the
+      # userns sysctl below, so running it as root would pass while a real
+      # deployment fails.
+      id sandbox-test || useradd --system --user-group \
+        --home-dir /var/lib/sandbox-test --create-home sandbox-test
+
+      # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, which
+      # blocks an *unconfined* non-root process from creating a user namespace
+      # -- exactly what this backend does. The apt bubblewrap package
+      # (0.9.0-1ubuntu0.1) ships no AppArmor profile, so bwrap fails with
+      # "setting up uid map: Permission denied" unless one is installed that
+      # permits userns creation. `apparmor_parser -r` replaces an already-loaded
+      # profile, so re-provisioning is safe.
+      cat > /etc/apparmor.d/bwrap <<'EOF'
+      abi <abi/4.0>,
+      include <tunables/global>
+
+      profile bwrap /usr/bin/bwrap flags=(unconfined) {
+        userns,
+
+        # Site-specific additions and overrides. See local/README for details.
+        include if exists <local/bwrap>
+      }
+      EOF
+      apparmor_parser -r -W /etc/apparmor.d/bwrap
+
+      # `bwrap --bind <dir> /workspace` needs /workspace to already exist: the
+      # argv ro-binds `/` first, so bwrap cannot mkdir the bind destination
+      # itself ("Can't mkdir /workspace: Read-only file system"). Ubuntu ships
+      # no /workspace. `install -d` is idempotent.
+      install -d -m 0755 /workspace

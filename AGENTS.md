@@ -76,10 +76,19 @@ pnpm lint && pnpm fmt:check && pnpm typecheck && pnpm test && pnpm build
 
 That is exactly what CI runs, minus the two jobs that need Linux or a registry:
 
-- `pnpm tsx src/integration/bwrap-backend-smoke.ts` — real bwrap. Linux only,
-  unprivileged user, needs the AppArmor profile loaded and `/workspace` created
-  (see **Requirements** in `README.md`). Prints `BWRAP SMOKE OK`.
+- `bash infra/smoke.sh` — real bwrap in a Lima VM, run as an unprivileged user
+  under `NoNewPrivileges` / `ProtectSystem=strict` / `PrivateTmp`. Prints
+  `BWRAP SMOKE OK`. **Run this before pushing changes to `src/args.ts` or
+  `src/process.ts`.** CI's smoke job covers the unprivileged-user case, which is
+  the AppArmor/userns failure mode, but deliberately does not reproduce the
+  systemd hardening — this script is the only thing that does.
 - The `pack` job — packs the tarball and imports it from a clean project.
+
+Two things that make a real-bwrap pass meaningless if you get them wrong: run it
+as an unprivileged user (root is exempt from
+`kernel.apparmor_restrict_unprivileged_userns`, so root passes on a host where a
+deployment would fail), and do not skip the AppArmor profile (Ubuntu's
+bubblewrap package ships none).
 
 ## Releases
 

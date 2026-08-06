@@ -175,10 +175,20 @@ jobs:
       # the real binary. Ubuntu's packaged bubblewrap ships no AppArmor profile
       # and the runner image sets apparmor_restrict_unprivileged_userns=1, so
       # an unprivileged userns creator needs the same profile a deploy host does.
+      #
+      # `apparmor` is installed explicitly rather than assumed: it is what
+      # provides apparmor_parser, and a runner image that dropped it would fail
+      # this job for a reason that looks like a sandbox regression.
+      #
+      # This runs the test as the ordinary unprivileged runner user, which
+      # covers the AppArmor/userns interaction that actually breaks in practice.
+      # It does not reproduce the deployed-agent systemd hardening
+      # (NoNewPrivileges, ProtectSystem=strict); that dimension is covered by
+      # running the same test inside the Lima VM -- see AGENTS.md.
       - name: Provision bwrap prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y apparmor bubblewrap
           sudo install -d -m 0755 /workspace
           sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
           abi <abi/4.0>,
