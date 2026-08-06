@@ -30,8 +30,8 @@ bwrap as its unprivileged deployment user. The local Docker runtime installs bwr
 image and grants the outer container only the capabilities nested bwrap requires; the
 Agent container still receives no Docker socket. Local `eve dev` is untouched — it never runs
 the eveland build pipeline, so it falls back to eve's default backend chain (usually
-`just-bash`, or Docker where available). See `docs/deploy/linux.md` for what the build
-log looks like and what happens when the sandbox does not work on the host.
+`just-bash`, or Docker where available). See eveland's `docs/deploy/linux.md` for what the
+build log looks like and what happens when the sandbox does not work on the host.
 
 **Standalone use of this package** (outside eveland, or in any project that manages its
 own `agent/sandbox.ts`) still works the manual way:
@@ -49,24 +49,34 @@ export default defineSandbox({
 
 ### eve version requirement
 
-This package requires `eve` `>=0.27.0 <0.30.0` (eve's 0.x releases use
-caret-incompatible minor bumps, so the verified three-minor window is written explicitly).
-Compatibility is exercised against every exact release in Eveland's checked-in Eve compatibility policy. The backend implements the
-required `shutdown()` contract by killing every process the session has spawned that
-has not yet exited, honoring eve's requirement that nothing may be left running once
-the handle is shut down. The session's workspace directory is not touched by
-`shutdown()` — it is durable state and remains available when the session reattaches.
+This package requires `eve` `>=0.27.0 <1.0.0`.
+
+The range is deliberately wide. eve's 0.x releases use caret-incompatible minor bumps,
+so a package that pins a narrow window has to republish for every eve minor — which is
+churn for consumers, not safety, when the surface actually consumed is one small
+interface (`SandboxBackend` from `eve/sandbox`) that has been stable across the whole
+range. Rather than re-declaring the window, CI keeps the claim honest from both ends:
+`src/eve-compatibility.test.ts` typechecks the backend against the range's exact floor
+(0.27.13) and the newest verified release on every run, and a scheduled workflow re-runs
+the suite against `eve@latest` so a breaking eve minor shows up as a red build here
+instead of a bug report from your deployment.
+
+The backend implements the required `shutdown()` contract by killing every process the
+session has spawned that has not yet exited, honoring eve's requirement that nothing may
+be left running once the handle is shut down. The session's workspace directory is not
+touched by `shutdown()` — it is durable state and remains available when the session
+reattaches.
 
 ### Options
 
-| Option             | Default                              | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ------------------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `env`              | `{}`                                 | Environment variables set for every sandboxed command.                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `networkPolicy`    | `"allow-all"`                        | `"allow-all"` shares the host network; `"deny-all"` runs each command with no network (`--unshare-net`). `setNetworkPolicy` can switch between the two at run time; granular domain policies are rejected (use the Vercel backend for those).                                                                                                                                                                                                                                  |
-| `hidePaths`        | `[]`                                 | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `bwrapPath`        | `"bwrap"`                            | bwrap executable to invoke.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `cacheDir`         | `<appRoot>/.eve/sandbox-cache/bwrap` | Absolute directory holding templates and durable session workspaces. Pin this outside the release directory so a redeploy does not discard durable session state: since eve 0.22.0, eve keys session sandboxes per durable session, not per deployment, so an `appRoot`-derived default would silently destroy every session's `/workspace` on the next redeploy. The generated eveland module always sets this from `EVELAND_SANDBOX_CACHE_DIR` (see `docs/deploy/linux.md`). |
-| `templateRevision` | `null`                               | Optional immutable release identity included in the template cache key but not the session path. Change it when seed files change so new Sessions use a fresh template without overwriting durable workspaces. Eveland sets it from its internal `EVELAND_SANDBOX_TEMPLATE_REVISION`.                                                                                                                                                                                          |
+| Option             | Default                              | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `env`              | `{}`                                 | Environment variables set for every sandboxed command.                                                                                                                                                                                                                                                                                                                                                                                            |
+| `networkPolicy`    | `"allow-all"`                        | `"allow-all"` shares the host network; `"deny-all"` runs each command with no network (`--unshare-net`). `setNetworkPolicy` can switch between the two at run time; granular domain policies are rejected (use the Vercel backend for those).                                                                                                                                                                                                     |
+| `hidePaths`        | `[]`                                 | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                                                                                                                                        |
+| `bwrapPath`        | `"bwrap"`                            | bwrap executable to invoke.                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `cacheDir`         | `<appRoot>/.eve/sandbox-cache/bwrap` | Absolute directory holding templates and durable session workspaces. Pin this outside the release directory so a redeploy does not discard durable session state: since eve 0.22.0, eve keys session sandboxes per durable session, not per deployment, so an `appRoot`-derived default would silently destroy every session's `/workspace` on the next redeploy. The generated eveland module always sets this from `EVELAND_SANDBOX_CACHE_DIR`. |
+| `templateRevision` | `null`                               | Optional immutable release identity included in the template cache key but not the session path. Change it when seed files change so new Sessions use a fresh template without overwriting durable workspaces. Eveland sets it from its internal `EVELAND_SANDBOX_TEMPLATE_REVISION`.                                                                                                                                                             |
 
 ## How it works
 
@@ -168,8 +178,24 @@ production topology uses the unprivileged systemd path below.
   sysctl, but nothing here runs as root: eveland's systemd runtime runs both this
   backend (as the deployment user) and its own build sandbox (as a separate,
   unprivileged build user) as unconfined non-root userns creators, so both need the
-  same AppArmor grant. See `docs/deploy/linux.md` for the profile and the install
-  command.
+  same AppArmor grant. Save this as `/etc/apparmor.d/bwrap`:
+
+  ```
+  abi <abi/4.0>,
+  include <tunables/global>
+
+  profile bwrap /usr/bin/bwrap flags=(unconfined) {
+    userns,
+
+    # Site-specific additions and overrides. See local/README for details.
+    include if exists <local/bwrap>
+  }
+  ```
+
+  then load it with `apparmor_parser -r -W /etc/apparmor.d/bwrap` (safe to re-run; it
+  replaces an already-loaded profile). A distro whose bubblewrap package ships its own
+  profile, or a host with the sysctl disabled, needs none of this.
+
 - `/workspace` must pre-exist on the host as an empty directory. `bwrap` binds each
   session directory onto `/workspace` inside the sandbox but cannot create that mount
   destination itself, because the host root is bind-mounted read-only first
@@ -185,19 +211,21 @@ production topology uses the unprivileged systemd path below.
 
 ## Testing
 
-- `pnpm --filter @evelandhq/sandbox-bwrap test` — unit tests, run anywhere (process
-  execution is injectable; no bwrap needed).
-- `pnpm --filter @evelandhq/worker smoke:docker-sandbox` — local Docker end to end:
-  builds the fixture Release, runs the image self-check, starts the Agent, and drives
-  an HTTP turn whose `bash` tool writes and executes TypeScript in the durable cache.
-- `bash infra/integration/run.sh` — full contract test against real bwrap. The
-  script provisions a Lima VM from `infra/lima/eveland.yaml` (installing the
-  AppArmor profile and creating `/workspace`), then runs this package's contract
-  test as the unprivileged `eveland-app` user under deployed-agent systemd
-  constraints (`NoNewPrivileges`, `ProtectSystem=strict`). A clean-VM run prints
-  both `SMOKE OK` (the systemd deploy smoke test) and `BWRAP SMOKE OK` (this
-  package's contract test).
+- `pnpm test` — unit tests, run anywhere, including macOS (process execution is
+  injectable; no bwrap and no Linux needed). This is what CI runs on every push, and it
+  includes the eve floor/latest compatibility typechecks.
+- `pnpm tsx src/integration/bwrap-backend-smoke.ts` — the contract test against **real**
+  bwrap. It must run on Linux, as an unprivileged user, on a host that has the AppArmor
+  profile loaded and `/workspace` created (see [Requirements](#requirements)). It prints
+  `BWRAP SMOKE OK` on success. Running it under systemd's deployed-agent constraints
+  (`NoNewPrivileges=yes`, `ProtectSystem=strict`) is the configuration this backend is
+  designed for and the one worth reproducing when you change anything in `src/process.ts`
+  or `src/args.ts`.
+
+Eveland drives that same smoke test inside a Lima VM as part of its own systemd
+integration suite; if you are changing this backend for Eveland, running it there
+exercises the deploy-host path end to end.
 
 ## License
 
-This package is licensed under the MIT License.
+Apache-2.0. See [LICENSE](./LICENSE).

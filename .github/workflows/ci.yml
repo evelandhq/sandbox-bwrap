@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Check formatting
+        run: pnpm fmt:check
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Covers src/eve-compatibility.test.ts, whose type annotations are what
+      # actually prove the backend still satisfies SandboxBackend on both ends
+      # of the declared peer range.
+      - name: Typecheck
+        run: pnpm typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+  pack:
+    name: Pack contract (eve ${{ matrix.eve }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of the declared peer range, resolved from npm exactly as a
+        # consumer would get them. The typecheck job proves structural
+        # compatibility; this proves the *runtime* import works, which is a
+        # separate claim -- dist/backend.js imports a value from eve/sandbox
+        # (SandboxTemplateNotProvisionedError), so a peer that typechecks could
+        # still fail to load.
+        eve: ["0.27.13", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The published package must stay installable straight from a registry
+      # tarball: prepack builds dist, then the tarball is installed into a clean
+      # project (the eve peer resolves from npm) and imported. Eveland vendors
+      # this package's dist/ into every Release it builds, so a tarball missing
+      # dist/ or with a broken exports map would break deploys, not just imports.
+      - name: Pack
+        run: pnpm pack --pack-destination /tmp/sandbox-bwrap-pack
+
+      # The smoke test is a file, not `node -e`: eve's package internals call
+      # createRequire() during module init, which throws on the `[eval]`
+      # pseudo-filename `node -e` supplies. That would fail here for a reason
+      # having nothing to do with this package.
+      - name: Install the tarball into a clean project and import it
+        run: |
+          mkdir -p /tmp/pack-smoke && cd /tmp/pack-smoke
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "eve@${{ matrix.eve }}" /tmp/sandbox-bwrap-pack/evelandhq-sandbox-bwrap-*.tgz
+          node -p "'resolved eve: ' + require('./node_modules/eve/package.json').version"
+          cat > smoke.mjs <<'EOF'
+          import { bwrap, isBwrapAvailable, createBwrapSandboxBackend } from "@evelandhq/sandbox-bwrap";
+
+          if (typeof bwrap !== "function") throw new Error("bwrap export missing");
+          if (typeof isBwrapAvailable !== "function") throw new Error("isBwrapAvailable export missing");
+          if (createBwrapSandboxBackend().name !== "bwrap") throw new Error("backend name changed");
+          console.log("pack import ok");
+          EOF
+          node smoke.mjs
+
+  smoke:
+    name: bwrap contract (real binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The unit suite injects the process runner, so nothing above ever
+      # executes bwrap. This job is the only place the real argv is handed to
+      # the real binary. Ubuntu's packaged bubblewrap ships no AppArmor profile
+      # and the runner image sets apparmor_restrict_unprivileged_userns=1, so
+      # an unprivileged userns creator needs the same profile a deploy host does.
+      - name: Provision bwrap prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo install -d -m 0755 /workspace
+          sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+
+            # Site-specific additions and overrides. See local/README for details.
+            include if exists <local/bwrap>
+          }
+          PROFILE
+          sudo apparmor_parser -r -W /etc/apparmor.d/bwrap
+          bwrap --ro-bind / / --unshare-pid true && echo "bwrap userns ok"
+
+      - name: Run the bwrap contract test
+        run: pnpm tsx src/integration/bwrap-backend-smoke.ts

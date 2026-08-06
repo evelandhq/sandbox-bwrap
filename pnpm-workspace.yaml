@@ -1,0 +1,9 @@
+allowBuilds:
+  esbuild: true
+
+# eve is this package's whole reason to exist, and its 0.x line ships often. The
+# excluded entry is the package name, not a pinned version, so bumping the eve
+# devDependency never has to touch this file -- the same churn the wide peer
+# range in package.json exists to avoid.
+minimumReleaseAgeExclude:
+  - eve
