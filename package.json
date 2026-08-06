@@ -35,7 +35,7 @@
     "fmt:check": "oxfmt --check",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
-    "prepack": "pnpm build"
+    "prepack": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",

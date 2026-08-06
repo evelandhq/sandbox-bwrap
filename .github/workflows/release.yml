@@ -1,21 +1,44 @@
 name: Release
 
+# Two steps, deliberately separated by a human.
+#
+# release-please watches conventional commits on main and keeps ONE open pull
+# request that bumps the version and writes CHANGELOG.md. Nothing is published
+# while that PR sits there. Merging it is the decision to release: that merge
+# tags the commit, cuts a GitHub release, and only then does `publish` run.
+#
+# Publishing uses npm trusted publishing (OIDC), so there is no NPM_TOKEN to
+# store, rotate or leak. The first publish of a package cannot come from here:
+# npm will not let you configure a trusted publisher for a package that does
+# not exist yet, so 0.1.0 is published by hand and everything after is
+# automatic. See the Releases section in AGENTS.md.
 on:
   push:
     branches: [main]
+  # So a release can be re-attempted if the publish job fails after the tag was
+  # already cut. release-please is idempotent: it will not re-release a version
+  # whose tag already exists.
   workflow_dispatch:
 
+# Least privilege at the top; each job widens only what it needs.
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release-please:
+    name: Maintain the release PR
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+      released: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -25,36 +48,56 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
   publish:
+    name: Publish to npm
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: needs.release-please.outputs.released == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Required for npm provenance, which ties the published tarball to this
-      # workflow run. Provenance also requires package.json's repository.url to
-      # match this repository.
+      # The whole point: this is what lets npm verify the workflow's identity
+      # over OIDC, so no long-lived token is involved. It also makes npm attach
+      # a provenance attestation on its own -- this repo and package are both
+      # public, which is the condition for that. Do not add --provenance; that
+      # flag is for token-based publishing and conflicts with this.
       id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          # The tag release-please just cut, not whatever main has moved on to.
+          ref: ${{ needs.release-please.outputs.tag }}
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: pnpm
           registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      # Trusted publishing needs npm >= 11.5.1, which is newer than what the
+      # Node 24 image happens to bundle. Pinning it here rather than trusting
+      # the runner image means a runner update cannot silently break publishing.
+      # Only the publish call uses npm; dependencies stay on pnpm's lockfile.
+      - name: Use an npm that speaks OIDC
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # `prepack` builds dist/ -- the tarball's only shipped code. CI's pack job
-      # already proved this tarball installs and imports from a clean project.
-      - name: Publish to npm
-        run: pnpm publish --provenance --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # `prepack` runs the build, so dist/ is produced from this exact tag.
+      # CI's pack job already proved this tarball installs and imports from a
+      # clean project against both ends of the eve peer range.
+      - name: Publish
+        run: npm publish --access public
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published \`@evelandhq/sandbox-bwrap@${{ needs.release-please.outputs.version }}\`"
+            echo
+            echo "- tag: \`${{ needs.release-please.outputs.tag }}\`"
+            echo "- https://www.npmjs.com/package/@evelandhq/sandbox-bwrap"
+          } >> "$GITHUB_STEP_SUMMARY"

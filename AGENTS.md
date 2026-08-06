@@ -92,9 +92,25 @@ bubblewrap package ships none).
 
 ## Releases
 
-Conventional commits drive release-please, which opens a release PR. Merging it
-tags the release, and the `publish` job publishes to npm with provenance. Do not
-hand-edit `version` in `package.json` or `.release-please-manifest.json`.
+Conventional commits drive release-please, which keeps one open release PR.
+Nothing publishes while that PR sits there; merging it is the decision to
+release. The merge tags the commit and cuts a GitHub release, and only then does
+the `publish` job run. Do not hand-edit `version` in `package.json` or
+`.release-please-manifest.json`.
 
-`prepack` builds `dist/`, which is the only code the tarball ships — `src/` is
-not published.
+`prepack` builds `dist/`, the only code the tarball ships — `src/` is not
+published. It is deliberately written as `npm run build`, not `pnpm build`,
+because `npm publish` is what triggers it.
+
+Publishing uses **npm trusted publishing (OIDC)**. There is no `NPM_TOKEN`
+anywhere, and there should never be one: the `id-token: write` permission lets
+npm verify the workflow's identity directly, and npm attaches a provenance
+attestation on its own. Do not add `--provenance` to the publish command — that
+flag is for token-based publishing.
+
+The one thing this does not cover is the _first_ publish of a package name: npm
+will not let you configure a trusted publisher for a package that does not exist
+yet. So 0.1.0 was published by hand, trusted publishing was configured against
+this repo and `release.yml` afterwards, and every release since is automatic.
+If the package is ever unpublished and recreated, that bootstrap has to be
+repeated.
