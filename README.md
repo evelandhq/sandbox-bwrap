@@ -54,18 +54,24 @@ This package requires `eve` `>=0.27.0 <1.0.0`.
 The range is deliberately wide. eve's 0.x releases use caret-incompatible minor bumps,
 so a package that pins a narrow window has to republish for every eve minor — which is
 churn for consumers, not safety, when the surface actually consumed is one small
-interface (`SandboxBackend` from `eve/sandbox`) that has been stable across the whole
-range. Rather than re-declaring the window, CI keeps the claim honest from both ends:
+interface (`SandboxBackend` from `eve/sandbox`) that changes rarely. Rather than
+re-declaring the window, CI keeps the claim honest from both ends:
 `src/eve-compatibility.test.ts` typechecks the backend against the range's exact floor
 (0.27.13) and the newest verified release on every run, and a scheduled workflow re-runs
 the suite against `eve@latest` so a breaking eve minor shows up as a red build here
-instead of a bug report from your deployment.
+instead of a bug report from your deployment. That is not theoretical: eve 0.32.0 added a
+required `stop()` to the backend handle. This package implements it; 0.1.0 does not, and
+pairing that release with eve `>=0.32.0` resolves cleanly and then fails at runtime the
+first time authored code calls `ctx.getSandbox().stop()`.
 
-The backend implements the required `shutdown()` contract by killing every process the
-session has spawned that has not yet exited, honoring eve's requirement that nothing may
-be left running once the handle is shut down. The session's workspace directory is not
-touched by `shutdown()` — it is durable state and remains available when the session
-reattaches.
+The backend implements both handle lifecycle methods by killing every process the session
+has spawned that has not yet exited: `shutdown()`, which eve calls at server teardown and
+which requires that nothing be left running afterwards, and `stop()`, which authored code
+triggers mid-run through `ctx.getSandbox().stop()`. Backends with provider-side compute
+distinguish the two — a container to pause, a VM to snapshot; bwrap has no such resource,
+because the processes are the compute. Neither method touches the session's workspace
+directory — it is durable state, and remains available when the session reattaches or the
+next callback reopens it.
 
 ### Options
 
@@ -103,8 +109,8 @@ reattach when a session resumes. Each session key gets a directory that is reuse
 the lifetime of the session; each template is cached per (template key, options hash), with
 an optional release revision in the options hash,
 and reused across sessions. This backend intentionally does not prune either — its
-`shutdown()` method only kills the session's live processes and leaves the workspace on
-disk, so reattach is instant and stateless from the agent's perspective. On a long-lived
+`stop()` and `shutdown()` methods only kill the session's live processes and leave the
+workspace on disk, so reattach is instant and stateless from the agent's perspective. On a long-lived
 host, this means the cache will grow with the number of durable sessions and unique
 templates, consuming disk space indefinitely. On eveland deployments this cache lives at
 `EVELAND_SANDBOX_CACHE_DIR` (one subdirectory per project), outside every release

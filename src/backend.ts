@@ -145,6 +145,16 @@ export function createBwrapSandboxBackend(
         async captureState() {
           return { backendName: BWRAP_BACKEND_NAME, metadata: {}, sessionKey };
         },
+        // eve (>=0.32) calls this when authored code runs
+        // `ctx.getSandbox().stop()` mid-run: stop the compute, keep the durable
+        // session. Backends with provider-side compute distinguish this from
+        // shutdown() — a container to pause, a VM to snapshot. bwrap has no such
+        // resource: the processes are the compute and the workspace directory is
+        // the session, so stopping is killing the processes, and the next
+        // create() reopens the same workspace.
+        async stop() {
+          await session.killAll();
+        },
         // eve calls this when the server is shutting down: nothing may be left
         // running afterwards. The workspace directory IS the durable state, so
         // it stays on disk and the session reattaches on the next start.
