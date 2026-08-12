@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/evelandhq/sandbox-bwrap/compare/v0.1.0...v0.1.1) (2026-08-12)
+
+
+### Fixes
+
+* implement the SandboxBackend handle stop() eve 0.32 requires ([6c3ea76](https://github.com/evelandhq/sandbox-bwrap/commit/6c3ea76fd9c31a82fde5ff5143f3255bc27d5307))
+
 ## 0.1.0 (2026-08-06)
 
 
