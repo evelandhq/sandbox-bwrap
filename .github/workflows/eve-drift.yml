@@ -38,11 +38,14 @@ jobs:
         id: eve
         run: echo "version=$(npm view eve version)" >> "$GITHUB_OUTPUT"
 
-      # Deliberately not --frozen-lockfile and deliberately not committed: this
-      # job asks "does today's eve still work", it does not change what the
-      # package ships.
+      # The lockfile edit is deliberate and deliberately not committed: this job
+      # asks "does today's eve still work", it does not change what the package
+      # ships. `pnpm add` updates the lockfile on its own — passing
+      # --no-frozen-lockfile here fails the step outright under pnpm 11
+      # ("Unknown option: 'frozen-lockfile'"), which silently turned this whole
+      # check into a no-op that reported drift it had never looked for.
       - name: Install eve@${{ steps.eve.outputs.version }}
-        run: pnpm add -D "eve@${{ steps.eve.outputs.version }}" --no-frozen-lockfile
+        run: pnpm add -D "eve@${{ steps.eve.outputs.version }}"
 
       - name: Typecheck against the newest eve
         run: pnpm typecheck
