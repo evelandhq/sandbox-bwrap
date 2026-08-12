@@ -175,6 +175,54 @@ describe("create", () => {
     expect(await again.session.readTextFile({ path: "keep.txt" })).toBe("durable");
   });
 
+  /**
+   * eve calls `stop()` when authored code runs `ctx.getSandbox().stop()` mid-run,
+   * not at server teardown: the compute stops but the durable session must reopen
+   * on the next callback. For bwrap that is the same operation as `shutdown()` —
+   * the workspace directory _is_ the durable state — so what this pins is that
+   * `stop()` exists at all and does not take the workspace with it.
+   */
+  test("stop kills live processes and leaves the session reopenable", async () => {
+    const killed: number[] = [];
+    let pid = 0;
+    const runner: ProcessRunner = {
+      spawn() {
+        const id = ++pid;
+        const empty = () => new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+        return {
+          pid: id,
+          stdout: empty(),
+          stderr: empty(),
+          wait: async () => ({ exitCode: 0 }),
+          kill: async () => {
+            killed.push(id);
+          },
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-backend-stop-"));
+    const runtimeContext = { appRoot };
+    const backend = createBwrapSandboxBackend({ runner });
+    const handle = await backend.create({
+      templateKey: null,
+      sessionKey: "sess-stop",
+      runtimeContext,
+    });
+    await handle.session.writeTextFile({ path: "keep.txt", content: "durable" });
+    await handle.session.spawn({ command: "sleep 60" });
+
+    await handle.stop();
+    await handle.stop();
+
+    expect(killed).toEqual([1]);
+    const reopened = await backend.create({
+      templateKey: null,
+      sessionKey: "sess-stop",
+      runtimeContext,
+    });
+    expect(await reopened.session.readTextFile({ path: "keep.txt" })).toBe("durable");
+  });
+
   test("session state survives a change of appRoot when cacheDir is pinned", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "bwrap-redeploy-"));
     const cacheDir = path.join(root, "stable");

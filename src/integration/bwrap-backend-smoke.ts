@@ -198,6 +198,17 @@ async function main(): Promise<void> {
     ]);
     assert.equal(settled, "settled", "killed spawn must settle wait() promptly");
 
+    // stop() is the mid-run counterpart of shutdown(): the compute stops, the
+    // session stays usable. Spawn a sleeper, stop, and confirm both halves —
+    // the process is gone from the host and the same session still reads.
+    const stopSleeper = await session.spawn({ command: "sleep 300" });
+    const stopSleeperPid = stopSleeper.pid;
+    await session.writeTextFile({ path: "notes/stopped.txt", content: "survives stop" });
+    await handle.stop();
+    assert.ok(stopSleeperPid !== undefined, "spawn must expose a pid");
+    assert.equal(processIsAlive(stopSleeperPid), false, "stop() must kill spawned processes");
+    assert.equal(await session.readTextFile({ path: "notes/stopped.txt" }), "survives stop");
+
     // shutdown() must leave nothing running: spawn a sleeper, shut down, and
     // confirm the process is gone from the host.
     const sleeper = await session.spawn({ command: "sleep 300" });
