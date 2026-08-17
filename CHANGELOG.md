@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.1.3...v0.2.0) (2026-08-17)
+
+
+### Features
+
+* harden sandbox lifecycle and cache management ([#12](https://github.com/evelandhq/sandbox-bwrap/issues/12)) ([477dbac](https://github.com/evelandhq/sandbox-bwrap/commit/477dbac6157504351742a6d923b18d6ff636388f))
+
 ## [0.1.3](https://github.com/evelandhq/sandbox-bwrap/compare/v0.1.2...v0.1.3) (2026-08-17)
 
 

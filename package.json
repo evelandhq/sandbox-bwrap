@@ -1,6 +1,6 @@
 {
   "name": "@evelandhq/sandbox-bwrap",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "bubblewrap SandboxBackend for eve agents — real exec sandboxing without Docker or KVM",
   "keywords": [
     "agent",
