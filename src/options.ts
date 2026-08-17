@@ -3,6 +3,12 @@ import { createHash } from "node:crypto";
 /** Coarse egress control, matching what eve's Docker backend supports. */
 export type BwrapNetworkPolicy = "allow-all" | "deny-all";
 
+/** Options lifecycle hooks can apply when they open a template or live Session. */
+export interface BwrapSandboxUseOptions {
+  /** Network policy used by subsequent commands in this lifecycle callback. */
+  readonly networkPolicy?: BwrapNetworkPolicy;
+}
+
 /** Commands executed through `run()` are bounded by default; use `spawn()` for daemons. */
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
 

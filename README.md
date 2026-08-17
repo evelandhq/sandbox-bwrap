@@ -21,11 +21,12 @@ the sandbox module into the release directory at build time — `agent/sandbox.j
 agent, or `agent/sandbox/sandbox.js` when a sandbox folder exists, recursively for every
 subagent — and vendors this package's built output beside it, so agent projects never declare
 a deployment backend themselves. If a project shipped its own sandbox module, the build
-replaces that definition and reports it in the build log; authored `bootstrap()` and
-`onSession()` behavior is not used. The sibling `agent/sandbox/workspace/**` tree is preserved,
-so Eve still seeds those files into each Session's `/workspace`. Each Eveland Release supplies a
-distinct template revision, so Sessions created against a new Deployment see its updated seeds
-while existing durable Session workspaces remain untouched. The systemd runtime invokes
+wraps that definition and reports it in the build log: Eveland overrides only `backend`, while
+authored `bootstrap()`, `onSession()`, `description`, and `revalidationKey` remain active. The
+sibling `agent/sandbox/workspace/**` tree is preserved, so Eve still seeds those files into each
+Session's `/workspace`. Each Eveland Release supplies a distinct template revision, so Sessions
+created against a new Deployment see its updated seeds while existing durable Session workspaces
+remain untouched. The systemd runtime invokes
 bwrap as its unprivileged deployment user. The local Docker runtime installs bwrap inside the Agent
 image and grants the outer container only the capabilities nested bwrap requires; the
 Agent container still receives no Docker socket. Local `eve dev` is untouched — it never runs
@@ -85,11 +86,17 @@ next callback reopens it.
 | `templateRevision` | `null`                               | Optional immutable release identity included in the template cache key but not the session path. Change it when seed files change so new Sessions use a fresh template without overwriting durable workspaces. Eveland sets it from its internal `EVELAND_SANDBOX_TEMPLATE_REVISION`.                                                                                                                                                             |
 | `runTimeoutMs`     | `600000`                             | Hard wall-clock limit for one `run()` command. Timeout aborts the command and kills its complete bwrap process group. Set `null` to disable it. The limit deliberately does not apply to `spawn()`, which is the API for long-running processes.                                                                                                                                                                                                  |
 
+Both lifecycle callbacks may call `use({ networkPolicy: "allow-all" | "deny-all" })`. The
+policy is applied before `use()` returns the template or live Session, so subsequent commands in
+that callback use the requested network boundary. Calling `use()` without options keeps the
+backend's configured policy.
+
 ## How it works
 
-- **prewarm** (build time): runs the authored `bootstrap` inside bwrap against a
-  staging directory, resolves Eve's `$HOME/.agents/skills/**` seed paths to
-  `/workspace/.agents/skills/**`, writes seed files, then atomically renames it into
+- **prewarm** (build time): resolves Eve's `$HOME/.agents/skills/**` seed paths to
+  `/workspace/.agents/skills/**`, writes every seed into a staging directory, then runs the
+  authored `bootstrap` inside bwrap so it can consume those canonical inputs, before atomically
+  renaming the result into
   `<cacheDir>/templates/<hash>` (`<cacheDir>` defaults to
   `<appRoot>/.eve/sandbox-cache/bwrap` when the `cacheDir` option is not set). Idempotent
   per template key + options hash; `templateRevision` participates in that hash.

@@ -1,13 +1,17 @@
 import type { SandboxBackend } from "eve/sandbox";
 import { createBwrapSandboxBackend } from "./backend.js";
-import type { BwrapSandboxCreateOptions } from "./options.js";
+import type { BwrapSandboxCreateOptions, BwrapSandboxUseOptions } from "./options.js";
 
 export {
   BWRAP_BACKEND_NAME,
   createBwrapSandboxBackend,
   type CreateBwrapSandboxBackendInput,
 } from "./backend.js";
-export type { BwrapNetworkPolicy, BwrapSandboxCreateOptions } from "./options.js";
+export type {
+  BwrapNetworkPolicy,
+  BwrapSandboxCreateOptions,
+  BwrapSandboxUseOptions,
+} from "./options.js";
 export { DEFAULT_RUN_TIMEOUT_MS } from "./options.js";
 export { isBwrapAvailable } from "./process.js";
 export type { ProcessRunner, SpawnedProcess } from "./process.js";
@@ -25,6 +29,8 @@ export type { ProcessRunner, SpawnedProcess } from "./process.js";
  * });
  * ```
  */
-export function bwrap(options?: BwrapSandboxCreateOptions): SandboxBackend {
+export function bwrap(
+  options?: BwrapSandboxCreateOptions,
+): SandboxBackend<BwrapSandboxUseOptions, BwrapSandboxUseOptions> {
   return createBwrapSandboxBackend({ createOptions: options });
 }
