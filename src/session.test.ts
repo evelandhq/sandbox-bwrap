@@ -192,6 +192,74 @@ describe("run and spawn", () => {
 
     expect(receivedSignal).toBeUndefined();
   });
+
+  test("rejects run output that exceeds the combined byte limit and aborts the process", async () => {
+    let aborted = false;
+    const runner: ProcessRunner = {
+      spawn(_argv, spawnOptions): SpawnedProcess {
+        const signal = spawnOptions?.abortSignal;
+        if (!signal) throw new Error("run did not supply an abort signal");
+        signal.addEventListener("abort", () => (aborted = true), { once: true });
+        return {
+          pid: 11,
+          stdout: stringStream("12345"),
+          stderr: stringStream("6789"),
+          wait: async () =>
+            await new Promise<never>((_resolve, reject) => {
+              signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+            }),
+          kill: async () => {},
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-output-limit-"));
+    const workspaceDir = path.join(appRoot, "ws");
+    await mkdir(workspaceDir, { recursive: true });
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      appRoot,
+      runner,
+      options: resolveBwrapSandboxOptions({ maxOutputBytes: 8 }),
+    });
+
+    await expect(session.run({ command: "lots-of-output" })).rejects.toThrow(
+      "output exceeded 8 bytes",
+    );
+    expect(aborted).toBe(true);
+  });
+
+  test("rejects a new command when the generation reaches its process limit", async () => {
+    let resolveExit!: (value: { exitCode: number }) => void;
+    const exit = new Promise<{ exitCode: number }>((resolve) => (resolveExit = resolve));
+    const runner: ProcessRunner = {
+      spawn(): SpawnedProcess {
+        return {
+          pid: 12,
+          stdout: stringStream(""),
+          stderr: stringStream(""),
+          wait: async () => await exit,
+          kill: async () => resolveExit({ exitCode: 137 }),
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-process-limit-"));
+    const workspaceDir = path.join(appRoot, "ws");
+    await mkdir(workspaceDir, { recursive: true });
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      appRoot,
+      runner,
+      options: resolveBwrapSandboxOptions({ maxConcurrentProcesses: 1 }),
+    });
+
+    await session.spawn({ command: "first" });
+    await expect(session.spawn({ command: "second" })).rejects.toThrow(
+      "concurrent process limit of 1",
+    );
+    await session.killAll();
+  });
 });
 
 describe("network policy", () => {
@@ -296,17 +364,20 @@ describe("file I/O", () => {
 describe("killAll", () => {
   test("kills every process spawned by this session and is idempotent", async () => {
     const killed: number[] = [];
+    const exits = new Map<number, (value: { exitCode: number }) => void>();
     let pid = 0;
     const runner: ProcessRunner = {
       spawn(): SpawnedProcess {
         const id = ++pid;
+        const exit = new Promise<{ exitCode: number }>((resolve) => exits.set(id, resolve));
         return {
           pid: id,
           stdout: stringStream(""),
           stderr: stringStream(""),
-          wait: async () => ({ exitCode: 0 }),
+          wait: async () => await exit,
           kill: async () => {
             killed.push(id);
+            exits.get(id)?.({ exitCode: 137 });
           },
         };
       },
@@ -360,5 +431,137 @@ describe("killAll", () => {
     await session.killAll();
 
     expect(killed).toEqual([]);
+  });
+
+  test("a spawned process unregisters on actual exit even when its caller never waits", async () => {
+    const killed: number[] = [];
+    let resolveExit!: (value: { exitCode: number }) => void;
+    const exit = new Promise<{ exitCode: number }>((resolve) => (resolveExit = resolve));
+    const runner: ProcessRunner = {
+      spawn(): SpawnedProcess {
+        return {
+          pid: 8,
+          stdout: stringStream(""),
+          stderr: stringStream(""),
+          wait: async () => await exit,
+          kill: async () => {
+            killed.push(8);
+          },
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-auto-untrack-"));
+    const workspaceDir = path.join(appRoot, "ws");
+    await mkdir(workspaceDir, { recursive: true });
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      appRoot,
+      runner,
+      options: resolveBwrapSandboxOptions(),
+    });
+
+    await session.spawn({ command: "short" });
+    resolveExit({ exitCode: 0 });
+    await exit;
+    await new Promise((resolve) => setImmediate(resolve));
+    await session.killAll();
+
+    expect(killed).toEqual([]);
+  });
+
+  test("blocks spawn as soon as cleanup begins", async () => {
+    let finishKill!: () => void;
+    const killing = new Promise<void>((resolve) => (finishKill = resolve));
+    const runner: ProcessRunner = {
+      spawn(): SpawnedProcess {
+        return {
+          pid: 9,
+          stdout: stringStream(""),
+          stderr: stringStream(""),
+          wait: async () => await new Promise<{ exitCode: number }>(() => {}),
+          kill: async () => await killing,
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-stop-barrier-"));
+    const workspaceDir = path.join(appRoot, "ws");
+    await mkdir(workspaceDir, { recursive: true });
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      appRoot,
+      runner,
+      options: resolveBwrapSandboxOptions(),
+    });
+    await session.spawn({ command: "first" });
+
+    const stopping = session.killAll();
+    await expect(session.spawn({ command: "escaped" })).rejects.toThrow(/stopping/);
+    finishKill();
+    await stopping;
+    await expect(session.spawn({ command: "after-stop" })).rejects.toThrow(/stopped/);
+  });
+
+  test("reports cleanup failures and retries the still-live process", async () => {
+    let attempts = 0;
+    const runner: ProcessRunner = {
+      spawn(): SpawnedProcess {
+        return {
+          pid: 10,
+          stdout: stringStream(""),
+          stderr: stringStream(""),
+          wait: async () => await new Promise<{ exitCode: number }>(() => {}),
+          kill: async () => {
+            attempts += 1;
+            if (attempts === 1) throw new Error("kill denied");
+          },
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-cleanup-error-"));
+    const workspaceDir = path.join(appRoot, "ws");
+    await mkdir(workspaceDir, { recursive: true });
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      appRoot,
+      runner,
+      options: resolveBwrapSandboxOptions(),
+    });
+    await session.spawn({ command: "unkillable" });
+
+    await expect(session.killAll()).rejects.toThrow("kill denied");
+    await expect(session.killAll()).resolves.toBeUndefined();
+    expect(attempts).toBe(2);
+  });
+
+  test("does not report stopped until final cleanup notification succeeds", async () => {
+    let notifications = 0;
+    const runner: ProcessRunner = {
+      spawn(): SpawnedProcess {
+        throw new Error("no process expected");
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-stop-notification-"));
+    const workspaceDir = path.join(appRoot, "ws");
+    await mkdir(workspaceDir, { recursive: true });
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      appRoot,
+      runner,
+      options: resolveBwrapSandboxOptions(),
+      onStopped: async () => {
+        notifications += 1;
+        if (notifications === 1) throw new Error("lease removal denied");
+      },
+    });
+
+    await expect(session.killAll()).rejects.toThrow("lease removal denied");
+    expect(session.lifecycleState()).toBe("stopping");
+    await expect(session.killAll()).resolves.toBeUndefined();
+    expect(session.lifecycleState()).toBe("stopped");
+    expect(notifications).toBe(2);
   });
 });

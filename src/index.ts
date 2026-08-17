@@ -12,7 +12,28 @@ export type {
   BwrapSandboxCreateOptions,
   BwrapSandboxUseOptions,
 } from "./options.js";
-export { DEFAULT_RUN_TIMEOUT_MS } from "./options.js";
+export type {
+  BwrapCommandFinishReason,
+  BwrapSandboxEvent,
+  BwrapSandboxEventSink,
+} from "./events.js";
+export { listBwrapCache, listBwrapCacheLeases, pruneBwrapCache } from "./cache.js";
+export type {
+  BwrapCacheEntry,
+  BwrapCacheEntryKind,
+  BwrapCacheLocation,
+  BwrapCacheLease,
+  BwrapCacheMetadata,
+  BwrapCachePruneInput,
+  BwrapCachePrunePolicy,
+  BwrapCachePruneResult,
+  BwrapCloneStrategy,
+} from "./cache.js";
+export {
+  DEFAULT_MAX_CONCURRENT_PROCESSES,
+  DEFAULT_MAX_OUTPUT_BYTES,
+  DEFAULT_RUN_TIMEOUT_MS,
+} from "./options.js";
 export { isBwrapAvailable } from "./process.js";
 export type { ProcessRunner, SpawnedProcess } from "./process.js";
 

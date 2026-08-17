@@ -1,4 +1,5 @@
 import { createReadStream, existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
@@ -15,6 +16,11 @@ import {
   WORKSPACE_ROOT,
 } from "./paths.js";
 import type { ProcessRunner, SpawnedProcess } from "./process.js";
+import type {
+  BwrapCommandFinishReason,
+  BwrapSandboxEvent,
+  BwrapSandboxEventPayload,
+} from "./events.js";
 
 export interface CreateBwrapSessionInput {
   readonly id: string;
@@ -22,6 +28,9 @@ export interface CreateBwrapSessionInput {
   readonly appRoot: string;
   readonly runner: ProcessRunner;
   readonly options: ResolvedBwrapSandboxOptions;
+  readonly generationId?: string;
+  readonly tags?: Readonly<Record<string, string>>;
+  readonly onStopped?: () => void | Promise<void>;
 }
 
 function isMissingFileError(error: unknown): boolean {
@@ -32,13 +41,32 @@ function isMissingFileError(error: unknown): boolean {
   );
 }
 
-async function collectStream(stream: ReadableStream<Uint8Array>): Promise<string> {
+interface OutputBudget {
+  readonly limit: number | null;
+  used: number;
+}
+
+async function collectStream(
+  stream: ReadableStream<Uint8Array>,
+  budget: OutputBudget,
+  abort: (reason: Error) => void,
+): Promise<string> {
   const chunks: Uint8Array[] = [];
   const reader = stream.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      budget.used += value.byteLength;
+      if (budget.limit !== null && budget.used > budget.limit) {
+        const error = new Error(`bwrap sandbox: run output exceeded ${budget.limit} bytes`);
+        abort(error);
+        throw error;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
   }
   return Buffer.concat(chunks).toString("utf8");
 }
@@ -59,8 +87,12 @@ function sliceLines(text: string, startLine?: number, endLine?: number): string 
 function createRunAbortSignal(
   callerSignal: AbortSignal | undefined,
   timeoutMs: number | null,
+  outputSignal: AbortSignal,
 ): { signal: AbortSignal | undefined; clear(): void } {
-  if (timeoutMs === null) return { signal: callerSignal, clear() {} };
+  const signals = [outputSignal, ...(callerSignal ? [callerSignal] : [])];
+  if (timeoutMs === null) {
+    return { signal: AbortSignal.any(signals), clear() {} };
+  }
 
   const timeout = new AbortController();
   const timer = setTimeout(() => {
@@ -68,7 +100,7 @@ function createRunAbortSignal(
   }, timeoutMs);
   timer.unref?.();
   return {
-    signal: callerSignal ? AbortSignal.any([callerSignal, timeout.signal]) : timeout.signal,
+    signal: AbortSignal.any([...signals, timeout.signal]),
     clear: () => clearTimeout(timer),
   };
 }
@@ -81,11 +113,37 @@ function createRunAbortSignal(
 export type BwrapSession = SandboxSession & {
   /** Kills every process this session spawned that has not yet exited. Idempotent. */
   killAll(): Promise<void>;
+  /** Internal compute-generation state used to coordinate repeated handles. */
+  lifecycleState(): "running" | "stopping" | "stopped";
 };
 
 export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession {
   const { id, workspaceDir, appRoot, runner, options } = input;
+  const generationId = input.generationId ?? randomUUID();
+  const tags = input.tags ?? {};
   let networkPolicy: "allow-all" | "deny-all" = options.networkPolicy;
+
+  function emit(event: BwrapSandboxEventPayload) {
+    try {
+      const receipt = options.onEvent?.({
+        ...event,
+        timestamp: new Date().toISOString(),
+        sessionId: id,
+        generationId,
+        tags,
+      } as BwrapSandboxEvent);
+      if (
+        receipt !== null &&
+        typeof receipt === "object" &&
+        "then" in receipt &&
+        typeof receipt.then === "function"
+      ) {
+        void Promise.resolve(receipt).catch(() => {});
+      }
+    } catch {
+      // Observability is best effort and must never change sandbox behavior.
+    }
+  }
 
   const host = (path: string) => toHostPath(path, workspaceDir);
 
@@ -97,37 +155,114 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     return hostPath;
   }
 
-  const live = new Set<SpawnedProcess>();
+  type TrackedProcess = SpawnedProcess & {
+    terminate(reason: "killed" | "cleanup"): Promise<void>;
+  };
+  const live = new Set<TrackedProcess>();
+  let lifecycle: "running" | "stopping" | "stopped" = "running";
+  let cleanupPromise: Promise<void> | undefined;
+  let stoppedNotified = false;
 
-  // Wrap wait()/kill() rather than eagerly calling proc.wait() ourselves to
-  // watch for exit: a fire-and-forget wait() started at spawn time races
-  // ahead of the caller (its resolution is not tied to when anyone actually
-  // observes the process), so a process can be silently untracked before
-  // killAll() ever sees it. Tying removal to the caller's own wait()/kill()
-  // call keeps "still tracked" in sync with "still owned by the caller":
-  // run() untracks itself the moment its internal wait() settles, and a
-  // bare spawn() stays tracked (and killable) until its holder collects it.
-  function track(proc: SpawnedProcess): SpawnedProcess {
-    const wrapped: SpawnedProcess = {
-      pid: proc.pid,
-      stdout: proc.stdout,
-      stderr: proc.stderr,
-      async wait() {
-        try {
-          return await proc.wait();
-        } finally {
-          live.delete(wrapped);
+  emit({ type: "generation.started" });
+
+  function countedStream(
+    stream: ReadableStream<Uint8Array>,
+    onBytes: (count: number) => void,
+  ): ReadableStream<Uint8Array> {
+    const reader = stream.getReader();
+    return new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          reader.releaseLock();
+          return;
         }
+        onBytes(value.byteLength);
+        controller.enqueue(value);
+      },
+      async cancel(reason) {
+        await reader.cancel(reason);
+        reader.releaseLock();
+      },
+    });
+  }
+
+  function finishReason(
+    error: unknown,
+    terminationReason: "killed" | "cleanup" | undefined,
+  ): BwrapCommandFinishReason {
+    if (terminationReason) return terminationReason;
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    if (message.includes("timed out")) return "timeout";
+    if (message.includes("output exceeded")) return "output-limit";
+    return error === undefined ? "exit" : "abort";
+  }
+
+  function track(proc: SpawnedProcess): SpawnedProcess {
+    const commandId = randomUUID();
+    const startedAt = Date.now();
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let terminationReason: "killed" | "cleanup" | undefined;
+    const exit = proc.wait();
+    const wrapped: TrackedProcess = {
+      pid: proc.pid,
+      stdout: countedStream(proc.stdout, (count) => (stdoutBytes += count)),
+      stderr: countedStream(proc.stderr, (count) => (stderrBytes += count)),
+      async wait() {
+        return await exit;
       },
       async kill() {
-        try {
-          await proc.kill();
-        } finally {
-          live.delete(wrapped);
-        }
+        await wrapped.terminate("killed");
+      },
+      async terminate(reason) {
+        terminationReason = reason;
+        await proc.kill();
+        live.delete(wrapped);
       },
     };
     live.add(wrapped);
+    emit({
+      type: "command.started",
+      commandId,
+      ...(proc.pid === undefined ? {} : { pid: proc.pid, pgid: proc.pid }),
+      liveProcesses: live.size,
+    });
+    // Process ownership ends when the process actually exits, independently
+    // of whether the caller ever collects the returned handle.
+    void exit
+      .then(
+        (result) => {
+          live.delete(wrapped);
+          emit({
+            type: "command.finished",
+            commandId,
+            ...(proc.pid === undefined ? {} : { pid: proc.pid }),
+            reason: finishReason(undefined, terminationReason),
+            exitCode: result.exitCode,
+            durationMs: Date.now() - startedAt,
+            stdoutBytes,
+            stderrBytes,
+            liveProcesses: live.size,
+          });
+        },
+        (error: unknown) => {
+          live.delete(wrapped);
+          emit({
+            type: "command.finished",
+            commandId,
+            ...(proc.pid === undefined ? {} : { pid: proc.pid }),
+            reason: finishReason(error, terminationReason),
+            durationMs: Date.now() - startedAt,
+            stdoutBytes,
+            stderrBytes,
+            liveProcesses: live.size,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      )
+      .catch(() => {});
     return wrapped;
   }
 
@@ -137,6 +272,14 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     env?: Record<string, string>;
     abortSignal?: AbortSignal;
   }) {
+    if (lifecycle !== "running") {
+      throw new Error(`bwrap sandbox: compute generation is ${lifecycle}; refusing to spawn`);
+    }
+    if (options.maxConcurrentProcesses !== null && live.size >= options.maxConcurrentProcesses) {
+      throw new Error(
+        `bwrap sandbox: concurrent process limit of ${options.maxConcurrentProcesses} reached`,
+      );
+    }
     const env = {
       PATH: DEFAULT_SANDBOX_PATH,
       HOME: WORKSPACE_ROOT,
@@ -164,10 +307,70 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     id,
     resolvePath: resolveWorkspacePath,
 
+    lifecycleState() {
+      return lifecycle;
+    },
+
     async killAll() {
-      const pending = [...live];
-      live.clear();
-      await Promise.all(pending.map((proc) => proc.kill().catch(() => undefined)));
+      if (lifecycle === "stopped") return;
+      if (cleanupPromise) return await cleanupPromise;
+      lifecycle = "stopping";
+      cleanupPromise = (async () => {
+        const pending = [...live];
+        const startedAt = Date.now();
+        emit({ type: "cleanup.started", requestedProcesses: pending.length });
+        const results = await Promise.allSettled(
+          pending.map(async (proc) => await proc.terminate("cleanup")),
+        );
+        const failures = results.flatMap((result) =>
+          result.status === "rejected" ? [result.reason] : [],
+        );
+        if (failures.length > 0) {
+          const errorMessages = failures.map((failure) =>
+            failure instanceof Error ? failure.message : String(failure),
+          );
+          emit({
+            type: "cleanup.failed",
+            requestedProcesses: pending.length,
+            remainingProcesses: live.size,
+            durationMs: Date.now() - startedAt,
+            errors: errorMessages,
+          });
+          throw new AggregateError(
+            failures,
+            `bwrap sandbox: failed to stop all live processes: ${errorMessages.join("; ")}`,
+          );
+        }
+        if (!stoppedNotified) {
+          try {
+            await input.onStopped?.();
+            stoppedNotified = true;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            emit({
+              type: "cleanup.failed",
+              requestedProcesses: pending.length,
+              remainingProcesses: live.size,
+              durationMs: Date.now() - startedAt,
+              errors: [message],
+            });
+            throw error;
+          }
+        }
+        lifecycle = "stopped";
+        emit({
+          type: "cleanup.completed",
+          requestedProcesses: pending.length,
+          remainingProcesses: live.size,
+          durationMs: Date.now() - startedAt,
+        });
+      })();
+      try {
+        await cleanupPromise;
+      } catch (error) {
+        cleanupPromise = undefined;
+        throw error;
+      }
     },
 
     async spawn(spawnOptions) {
@@ -175,12 +378,18 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     },
 
     async run(runOptions) {
-      const runAbort = createRunAbortSignal(runOptions.abortSignal, options.runTimeoutMs);
+      const outputAbort = new AbortController();
+      const runAbort = createRunAbortSignal(
+        runOptions.abortSignal,
+        options.runTimeoutMs,
+        outputAbort.signal,
+      );
+      const budget: OutputBudget = { limit: options.maxOutputBytes, used: 0 };
       try {
         const proc = await spawnProcess({ ...runOptions, abortSignal: runAbort.signal });
         const [stdout, stderr, { exitCode }] = await Promise.all([
-          collectStream(proc.stdout),
-          collectStream(proc.stderr),
+          collectStream(proc.stdout, budget, (reason) => outputAbort.abort(reason)),
+          collectStream(proc.stderr, budget, (reason) => outputAbort.abort(reason)),
           proc.wait(),
         ]);
         return { exitCode, stdout, stderr };
