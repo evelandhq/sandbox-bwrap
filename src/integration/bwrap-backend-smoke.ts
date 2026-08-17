@@ -233,6 +233,36 @@ async function main(): Promise<void> {
     });
     assert.equal(await other.session.readTextFile({ path: "notes/hello.txt" }), null);
 
+    // A real timed-out run must reap its full process group, including a
+    // background descendant, and leave the durable session usable afterwards.
+    const boundedBackend = createBwrapSandboxBackend({
+      createOptions: { runTimeoutMs: 500 },
+    });
+    const boundedHandle = await boundedBackend.create({
+      templateKey: null,
+      sessionKey: "sess-timeout",
+      runtimeContext,
+    });
+    await assert.rejects(
+      async () =>
+        await boundedHandle.session.run({
+          command: "sleep 300 & echo $! > timeout-child.pid; wait",
+        }),
+      /run timed out after 500 ms/,
+    );
+    const timeoutChildPid = Number(
+      await boundedHandle.session.readTextFile({ path: "timeout-child.pid" }),
+    );
+    assert.ok(Number.isSafeInteger(timeoutChildPid), "timed command must record its child pid");
+    assert.equal(
+      processIsAlive(timeoutChildPid),
+      false,
+      "run timeout must kill background descendants",
+    );
+    const afterTimeout = await boundedHandle.session.run({ command: "printf timeout-recovered" });
+    assert.equal(afterTimeout.stdout, "timeout-recovered", "session must recover after timeout");
+    await boundedHandle.shutdown();
+
     console.log("BWRAP SMOKE OK");
   } finally {
     await rm(appRoot, { recursive: true, force: true });

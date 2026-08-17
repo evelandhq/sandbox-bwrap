@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 /** Coarse egress control, matching what eve's Docker backend supports. */
 export type BwrapNetworkPolicy = "allow-all" | "deny-all";
 
+/** Commands executed through `run()` are bounded by default; use `spawn()` for daemons. */
+export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
+
 /** Options accepted by `bwrap(opts)`. */
 export interface BwrapSandboxCreateOptions {
   /** Environment variables set for every command the backend runs. */
@@ -26,6 +29,12 @@ export interface BwrapSandboxCreateOptions {
    * remain keyed solely by Eve's session key.
    */
   readonly templateRevision?: string;
+  /**
+   * Hard wall-clock limit for one `run()` command. Defaults to 10 minutes.
+   * Set to `null` to disable. This does not apply to the deliberately
+   * long-running `spawn()` API.
+   */
+  readonly runTimeoutMs?: number | null;
 }
 
 /** Fully-defaulted options consumed by the backend implementation. */
@@ -36,6 +45,16 @@ export interface ResolvedBwrapSandboxOptions {
   readonly bwrapPath: string;
   readonly cacheDir: string | null;
   readonly templateRevision: string | null;
+  readonly runTimeoutMs: number | null;
+}
+
+function resolveRunTimeoutMs(value: number | null | undefined): number | null {
+  if (value === null) return null;
+  const resolved = value ?? DEFAULT_RUN_TIMEOUT_MS;
+  if (!Number.isSafeInteger(resolved) || resolved <= 0) {
+    throw new Error("bwrap sandbox: runTimeoutMs must be a positive safe integer or null");
+  }
+  return resolved;
 }
 
 export function resolveBwrapSandboxOptions(
@@ -48,6 +67,7 @@ export function resolveBwrapSandboxOptions(
     bwrapPath: options.bwrapPath ?? "bwrap",
     cacheDir: options.cacheDir ?? null,
     templateRevision: options.templateRevision ?? null,
+    runTimeoutMs: resolveRunTimeoutMs(options.runTimeoutMs),
   };
 }
 
@@ -63,6 +83,7 @@ export function createBwrapOptionsHash(options: ResolvedBwrapSandboxOptions): st
     env: Object.fromEntries(Object.entries(options.env).sort(([a], [b]) => (a < b ? -1 : 1))),
     hidePaths: [...options.hidePaths],
     networkPolicy: options.networkPolicy,
+    runTimeoutMs: options.runTimeoutMs,
     templateRevision: options.templateRevision,
   });
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);

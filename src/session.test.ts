@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { resolveBwrapSandboxOptions } from "./options.js";
 import type { ProcessRunner, SpawnedProcess } from "./process.js";
 import { createBwrapSession } from "./session.js";
@@ -104,6 +104,93 @@ describe("run and spawn", () => {
     const secondTmpfs = argv.indexOf("--tmpfs", argv.indexOf("--tmpfs") + 1);
     expect(argv.slice(secondTmpfs, secondTmpfs + 2)).toEqual(["--tmpfs", cacheDir]);
     expect(argv).not.toContain(path.join(appRoot, ".eve", "sandbox-cache", "bwrap"));
+  });
+
+  test("run aborts the process after the configured hard timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      let aborted = 0;
+      const runner: ProcessRunner = {
+        spawn(_argv, spawnOptions): SpawnedProcess {
+          const signal = spawnOptions?.abortSignal;
+          if (!signal) throw new Error("run did not supply an abort signal");
+
+          const stream = () =>
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                signal.addEventListener(
+                  "abort",
+                  () => {
+                    aborted += 1;
+                    controller.close();
+                  },
+                  { once: true },
+                );
+              },
+            });
+          return {
+            pid: 9,
+            stdout: stream(),
+            stderr: stream(),
+            wait: async () =>
+              await new Promise<never>((_resolve, reject) => {
+                signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+              }),
+            kill: async () => {},
+          };
+        },
+      };
+      const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-timeout-"));
+      const workspaceDir = path.join(appRoot, "ws");
+      await mkdir(workspaceDir, { recursive: true });
+      const session = createBwrapSession({
+        id: "s1",
+        workspaceDir,
+        appRoot,
+        runner,
+        options: resolveBwrapSandboxOptions({ runTimeoutMs: 1_000 }),
+      });
+
+      const run = session.run({ command: "while true; do :; done" });
+      const rejection = expect(run).rejects.toThrow("timed out after 1000 ms");
+      await vi.advanceTimersByTimeAsync(999);
+      expect(aborted).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      await rejection;
+      expect(aborted).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("spawn remains long-running and does not receive the run timeout", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const runner: ProcessRunner = {
+      spawn(_argv, spawnOptions): SpawnedProcess {
+        receivedSignal = spawnOptions?.abortSignal;
+        return {
+          pid: 10,
+          stdout: stringStream(""),
+          stderr: stringStream(""),
+          wait: async () => ({ exitCode: 0 }),
+          kill: async () => {},
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-spawn-timeout-"));
+    const workspaceDir = path.join(appRoot, "ws");
+    await mkdir(workspaceDir, { recursive: true });
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      appRoot,
+      runner,
+      options: resolveBwrapSandboxOptions({ runTimeoutMs: 1 }),
+    });
+
+    await session.spawn({ command: "long-lived-server" });
+
+    expect(receivedSignal).toBeUndefined();
   });
 });
 

@@ -37,6 +37,20 @@ describe("createNodeProcessRunner", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
+  test("kill terminates descendants in the spawned process group", async () => {
+    const proc = runner.spawn(["sh", "-c", "sleep 30 & echo $!; wait"]);
+    const reader = proc.stdout.getReader();
+    const first = await reader.read();
+    reader.releaseLock();
+    const childPid = Number(new TextDecoder().decode(first.value).trim());
+    expect(Number.isSafeInteger(childPid)).toBe(true);
+
+    await proc.kill();
+    await proc.wait().catch(() => undefined);
+
+    expect(() => process.kill(childPid, 0)).toThrow();
+  });
+
   test("abort makes wait() reject with the abort reason", async () => {
     const controller = new AbortController();
     const proc = runner.spawn(["sh", "-c", "sleep 30"], { abortSignal: controller.signal });

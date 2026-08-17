@@ -56,6 +56,23 @@ function sliceLines(text: string, startLine?: number, endLine?: number): string 
   return lines.slice((startLine ?? 1) - 1, endLine ?? lines.length).join("\n");
 }
 
+function createRunAbortSignal(
+  callerSignal: AbortSignal | undefined,
+  timeoutMs: number | null,
+): { signal: AbortSignal | undefined; clear(): void } {
+  if (timeoutMs === null) return { signal: callerSignal, clear() {} };
+
+  const timeout = new AbortController();
+  const timer = setTimeout(() => {
+    timeout.abort(new Error(`bwrap sandbox: run timed out after ${timeoutMs} ms`));
+  }, timeoutMs);
+  timer.unref?.();
+  return {
+    signal: callerSignal ? AbortSignal.any([callerSignal, timeout.signal]) : timeout.signal,
+    clear: () => clearTimeout(timer),
+  };
+}
+
 /**
  * A sandbox session plus the lifecycle hook the backend handle needs.
  * eve's `shutdown()` contract requires that nothing is left running, so the
@@ -158,13 +175,18 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     },
 
     async run(runOptions) {
-      const proc = await spawnProcess(runOptions);
-      const [stdout, stderr] = await Promise.all([
-        collectStream(proc.stdout),
-        collectStream(proc.stderr),
-      ]);
-      const { exitCode } = await proc.wait();
-      return { exitCode, stdout, stderr };
+      const runAbort = createRunAbortSignal(runOptions.abortSignal, options.runTimeoutMs);
+      try {
+        const proc = await spawnProcess({ ...runOptions, abortSignal: runAbort.signal });
+        const [stdout, stderr, { exitCode }] = await Promise.all([
+          collectStream(proc.stdout),
+          collectStream(proc.stderr),
+          proc.wait(),
+        ]);
+        return { exitCode, stdout, stderr };
+      } finally {
+        runAbort.clear();
+      }
     },
 
     async setNetworkPolicy(policy: SandboxNetworkPolicy) {
