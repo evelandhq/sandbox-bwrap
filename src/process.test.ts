@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import { WORKSPACE_ROOT } from "./paths.js";
 import { createNodeProcessRunner, describeMissingPrereqs, isBwrapAvailable } from "./process.js";
@@ -11,6 +12,28 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
     chunks.push(value);
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+
+  if (process.platform !== "linux") return true;
+
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Signal 0 still succeeds for zombies, but they have stopped executing and
+    // only remain in the process table until their new parent reaps them.
+    const state = stat.at(stat.lastIndexOf(")") + 2);
+    return state !== "Z" && state !== "X";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 describe("createNodeProcessRunner", () => {
@@ -48,7 +71,7 @@ describe("createNodeProcessRunner", () => {
     await proc.kill();
     await proc.wait().catch(() => undefined);
 
-    expect(() => process.kill(childPid, 0)).toThrow();
+    await expect.poll(() => isProcessRunning(childPid), { timeout: 1000 }).toBe(false);
   });
 
   test("abort makes wait() reject with the abort reason", async () => {
