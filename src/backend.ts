@@ -4,7 +4,7 @@ import { cp, mkdir, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { SandboxBackend, SandboxSeedFile } from "eve/sandbox";
 import { SandboxTemplateNotProvisionedError } from "eve/sandbox";
-import type { BwrapSandboxCreateOptions } from "./options.js";
+import type { BwrapSandboxCreateOptions, BwrapSandboxUseOptions } from "./options.js";
 import { createBwrapOptionsHash, resolveBwrapSandboxOptions } from "./options.js";
 import { resolveSessionPath, resolveTemplatePath, WORKSPACE_ROOT } from "./paths.js";
 import type { ProcessRunner } from "./process.js";
@@ -42,7 +42,7 @@ async function copyDirectoryAtomically(sourcePath: string, targetPath: string): 
 
 export function createBwrapSandboxBackend(
   input: CreateBwrapSandboxBackendInput = {},
-): SandboxBackend {
+): SandboxBackend<BwrapSandboxUseOptions, BwrapSandboxUseOptions> {
   const options = resolveBwrapSandboxOptions(input.createOptions);
   const optionsHash = createBwrapOptionsHash(options);
   const runner = input.runner ?? createNodeProcessRunner();
@@ -86,6 +86,16 @@ export function createBwrapSandboxBackend(
     }
   }
 
+  async function useSession(
+    session: BwrapSession,
+    useOptions?: BwrapSandboxUseOptions,
+  ): Promise<BwrapSession> {
+    if (useOptions?.networkPolicy !== undefined) {
+      await session.setNetworkPolicy(useOptions.networkPolicy);
+    }
+    return session;
+  }
+
   return {
     name: BWRAP_BACKEND_NAME,
 
@@ -104,8 +114,10 @@ export function createBwrapSandboxBackend(
       await mkdir(stagingPath, { recursive: true });
       try {
         const session = openSession(templateKey, stagingPath, runtimeContext.appRoot);
-        if (bootstrap) await bootstrap({ use: async () => session });
         await writeSeedFiles(session, seedFiles);
+        if (bootstrap) {
+          await bootstrap({ use: async (useOptions) => await useSession(session, useOptions) });
+        }
         await rename(stagingPath, templatePath);
       } catch (error) {
         await rm(stagingPath, { force: true, recursive: true }).catch(() => {});
@@ -141,7 +153,7 @@ export function createBwrapSandboxBackend(
       const session = openSession(sessionKey, sessionPath, runtimeContext.appRoot);
       return {
         session,
-        useSessionFn: async () => session,
+        useSessionFn: async (useOptions) => await useSession(session, useOptions),
         async captureState() {
           return { backendName: BWRAP_BACKEND_NAME, metadata: {}, sessionKey };
         },

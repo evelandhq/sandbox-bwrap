@@ -26,6 +26,28 @@ async function makeBackend() {
 }
 
 describe("prewarm", () => {
+  test("makes workspace seeds available to bootstrap", async () => {
+    const { backend, runtimeContext } = await makeBackend();
+
+    await backend.prewarm({
+      templateKey: "bootstrap-seeds",
+      runtimeContext,
+      seedFiles: [{ path: "input.txt", content: "from seed" }],
+      bootstrap: async ({ use }) => {
+        const session = await use();
+        const seeded = await session.readTextFile({ path: "input.txt" });
+        await session.writeTextFile({ path: "bootstrap-saw.txt", content: seeded ?? "missing" });
+      },
+    });
+
+    const handle = await backend.create({
+      templateKey: "bootstrap-seeds",
+      sessionKey: "bootstrap-seeds-session",
+      runtimeContext,
+    });
+    expect(await handle.session.readTextFile({ path: "bootstrap-saw.txt" })).toBe("from seed");
+  });
+
   test("materializes Eve skill seeds under the sandbox HOME", async () => {
     const { backend, runtimeContext } = await makeBackend();
     await backend.prewarm({
@@ -91,6 +113,35 @@ describe("prewarm", () => {
 });
 
 describe("create", () => {
+  test("applies onSession use options before returning the live session", async () => {
+    const argv: Array<readonly string[]> = [];
+    const runner: ProcessRunner = {
+      spawn(command) {
+        argv.push(command);
+        const empty = () => new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+        return {
+          stdout: empty(),
+          stderr: empty(),
+          wait: async () => ({ exitCode: 0 }),
+          kill: async () => {},
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-backend-use-options-"));
+    const backend = createBwrapSandboxBackend({ runner });
+    const handle = await backend.create({
+      templateKey: null,
+      sessionKey: "session-options",
+      runtimeContext: { appRoot },
+    });
+
+    const session = await handle.useSessionFn({ networkPolicy: "deny-all" });
+    await session.run({ command: "true" });
+
+    expect(argv).toHaveLength(1);
+    expect(argv[0]).toContain("--unshare-net");
+  });
+
   test("clones the template into a persistent per-session workspace", async () => {
     const { backend, runtimeContext } = await makeBackend();
     await backend.prewarm({
