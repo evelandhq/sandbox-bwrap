@@ -10,6 +10,7 @@ describe("resolveBwrapSandboxOptions", () => {
       bwrapPath: "bwrap",
       cacheDir: null,
       templateRevision: null,
+      runTimeoutMs: 600_000,
     });
   });
 
@@ -19,11 +20,24 @@ describe("resolveBwrapSandboxOptions", () => {
       networkPolicy: "deny-all",
       hidePaths: ["/srv/private"],
       bwrapPath: "/usr/bin/bwrap",
+      runTimeoutMs: 12_345,
     });
     expect(resolved.networkPolicy).toBe("deny-all");
     expect(resolved.env).toEqual({ FOO: "1" });
     expect(resolved.hidePaths).toEqual(["/srv/private"]);
     expect(resolved.bwrapPath).toBe("/usr/bin/bwrap");
+    expect(resolved.runTimeoutMs).toBe(12_345);
+  });
+
+  test.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid runTimeoutMs %s",
+    (runTimeoutMs) => {
+      expect(() => resolveBwrapSandboxOptions({ runTimeoutMs })).toThrow(/runTimeoutMs/);
+    },
+  );
+
+  test("allows the run timeout to be disabled explicitly", () => {
+    expect(resolveBwrapSandboxOptions({ runTimeoutMs: null }).runTimeoutMs).toBeNull();
   });
 });
 
@@ -55,5 +69,14 @@ describe("templateRevision option", () => {
 
     expect(first.templateRevision).toBe("release-1");
     expect(createBwrapOptionsHash(first)).not.toBe(createBwrapOptionsHash(second));
+  });
+});
+
+describe("runTimeoutMs option", () => {
+  test("participates in the options hash", () => {
+    const bounded = createBwrapOptionsHash(resolveBwrapSandboxOptions({ runTimeoutMs: 1_000 }));
+    const unbounded = createBwrapOptionsHash(resolveBwrapSandboxOptions({ runTimeoutMs: null }));
+
+    expect(bounded).not.toBe(unbounded);
   });
 });

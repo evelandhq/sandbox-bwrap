@@ -83,6 +83,7 @@ next callback reopens it.
 | `bwrapPath`        | `"bwrap"`                            | bwrap executable to invoke.                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `cacheDir`         | `<appRoot>/.eve/sandbox-cache/bwrap` | Absolute directory holding templates and durable session workspaces. Pin this outside the release directory so a redeploy does not discard durable session state: since eve 0.22.0, eve keys session sandboxes per durable session, not per deployment, so an `appRoot`-derived default would silently destroy every session's `/workspace` on the next redeploy. The generated eveland module always sets this from `EVELAND_SANDBOX_CACHE_DIR`. |
 | `templateRevision` | `null`                               | Optional immutable release identity included in the template cache key but not the session path. Change it when seed files change so new Sessions use a fresh template without overwriting durable workspaces. Eveland sets it from its internal `EVELAND_SANDBOX_TEMPLATE_REVISION`.                                                                                                                                                             |
+| `runTimeoutMs`     | `600000`                             | Hard wall-clock limit for one `run()` command. Timeout aborts the command and kills its complete bwrap process group. Set `null` to disable it. The limit deliberately does not apply to `spawn()`, which is the API for long-running processes.                                                                                                                                                                                                  |
 
 ## How it works
 
@@ -98,6 +99,9 @@ next callback reopens it.
 - **run/spawn**: every command is one transient bwrap invocation —
   read-only host rootfs, the session directory bound read-write at `/workspace`,
   tmpfs `/tmp`, PID/IPC/UTS namespaces unshared, `--die-with-parent`.
+  `run()` also applies `runTimeoutMs` and kills the entire detached process group
+  when the deadline or caller AbortSignal fires; `spawn()` remains unbounded until
+  its holder calls `kill()`, the Session is stopped, or the backend shuts down.
 - **File I/O** (`readTextFile`, `writeFile`, …): host-side operations on the session
   directory; no subprocess. Writes outside `/workspace` are refused.
 
@@ -145,9 +149,10 @@ Reclaiming space today requires manual intervention: identify which sessions are
   (Firecracker/microsandbox) instead of hardening this backend further.
   Under Eveland's local Docker runtime, "host filesystem" here means the outer Agent
   container's filesystem, not the Docker host; no host root or Docker socket is mounted.
-- Resource limits are inherited from whatever cgroup the agent runs in (on eveland's
-  systemd runtime: the deployment unit's `MemoryMax`/`CPUQuota` cover sandbox
-  children too). The backend sets no per-command limits itself.
+- CPU, memory, and PID limits are inherited from whatever cgroup the agent runs in
+  (on eveland, the deployment's Docker container or systemd unit covers sandbox
+  children too). The backend adds only the `run()` wall-clock deadline; it does not
+  create a per-command cgroup or impose resource quotas on `spawn()`.
 - Host-side write/remove calls (`writeFile`, `writeTextFile`, `writeBinaryFile`,
   `removePath`) verify containment with a realpath-aware check
   (`isWithinWorkspaceReal`): they resolve symlinks along the path and re-check that

@@ -8,6 +8,7 @@ export {
   type CreateBwrapSandboxBackendInput,
 } from "./backend.js";
 export type { BwrapNetworkPolicy, BwrapSandboxCreateOptions } from "./options.js";
+export { DEFAULT_RUN_TIMEOUT_MS } from "./options.js";
 export { isBwrapAvailable } from "./process.js";
 export type { ProcessRunner, SpawnedProcess } from "./process.js";
 
