@@ -3,7 +3,7 @@
 // It is intentionally run as an unprivileged user under systemd hardening
 // (NoNewPrivileges, ProtectSystem=strict) to mirror a deployed eve agent.
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -20,6 +20,25 @@ function processIsAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+async function countBwrapZombies(): Promise<number> {
+  if (process.platform !== "linux") return 0;
+  const procEntries = await readdir("/proc");
+  let zombies = 0;
+  for (const entry of procEntries) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const [comm, stat] = await Promise.all([
+        readFile(`/proc/${entry}/comm`, "utf8"),
+        readFile(`/proc/${entry}/stat`, "utf8"),
+      ]);
+      if (comm.trim() === "bwrap" && stat.at(stat.lastIndexOf(")") + 2) === "Z") zombies += 1;
+    } catch {
+      // The process can disappear between readdir and readFile.
+    }
+  }
+  return zombies;
 }
 
 async function main(): Promise<void> {
@@ -162,6 +181,21 @@ async function main(): Promise<void> {
     );
     await session.setNetworkPolicy("allow-all");
 
+    // Sustained short-command churn must not grow the host process table.
+    // This exercises the exact transient-bwrap pattern that exhausted the
+    // Docker deployment's PID limit before its outer PID 1 gained a reaper.
+    const zombiesBeforeChurn = await countBwrapZombies();
+    for (let index = 0; index < 500; index += 1) {
+      const short = await session.run({ command: "true" });
+      assert.equal(short.exitCode, 0, `short command ${index} failed: ${short.stderr}`);
+    }
+    await sleep(200);
+    assert.equal(
+      await countBwrapZombies(),
+      zombiesBeforeChurn,
+      "500 short bwrap commands must not leak zombies under systemd",
+    );
+
     // HARD LINK probe: a distinct escape class from the symlink escape Task 3
     // closed via isWithinWorkspaceReal. A hard link creates a second
     // directory entry aliasing the SAME inode across a bind mount of one
@@ -198,9 +232,9 @@ async function main(): Promise<void> {
     ]);
     assert.equal(settled, "settled", "killed spawn must settle wait() promptly");
 
-    // stop() is the mid-run counterpart of shutdown(): the compute stops, the
-    // session stays usable. Spawn a sleeper, stop, and confirm both halves —
-    // the process is gone from the host and the same session still reads.
+    // stop() is the mid-run counterpart of shutdown(): the compute generation
+    // closes, while durable workspace I/O remains available. Spawn a sleeper,
+    // stop, and confirm both halves.
     const stopSleeper = await session.spawn({ command: "sleep 300" });
     const stopSleeperPid = stopSleeper.pid;
     await session.writeTextFile({ path: "notes/stopped.txt", content: "survives stop" });
@@ -208,18 +242,29 @@ async function main(): Promise<void> {
     assert.ok(stopSleeperPid !== undefined, "spawn must expose a pid");
     assert.equal(processIsAlive(stopSleeperPid), false, "stop() must kill spawned processes");
     assert.equal(await session.readTextFile({ path: "notes/stopped.txt" }), "survives stop");
+    await assert.rejects(
+      async () => await session.spawn({ command: "must-not-start-after-stop" }),
+      /compute generation is stopped/,
+    );
 
-    // shutdown() must leave nothing running: spawn a sleeper, shut down, and
-    // confirm the process is gone from the host.
-    const sleeper = await session.spawn({ command: "sleep 300" });
+    // Reattach creates a fresh compute generation over the same durable
+    // workspace. shutdown() must leave nothing running in that generation.
+    const reopenedAfterStop = await backend.create({
+      templateKey: "smoke-template",
+      sessionKey: "sess-1",
+      runtimeContext,
+    });
+    const sleeper = await reopenedAfterStop.session.spawn({ command: "sleep 300" });
     const sleeperPid = sleeper.pid;
-    await handle.shutdown();
+    await reopenedAfterStop.shutdown();
     assert.ok(sleeperPid !== undefined, "spawn must expose a pid");
     assert.equal(processIsAlive(sleeperPid), false, "shutdown() must kill spawned processes");
 
     // persistence across reconnect; isolation between sessions
-    await session.writeTextFile({ path: "notes/hello.txt", content: "persisted" });
-    await handle.shutdown();
+    await reopenedAfterStop.session.writeTextFile({
+      path: "notes/hello.txt",
+      content: "persisted",
+    });
     const again = await backend.create({
       templateKey: "smoke-template",
       sessionKey: "sess-1",
@@ -236,7 +281,7 @@ async function main(): Promise<void> {
     // A real timed-out run must reap its full process group, including a
     // background descendant, and leave the durable session usable afterwards.
     const boundedBackend = createBwrapSandboxBackend({
-      createOptions: { runTimeoutMs: 500 },
+      createOptions: { runTimeoutMs: 500, maxOutputBytes: 1024 },
     });
     const boundedHandle = await boundedBackend.create({
       templateKey: null,
@@ -246,7 +291,7 @@ async function main(): Promise<void> {
     await assert.rejects(
       async () =>
         await boundedHandle.session.run({
-          command: "sleep 300 & echo $! > timeout-child.pid; wait",
+          command: "sleep 300 & echo $! > timeout-child.pid; (sleep 300 & wait) & wait",
         }),
       /run timed out after 500 ms/,
     );
@@ -261,6 +306,18 @@ async function main(): Promise<void> {
     );
     const afterTimeout = await boundedHandle.session.run({ command: "printf timeout-recovered" });
     assert.equal(afterTimeout.stdout, "timeout-recovered", "session must recover after timeout");
+    await assert.rejects(
+      async () => await boundedHandle.session.run({ command: "head -c 2048 /dev/zero" }),
+      /run output exceeded 1024 bytes/,
+    );
+    const afterOutputLimit = await boundedHandle.session.run({
+      command: "printf output-recovered",
+    });
+    assert.equal(
+      afterOutputLimit.stdout,
+      "output-recovered",
+      "session must recover after output-limit cleanup",
+    );
     await boundedHandle.shutdown();
 
     console.log("BWRAP SMOKE OK");

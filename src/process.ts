@@ -64,41 +64,66 @@ export function createNodeProcessRunner(): ProcessRunner {
         });
       });
       exit.catch(() => {});
-      const killTree = () => {
+      const killTree = (): unknown => {
+        if (child.exitCode !== null || child.signalCode !== null) return undefined;
         if (child.pid !== undefined) {
           try {
             process.kill(-child.pid, "SIGKILL");
-            return;
-          } catch {
-            // fall through: group already gone or not yet set up
+            return undefined;
+          } catch (error) {
+            // ESRCH can mean the process group was not established yet; kill
+            // the direct child. Other failures (notably EPERM) are cleanup
+            // failures even if the direct-child fallback succeeds, because
+            // descendants may have escaped the signal.
+            child.kill("SIGKILL");
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") return error;
+            return undefined;
           }
         }
         child.kill("SIGKILL");
+        return undefined;
       };
       let aborted = false;
       let abortReason: unknown;
+      let abortKillError: unknown;
       const signal = options?.abortSignal;
+      let onAbort: (() => void) | undefined;
       if (signal) {
-        const onAbort = () => {
+        onAbort = () => {
           aborted = true;
           abortReason = signal.reason;
-          killTree();
+          abortKillError = killTree();
         };
         if (signal.aborted) onAbort();
         else signal.addEventListener("abort", onAbort, { once: true });
       }
+      const removeAbortListener = () => {
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      };
+      void exit.then(removeAbortListener, removeAbortListener);
       return {
         pid: child.pid,
         stdout: Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>,
         stderr: Readable.toWeb(child.stderr) as unknown as ReadableStream<Uint8Array>,
         async wait() {
           const result = await exit;
+          if (abortKillError !== undefined) {
+            const cleanupMessage =
+              abortKillError instanceof Error ? abortKillError.message : String(abortKillError);
+            const abortMessage =
+              abortReason instanceof Error ? abortReason.message : String(abortReason);
+            throw new AggregateError(
+              [abortKillError, abortReason],
+              `bwrap process abort cleanup failed: ${cleanupMessage}; abort reason: ${abortMessage}`,
+            );
+          }
           if (aborted) throw abortReason;
           return result;
         },
         async kill() {
-          killTree();
+          const killError = killTree();
           await exit.catch(() => {});
+          if (killError !== undefined) throw killError;
         },
       };
     },

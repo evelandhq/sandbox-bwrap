@@ -1,4 +1,5 @@
-import { mkdtemp, readdir } from "node:fs/promises";
+import { cp, mkdtemp, readFile, readdir } from "node:fs/promises";
+import { constants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
@@ -6,6 +7,7 @@ import { SandboxTemplateNotProvisionedError } from "eve/sandbox";
 import { BWRAP_BACKEND_NAME, createBwrapSandboxBackend } from "./backend.js";
 import { bwrap, isBwrapAvailable } from "./index.js";
 import type { ProcessRunner } from "./process.js";
+import type { BwrapSandboxEvent } from "./events.js";
 
 const fakeRunner: ProcessRunner = {
   spawn() {
@@ -110,6 +112,31 @@ describe("prewarm", () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]).not.toContain(".staging");
   });
+
+  test("records template retention metadata outside the captured template", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "bwrap-template-metadata-"));
+    const cacheDir = path.join(root, "cache");
+    const backend = createBwrapSandboxBackend({
+      runner: fakeRunner,
+      createOptions: { cacheDir, templateRevision: "release-7" },
+    });
+    await backend.prewarm({
+      templateKey: "metadata-template",
+      runtimeContext: { appRoot: path.join(root, "release") },
+      seedFiles: [],
+    });
+
+    const [templateId] = await readdir(path.join(cacheDir, "templates"));
+    const metadata = JSON.parse(
+      await readFile(path.join(cacheDir, "metadata", "templates", `${templateId}.json`), "utf8"),
+    ) as Record<string, unknown>;
+    expect(metadata).toMatchObject({
+      schemaVersion: 1,
+      kind: "template",
+      id: templateId,
+      templateRevision: "release-7",
+    });
+  });
 });
 
 describe("create", () => {
@@ -181,6 +208,78 @@ describe("create", () => {
     expect(await other.session.readTextFile({ path: "state.txt" })).toBeNull();
   });
 
+  test("records operator metadata outside the sandbox-writable workspace", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "bwrap-cache-metadata-"));
+    const cacheDir = path.join(root, "cache");
+    const backend = createBwrapSandboxBackend({
+      runner: fakeRunner,
+      createOptions: { cacheDir },
+    });
+    const runtimeContext = { appRoot: path.join(root, "release") };
+
+    const handle = await backend.create({
+      templateKey: null,
+      sessionKey: "metadata-session",
+      tags: { channel: "http" },
+      runtimeContext,
+    });
+
+    const [sessionId] = await readdir(path.join(cacheDir, "sessions"));
+    const metadata = JSON.parse(
+      await readFile(path.join(cacheDir, "metadata", "sessions", `${sessionId}.json`), "utf8"),
+    ) as Record<string, unknown>;
+    expect(metadata).toMatchObject({
+      schemaVersion: 1,
+      kind: "session",
+      id: sessionId,
+      tags: { channel: "http" },
+      cloneStrategy: "empty",
+    });
+    expect(metadata.createdAt).toEqual(expect.any(String));
+    expect(metadata.lastUsedAt).toEqual(expect.any(String));
+    await expect(
+      readFile(path.join(cacheDir, "sessions", sessionId!, ".eveland-cache.json"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await handle.stop();
+  });
+
+  test("falls back to a regular template copy when reflink cloning is unsupported", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "bwrap-clone-fallback-"));
+    const cacheDir = path.join(root, "cache");
+    const modes: Array<number | undefined> = [];
+    const backend = createBwrapSandboxBackend({
+      runner: fakeRunner,
+      createOptions: { cacheDir },
+      copyDirectory: async (source, target, options) => {
+        modes.push(options.mode);
+        if (options.mode === constants.COPYFILE_FICLONE_FORCE) {
+          throw Object.assign(new Error("reflink unsupported"), { code: "ENOTSUP" });
+        }
+        await cp(source, target, { recursive: true });
+      },
+    });
+    const runtimeContext = { appRoot: path.join(root, "release") };
+    await backend.prewarm({
+      templateKey: "clone-source",
+      runtimeContext,
+      seedFiles: [{ path: "seed.txt", content: "seeded" }],
+    });
+
+    const handle = await backend.create({
+      templateKey: "clone-source",
+      sessionKey: "clone-target",
+      runtimeContext,
+    });
+
+    expect(await handle.session.readTextFile({ path: "seed.txt" })).toBe("seeded");
+    expect(modes).toEqual([constants.COPYFILE_FICLONE_FORCE, undefined]);
+    const [sessionId] = await readdir(path.join(cacheDir, "sessions"));
+    const metadata = JSON.parse(
+      await readFile(path.join(cacheDir, "metadata", "sessions", `${sessionId}.json`), "utf8"),
+    ) as Record<string, unknown>;
+    expect(metadata.cloneStrategy).toBe("copy");
+  });
+
   test("null templateKey creates an empty workspace", async () => {
     const { backend, runtimeContext } = await makeBackend();
     const handle = await backend.create({ templateKey: null, sessionKey: "fresh", runtimeContext });
@@ -235,18 +334,21 @@ describe("create", () => {
    */
   test("stop kills live processes and leaves the session reopenable", async () => {
     const killed: number[] = [];
+    const exits = new Map<number, (value: { exitCode: number }) => void>();
     let pid = 0;
     const runner: ProcessRunner = {
       spawn() {
         const id = ++pid;
+        const exit = new Promise<{ exitCode: number }>((resolve) => exits.set(id, resolve));
         const empty = () => new ReadableStream<Uint8Array>({ start: (c) => c.close() });
         return {
           pid: id,
           stdout: empty(),
           stderr: empty(),
-          wait: async () => ({ exitCode: 0 }),
+          wait: async () => await exit,
           kill: async () => {
             killed.push(id);
+            exits.get(id)?.({ exitCode: 137 });
           },
         };
       },
@@ -272,6 +374,120 @@ describe("create", () => {
       runtimeContext,
     });
     expect(await reopened.session.readTextFile({ path: "keep.txt" })).toBe("durable");
+  });
+
+  test("handles opened for the same durable session share one compute generation", async () => {
+    const killed: number[] = [];
+    let resolveExit!: (value: { exitCode: number }) => void;
+    const exit = new Promise<{ exitCode: number }>((resolve) => (resolveExit = resolve));
+    const runner: ProcessRunner = {
+      spawn() {
+        const empty = () => new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+        return {
+          pid: 41,
+          stdout: empty(),
+          stderr: empty(),
+          wait: async () => await exit,
+          kill: async () => {
+            killed.push(41);
+            resolveExit({ exitCode: 137 });
+          },
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-shared-generation-"));
+    const runtimeContext = { appRoot };
+    const backend = createBwrapSandboxBackend({ runner });
+    const first = await backend.create({
+      templateKey: null,
+      sessionKey: "same-session",
+      runtimeContext,
+    });
+    const second = await backend.create({
+      templateKey: null,
+      sessionKey: "same-session",
+      runtimeContext,
+    });
+    await first.session.spawn({ command: "long-running" });
+
+    await second.stop();
+
+    expect(killed).toEqual([41]);
+    await expect(first.session.spawn({ command: "must-not-escape" })).rejects.toThrow(/stopped/);
+  });
+
+  test("emits tagged command and cleanup receipts with generation identity", async () => {
+    const events: BwrapSandboxEvent[] = [];
+    let resolveExit!: (value: { exitCode: number }) => void;
+    const exit = new Promise<{ exitCode: number }>((resolve) => (resolveExit = resolve));
+    const runner: ProcessRunner = {
+      spawn() {
+        const empty = () => new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+        return {
+          pid: 51,
+          stdout: empty(),
+          stderr: empty(),
+          wait: async () => await exit,
+          kill: async () => resolveExit({ exitCode: 137 }),
+        };
+      },
+    };
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-events-"));
+    const backend = createBwrapSandboxBackend({
+      runner,
+      createOptions: { onEvent: (event) => events.push(event) },
+    });
+    const handle = await backend.create({
+      templateKey: null,
+      sessionKey: "observable",
+      tags: { channel: "http", session: "eve-session-1" },
+      runtimeContext: { appRoot },
+    });
+
+    await handle.session.spawn({ command: "long-running" });
+    await handle.stop();
+
+    const started = events.find((event) => event.type === "command.started");
+    expect(started).toMatchObject({
+      sessionId: "observable",
+      pid: 51,
+      pgid: 51,
+      liveProcesses: 1,
+      tags: { channel: "http", session: "eve-session-1" },
+    });
+    expect(started?.generationId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(started?.commandId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(events.find((event) => event.type === "command.finished")).toMatchObject({
+      commandId: started?.commandId,
+      reason: "cleanup",
+      exitCode: 137,
+      liveProcesses: 0,
+    });
+    expect(events.find((event) => event.type === "cleanup.completed")).toMatchObject({
+      requestedProcesses: 1,
+      remainingProcesses: 0,
+    });
+  });
+
+  test("an asynchronous event sink failure cannot escape into sandbox behavior", async () => {
+    const backend = createBwrapSandboxBackend({
+      runner: fakeRunner,
+      createOptions: {
+        onEvent: async () => {
+          throw new Error("telemetry unavailable");
+        },
+      },
+    });
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-event-failure-"));
+    const handle = await backend.create({
+      templateKey: null,
+      sessionKey: "event-failure",
+      runtimeContext: { appRoot },
+    });
+
+    await expect(handle.session.run({ command: "true" })).resolves.toMatchObject({ exitCode: 0 });
+    await expect(handle.stop()).resolves.toBeUndefined();
+    await new Promise((resolve) => setImmediate(resolve));
   });
 
   test("session state survives a change of appRoot when cacheDir is pinned", async () => {

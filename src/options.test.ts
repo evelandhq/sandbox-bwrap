@@ -11,6 +11,8 @@ describe("resolveBwrapSandboxOptions", () => {
       cacheDir: null,
       templateRevision: null,
       runTimeoutMs: 600_000,
+      maxConcurrentProcesses: 64,
+      maxOutputBytes: 16 * 1024 * 1024,
     });
   });
 
@@ -38,6 +40,31 @@ describe("resolveBwrapSandboxOptions", () => {
 
   test("allows the run timeout to be disabled explicitly", () => {
     expect(resolveBwrapSandboxOptions({ runTimeoutMs: null }).runTimeoutMs).toBeNull();
+  });
+
+  test.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid maxConcurrentProcesses %s",
+    (maxConcurrentProcesses) => {
+      expect(() => resolveBwrapSandboxOptions({ maxConcurrentProcesses })).toThrow(
+        /maxConcurrentProcesses/,
+      );
+    },
+  );
+
+  test.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid maxOutputBytes %s",
+    (maxOutputBytes) => {
+      expect(() => resolveBwrapSandboxOptions({ maxOutputBytes })).toThrow(/maxOutputBytes/);
+    },
+  );
+
+  test("allows process and output limits to be disabled explicitly", () => {
+    const resolved = resolveBwrapSandboxOptions({
+      maxConcurrentProcesses: null,
+      maxOutputBytes: null,
+    });
+    expect(resolved.maxConcurrentProcesses).toBeNull();
+    expect(resolved.maxOutputBytes).toBeNull();
   });
 });
 
@@ -78,5 +105,20 @@ describe("runTimeoutMs option", () => {
     const unbounded = createBwrapOptionsHash(resolveBwrapSandboxOptions({ runTimeoutMs: null }));
 
     expect(bounded).not.toBe(unbounded);
+  });
+});
+
+describe("process and output limit options", () => {
+  test("participate in the template options hash", () => {
+    const defaults = createBwrapOptionsHash(resolveBwrapSandboxOptions());
+    const processBound = createBwrapOptionsHash(
+      resolveBwrapSandboxOptions({ maxConcurrentProcesses: 8 }),
+    );
+    const outputBound = createBwrapOptionsHash(
+      resolveBwrapSandboxOptions({ maxOutputBytes: 1024 }),
+    );
+
+    expect(processBound).not.toBe(defaults);
+    expect(outputBound).not.toBe(defaults);
   });
 });

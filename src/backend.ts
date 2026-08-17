@@ -1,16 +1,29 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, mkdir, rename, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, rename, rm } from "node:fs/promises";
+import { basename } from "node:path";
 import type { SandboxBackend, SandboxSeedFile } from "eve/sandbox";
 import { SandboxTemplateNotProvisionedError } from "eve/sandbox";
 import type { BwrapSandboxCreateOptions, BwrapSandboxUseOptions } from "./options.js";
 import { createBwrapOptionsHash, resolveBwrapSandboxOptions } from "./options.js";
-import { resolveSessionPath, resolveTemplatePath, WORKSPACE_ROOT } from "./paths.js";
+import {
+  resolveBwrapCacheRoot,
+  resolveSessionPath,
+  resolveTemplatePath,
+  WORKSPACE_ROOT,
+} from "./paths.js";
 import type { ProcessRunner } from "./process.js";
 import { createNodeProcessRunner, describeMissingPrereqs, isBwrapAvailable } from "./process.js";
 import type { BwrapSession } from "./session.js";
 import { createBwrapSession } from "./session.js";
+import {
+  cloneDirectoryAtomically,
+  createBwrapCacheLease,
+  registerActiveCachePath,
+  touchCacheMetadata,
+  type BwrapCloneStrategy,
+  type BwrapDirectoryCopier,
+} from "./cache.js";
 
 const EVE_MODEL_SKILL_ROOT = "$HOME/.agents/skills";
 
@@ -24,20 +37,8 @@ export interface CreateBwrapSandboxBackendInput {
   readonly createOptions?: BwrapSandboxCreateOptions;
   /** Injectable process launcher so backend logic is testable without bwrap. */
   readonly runner?: ProcessRunner;
-}
-
-async function copyDirectoryAtomically(sourcePath: string, targetPath: string): Promise<void> {
-  const tmpPath = `${targetPath}.${randomUUID()}.tmp`;
-  await mkdir(dirname(targetPath), { recursive: true });
-  try {
-    await cp(sourcePath, tmpPath, { recursive: true });
-    await rename(tmpPath, targetPath);
-  } catch (error) {
-    await rm(tmpPath, { force: true, recursive: true }).catch(() => {});
-    // A concurrent writer winning the rename race is success, not failure.
-    if (existsSync(targetPath)) return;
-    throw error;
-  }
+  /** Injectable clone primitive for filesystem-capability tests. */
+  readonly copyDirectory?: BwrapDirectoryCopier;
 }
 
 export function createBwrapSandboxBackend(
@@ -46,6 +47,7 @@ export function createBwrapSandboxBackend(
   const options = resolveBwrapSandboxOptions(input.createOptions);
   const optionsHash = createBwrapOptionsHash(options);
   const runner = input.runner ?? createNodeProcessRunner();
+  const generations = new Map<string, BwrapSession>();
   // Probe only when running against the real bwrap; injected runners skip it.
   const shouldProbe = input.runner === undefined;
   let probed = false;
@@ -61,8 +63,60 @@ export function createBwrapSandboxBackend(
     probed = true;
   }
 
-  function openSession(id: string, workspaceDir: string, appRoot: string): BwrapSession {
-    return createBwrapSession({ id, workspaceDir, appRoot, runner, options });
+  function openSession(
+    id: string,
+    workspaceDir: string,
+    appRoot: string,
+    tags?: Readonly<Record<string, string>>,
+    generationId?: string,
+    onStopped?: () => void | Promise<void>,
+  ): BwrapSession {
+    return createBwrapSession({
+      id,
+      workspaceDir,
+      appRoot,
+      runner,
+      options,
+      tags,
+      generationId,
+      onStopped,
+    });
+  }
+
+  async function openRuntimeSession(
+    id: string,
+    workspaceDir: string,
+    appRoot: string,
+    tags?: Readonly<Record<string, string>>,
+  ): Promise<BwrapSession> {
+    const current = generations.get(workspaceDir);
+    if (current && current.lifecycleState() !== "stopped") return current;
+    const releaseActive = registerActiveCachePath(workspaceDir);
+    const cacheRoot = resolveBwrapCacheRoot(appRoot, options.cacheDir);
+    const activeLease = await createBwrapCacheLease({
+      cacheRoot,
+      sessionId: basename(workspaceDir),
+    });
+    let session: BwrapSession;
+    try {
+      session = openSession(
+        id,
+        workspaceDir,
+        appRoot,
+        tags,
+        activeLease.lease.generationId,
+        async () => {
+          releaseActive();
+          await activeLease.release();
+        },
+      );
+    } catch (error) {
+      releaseActive();
+      await activeLease.release();
+      throw error;
+    }
+    generations.set(workspaceDir, session);
+    return session;
   }
 
   function resolveSeedPath(seedPath: string): string {
@@ -107,7 +161,17 @@ export function createBwrapSandboxBackend(
         optionsHash,
         options.cacheDir,
       );
-      if (existsSync(templatePath)) return { reused: true };
+      const touchTemplate = async () =>
+        await touchCacheMetadata({
+          cacheRoot: resolveBwrapCacheRoot(runtimeContext.appRoot, options.cacheDir),
+          kind: "template",
+          id: basename(templatePath),
+          templateRevision: options.templateRevision,
+        });
+      if (existsSync(templatePath)) {
+        await touchTemplate();
+        return { reused: true };
+      }
 
       log?.(`bwrap: capturing template for ${templateKey}`);
       const stagingPath = `${templatePath}.staging-${randomUUID()}`;
@@ -122,18 +186,24 @@ export function createBwrapSandboxBackend(
       } catch (error) {
         await rm(stagingPath, { force: true, recursive: true }).catch(() => {});
         // A concurrent prewarm winning the race is reuse, not failure.
-        if (existsSync(templatePath)) return { reused: true };
+        if (existsSync(templatePath)) {
+          await touchTemplate();
+          return { reused: true };
+        }
         throw error;
       }
+      await touchTemplate();
       return { reused: false };
     },
 
-    async create({ templateKey, sessionKey, runtimeContext }) {
+    async create({ templateKey, sessionKey, runtimeContext, tags }) {
       assertBwrapAvailable();
       const sessionPath = resolveSessionPath(runtimeContext.appRoot, sessionKey, options.cacheDir);
+      let cloneStrategy: BwrapCloneStrategy = "existing";
       if (!existsSync(sessionPath)) {
         if (templateKey === null) {
           await mkdir(sessionPath, { recursive: true });
+          cloneStrategy = "empty";
         } else {
           const templatePath = resolveTemplatePath(
             runtimeContext.appRoot,
@@ -147,10 +217,26 @@ export function createBwrapSandboxBackend(
               templateKey,
             });
           }
-          await copyDirectoryAtomically(templatePath, sessionPath);
+          cloneStrategy = await cloneDirectoryAtomically({
+            sourcePath: templatePath,
+            targetPath: sessionPath,
+            copyDirectory: input.copyDirectory,
+          });
         }
       }
-      const session = openSession(sessionKey, sessionPath, runtimeContext.appRoot);
+      await touchCacheMetadata({
+        cacheRoot: resolveBwrapCacheRoot(runtimeContext.appRoot, options.cacheDir),
+        kind: "session",
+        id: basename(sessionPath),
+        tags,
+        cloneStrategy,
+      });
+      const session = await openRuntimeSession(
+        sessionKey,
+        sessionPath,
+        runtimeContext.appRoot,
+        tags,
+      );
       return {
         session,
         useSessionFn: async (useOptions) => await useSession(session, useOptions),

@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { WORKSPACE_ROOT } from "./paths.js";
 import { createNodeProcessRunner, describeMissingPrereqs, isBwrapAvailable } from "./process.js";
 
@@ -60,6 +60,21 @@ describe("createNodeProcessRunner", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
+  test("kill rejects when signaling the process group is denied", async () => {
+    const groupError = Object.assign(new Error("group kill denied"), { code: "EPERM" });
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid) => {
+      if (pid < 0) throw groupError;
+      return true;
+    });
+    try {
+      const proc = runner.spawn(["sh", "-c", "sleep 30"]);
+      await expect(proc.kill()).rejects.toThrow("group kill denied");
+      await proc.wait().catch(() => undefined);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
   test("kill terminates descendants in the spawned process group", async () => {
     const proc = runner.spawn(["sh", "-c", "sleep 30 & echo $!; wait"]);
     const reader = proc.stdout.getReader();
@@ -80,6 +95,33 @@ describe("createNodeProcessRunner", () => {
     const waiting = proc.wait();
     controller.abort(new Error("stop-now"));
     await expect(waiting).rejects.toThrow("stop-now");
+  });
+
+  test("an abort after process exit cannot rewrite the settled result", async () => {
+    const controller = new AbortController();
+    const proc = runner.spawn(["sh", "-c", "exit 0"], { abortSignal: controller.signal });
+    await expect(proc.wait()).resolves.toEqual({ exitCode: 0 });
+
+    controller.abort(new Error("too-late"));
+
+    await expect(proc.wait()).resolves.toEqual({ exitCode: 0 });
+  });
+
+  test("abort reports a process-group cleanup failure instead of hiding it", async () => {
+    const groupError = Object.assign(new Error("abort group kill denied"), { code: "EPERM" });
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid) => {
+      if (pid < 0) throw groupError;
+      return true;
+    });
+    try {
+      const controller = new AbortController();
+      const proc = runner.spawn(["sh", "-c", "sleep 30"], { abortSignal: controller.signal });
+      const waiting = proc.wait();
+      controller.abort(new Error("deadline reached"));
+      await expect(waiting).rejects.toThrow(/abort group kill denied/);
+    } finally {
+      kill.mockRestore();
+    }
   });
 
   test("spawning a missing executable rejects wait()", async () => {
