@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/evelandhq/sandbox-bwrap/compare/v0.1.2...v0.1.3) (2026-08-17)
+
+
+### Fixes
+
+* preserve sandbox lifecycle semantics ([6f8074b](https://github.com/evelandhq/sandbox-bwrap/commit/6f8074bef358e0d30f1a441d0e8cf4a7ba3e96c0))
+
 ## [0.1.2](https://github.com/evelandhq/sandbox-bwrap/compare/v0.1.1...v0.1.2) (2026-08-17)
 
 
