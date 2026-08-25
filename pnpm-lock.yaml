@@ -15,8 +15,8 @@ importers:
         specifier: ^7.0.44
         version: 7.0.52(zod@4.4.3)
       eve:
-        specifier: 0.44.3
-        version: 0.44.3(ai@7.0.52(zod@4.4.3))(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.6))
+        specifier: 0.44.4
+        version: 0.44.4(ai@7.0.52(zod@4.4.3))(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.6))
       eve-floor:
         specifier: npm:eve@0.27.13
         version: eve@0.27.13(ai@7.0.52(zod@4.4.3))(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.6))
@@ -709,15 +709,15 @@ packages:
       microsandbox:
         optional: true
 
-  eve@0.44.3:
-    resolution: {integrity: sha512-YepBrHWm2Ecf7kmlPwzNeljTkI+LesZ8vC1q8SKCjgog9tKaZxgyIms7S/R3a8vRoQ8gnAtZuZdxXZgD6eKZbA==}
+  eve@0.44.4:
+    resolution: {integrity: sha512-juaOffL+doGo8z1gfB5FrO750dZKMaY5G3Qm96N+bASs5nHBwhkGfqHKEyTFGZmXaxBWJpnDRnEgL4rAKtQPcw==}
     engines: {node: '>=24'}
     hasBin: true
     peerDependencies:
       '@opentelemetry/api': ^1.0.0
       ai: ^7.0.58
       braintrust: ^3.0.0
-      just-bash: ^3.0.0
+      just-bash: ^3.1.0
       microsandbox: ^0.5.0
     peerDependenciesMeta:
       '@opentelemetry/api':
@@ -1609,7 +1609,7 @@ snapshots:
       - xml2js
       - zephyr-agent
 
-  eve@0.44.3(ai@7.0.52(zod@4.4.3))(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.6)):
+  eve@0.44.4(ai@7.0.52(zod@4.4.3))(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.6)):
     dependencies:
       ai: 7.0.52(zod@4.4.3)
       nitro: 3.0.260610-beta(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.6))
