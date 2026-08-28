@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.2.0...v0.3.0) (2026-08-28)
+
+
+### Features
+
+* implement SandboxBackendHandle.delete() required by eve 0.47 ([#23](https://github.com/evelandhq/sandbox-bwrap/issues/23)) ([4564f83](https://github.com/evelandhq/sandbox-bwrap/commit/4564f833142a91667f63c308b54da7e1bf9ed919))
+
 ## [0.2.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.1.3...v0.2.0) (2026-08-17)
 
 
