@@ -20,6 +20,7 @@ import {
   cloneDirectoryAtomically,
   createBwrapCacheLease,
   registerActiveCachePath,
+  removeCacheMetadata,
   touchCacheMetadata,
   type BwrapCloneStrategy,
   type BwrapDirectoryCopier,
@@ -258,6 +259,23 @@ export function createBwrapSandboxBackend(
         // it stays on disk and the session reattaches on the next start.
         async shutdown() {
           await session.killAll();
+        },
+        // eve (>=0.47) calls this when authored code runs
+        // `ctx.getSandbox().delete()`: the sandbox and its disposable state are
+        // gone for good, and the next access reprovisions from the template.
+        // For bwrap the disposable state is the session workspace directory and
+        // its metadata sidecar; the template it was cloned from is shared and
+        // must survive.
+        async delete(deleteOptions) {
+          deleteOptions?.abortSignal?.throwIfAborted();
+          await session.killAll();
+          generations.delete(sessionPath);
+          await rm(sessionPath, { force: true, recursive: true });
+          await removeCacheMetadata({
+            cacheRoot: resolveBwrapCacheRoot(runtimeContext.appRoot, options.cacheDir),
+            kind: "session",
+            id: basename(sessionPath),
+          });
         },
       };
     },

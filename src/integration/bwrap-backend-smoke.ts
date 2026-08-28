@@ -278,6 +278,25 @@ async function main(): Promise<void> {
     });
     assert.equal(await other.session.readTextFile({ path: "notes/hello.txt" }), null);
 
+    // delete() (eve >=0.47) permanently removes one session and nothing else:
+    // sess-2's workspace goes away, sess-1 and the shared template survive,
+    // and re-creating sess-2 reprovisions template state without the deleted
+    // session's writes.
+    await other.session.writeTextFile({ path: "notes/doomed.txt", content: "doomed" });
+    const deleteSleeper = await other.session.spawn({ command: "sleep 300" });
+    const deleteSleeperPid = deleteSleeper.pid;
+    await other.delete();
+    assert.ok(deleteSleeperPid !== undefined, "spawn must expose a pid");
+    assert.equal(processIsAlive(deleteSleeperPid), false, "delete() must kill spawned processes");
+    assert.equal(await again.session.readTextFile({ path: "notes/hello.txt" }), "persisted");
+    const reprovisioned = await backend.create({
+      templateKey: "smoke-template",
+      sessionKey: "sess-2",
+      runtimeContext,
+    });
+    assert.equal(await reprovisioned.session.readTextFile({ path: "seeded.txt" }), "from-seed");
+    assert.equal(await reprovisioned.session.readTextFile({ path: "notes/doomed.txt" }), null);
+
     // A real timed-out run must reap its full process group, including a
     // background descendant, and leave the durable session usable afterwards.
     const boundedBackend = createBwrapSandboxBackend({
