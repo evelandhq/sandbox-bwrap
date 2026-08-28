@@ -376,6 +376,87 @@ describe("create", () => {
     expect(await reopened.session.readTextFile({ path: "keep.txt" })).toBe("durable");
   });
 
+  /**
+   * eve (>=0.47) calls `delete()` when authored code runs
+   * `ctx.getSandbox().delete()`: the sandbox is gone for good and the next
+   * access reprovisions it. What this pins is the split the contract demands —
+   * the session workspace and its metadata sidecar are removed while the
+   * shared template survives, so a later create() starts from template state
+   * instead of reopening deleted files.
+   */
+  test("delete kills live processes and permanently removes the session, not the template", async () => {
+    const killed: number[] = [];
+    const exits = new Map<number, (value: { exitCode: number }) => void>();
+    let pid = 0;
+    const runner: ProcessRunner = {
+      spawn() {
+        const id = ++pid;
+        const exit = new Promise<{ exitCode: number }>((resolve) => exits.set(id, resolve));
+        const empty = () => new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+        return {
+          pid: id,
+          stdout: empty(),
+          stderr: empty(),
+          wait: async () => await exit,
+          kill: async () => {
+            killed.push(id);
+            exits.get(id)?.({ exitCode: 137 });
+          },
+        };
+      },
+    };
+    const root = await mkdtemp(path.join(os.tmpdir(), "bwrap-backend-delete-"));
+    const cacheDir = path.join(root, "cache");
+    const backend = createBwrapSandboxBackend({ runner, createOptions: { cacheDir } });
+    const runtimeContext = { appRoot: path.join(root, "release") };
+    await backend.prewarm({
+      templateKey: "tpl-del",
+      runtimeContext,
+      seedFiles: [{ path: "seed.txt", content: "seeded" }],
+    });
+
+    const handle = await backend.create({
+      templateKey: "tpl-del",
+      sessionKey: "sess-delete",
+      runtimeContext,
+    });
+    await handle.session.writeTextFile({ path: "scratch.txt", content: "doomed" });
+    await handle.session.spawn({ command: "sleep 60" });
+    const [sessionId] = await readdir(path.join(cacheDir, "sessions"));
+
+    await handle.delete();
+
+    expect(killed).toEqual([1]);
+    await expect(readdir(path.join(cacheDir, "sessions"))).resolves.toEqual([]);
+    await expect(
+      readFile(path.join(cacheDir, "metadata", "sessions", `${sessionId}.json`), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+
+    const reprovisioned = await backend.create({
+      templateKey: "tpl-del",
+      sessionKey: "sess-delete",
+      runtimeContext,
+    });
+    expect(await reprovisioned.session.readTextFile({ path: "seed.txt" })).toBe("seeded");
+    expect(await reprovisioned.session.readTextFile({ path: "scratch.txt" })).toBeNull();
+  });
+
+  test("delete honors an already-aborted signal before touching the session", async () => {
+    const { backend, runtimeContext } = await makeBackend();
+    const handle = await backend.create({
+      templateKey: null,
+      sessionKey: "sess-delete-abort",
+      runtimeContext,
+    });
+    await handle.session.writeTextFile({ path: "keep.txt", content: "durable" });
+
+    await expect(handle.delete({ abortSignal: AbortSignal.abort() })).rejects.toMatchObject({
+      name: "AbortError",
+    });
+
+    expect(await handle.session.readTextFile({ path: "keep.txt" })).toBe("durable");
+  });
+
   test("handles opened for the same durable session share one compute generation", async () => {
     const killed: number[] = [];
     let resolveExit!: (value: { exitCode: number }) => void;

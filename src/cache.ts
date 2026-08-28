@@ -388,3 +388,16 @@ export async function touchCacheMetadata(input: {
   }
   return metadata;
 }
+
+/**
+ * Removes one cache entry's metadata sidecar. Deleting a session removes its
+ * workspace directory too, and a metadata file without a directory would read
+ * as an orphan to `pruneBwrapCache` — remove both together.
+ */
+export async function removeCacheMetadata(input: {
+  cacheRoot: string;
+  kind: BwrapCacheEntryKind;
+  id: string;
+}): Promise<void> {
+  await rm(metadataPath(input.cacheRoot, input.kind, input.id), { force: true });
+}
