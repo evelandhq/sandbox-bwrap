@@ -15,8 +15,8 @@ importers:
         specifier: ^7.0.44
         version: 7.0.52(zod@4.4.3)
       eve:
-        specifier: 0.52.2
-        version: 0.52.2(ai@7.0.52(zod@4.4.3))
+        specifier: 0.52.5
+        version: 0.52.5(ai@7.0.52(zod@4.4.3))
       eve-floor:
         specifier: npm:eve@0.27.13
         version: eve@0.27.13(ai@7.0.52(zod@4.4.3))(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.6))
@@ -823,20 +823,23 @@ packages:
       microsandbox:
         optional: true
 
-  eve@0.52.2:
-    resolution: {integrity: sha512-FM3aC2A3SCKQxtyhSNR5+CaIVlKJmTGb7rCqcuHEhZShDKo1IXCTt/F7r4toqkLDG6lW7VcStTku77KWiosLfg==}
+  eve@0.52.5:
+    resolution: {integrity: sha512-MuzBnkI0c6Xbi4gIELCLr7wRSlgEQ1y8r1boSmt8NOZXOmFR8egNs0PIqaO8wwomiRoL9iLpUV/3P6ywg5MEXg==}
     engines: {node: '>=24'}
     hasBin: true
     peerDependencies:
       '@opentelemetry/api': ^1.0.0
       ai: ^7.0.82
       braintrust: ^3.0.0
+      dd-trace: ^6.13.0
       just-bash: ^3.1.0
       microsandbox: ^0.5.0
     peerDependenciesMeta:
       '@opentelemetry/api':
         optional: true
       braintrust:
+        optional: true
+      dd-trace:
         optional: true
       just-bash:
         optional: true
@@ -1719,6 +1722,10 @@ snapshots:
     optionalDependencies:
       srvx: 0.11.22
 
+  crossws@0.4.12(srvx@0.11.22):
+    optionalDependencies:
+      srvx: 0.11.22
+
   crossws@0.4.12(srvx@1.0.3):
     optionalDependencies:
       srvx: 1.0.3
@@ -1731,7 +1738,7 @@ snapshots:
 
   env-runner@0.1.16:
     dependencies:
-      crossws: 0.4.10(srvx@0.11.22)
+      crossws: 0.4.12(srvx@0.11.22)
       exsolve: 1.1.1
       httpxy: 0.5.5
       srvx: 0.11.22
@@ -1823,7 +1830,7 @@ snapshots:
       - xml2js
       - zephyr-agent
 
-  eve@0.52.2(ai@7.0.52(zod@4.4.3)):
+  eve@0.52.5(ai@7.0.52(zod@4.4.3)):
     dependencies:
       ai: 7.0.52(zod@4.4.3)
       nitro: 3.0.260903-beta
@@ -2158,7 +2165,7 @@ snapshots:
       lightningcss: 1.33.0
       picomatch: 4.0.5
       postcss: 8.5.25
-      rolldown: 1.2.2
+      rolldown: 1.2.7
       tinyglobby: 0.2.17
     optionalDependencies:
       '@types/node': 26.1.2
