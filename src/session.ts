@@ -10,7 +10,6 @@ import { buildBwrapExecArgs, DEFAULT_SANDBOX_PATH } from "./args.js";
 import type { ResolvedBwrapSandboxOptions } from "./options.js";
 import {
   isWithinWorkspaceReal,
-  resolveBwrapCacheRoot,
   resolveWorkspacePath,
   toHostPath,
   WORKSPACE_ROOT,
@@ -25,7 +24,12 @@ import type {
 export interface CreateBwrapSessionInput {
   readonly id: string;
   readonly workspaceDir: string;
-  readonly appRoot: string;
+  /**
+   * Host directories holding templates and session workspaces. Every one is
+   * masked with an empty tmpfs so a sandboxed command can never read another
+   * session's workspace or a template it was not cloned from.
+   */
+  readonly cacheRoots: readonly string[];
   readonly runner: ProcessRunner;
   readonly options: ResolvedBwrapSandboxOptions;
   readonly generationId?: string;
@@ -111,6 +115,13 @@ function createRunAbortSignal(
  * session tracks the processes it spawned and can terminate them on demand.
  */
 export type BwrapSession = SandboxSession & {
+  /**
+   * Stable identifier of the durable session this handle wraps. eve 0.64
+   * dropped `id` from `SandboxSession`, but every earlier line requires it.
+   */
+  readonly id: string;
+  /** Coarse egress switch; always present here, optional on eve 0.64's `SandboxSession`. */
+  setNetworkPolicy(policy: SandboxNetworkPolicy): Promise<void>;
   /** Kills every process this session spawned that has not yet exited. Idempotent. */
   killAll(): Promise<void>;
   /** Internal compute-generation state used to coordinate repeated handles. */
@@ -118,7 +129,7 @@ export type BwrapSession = SandboxSession & {
 };
 
 export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession {
-  const { id, workspaceDir, appRoot, runner, options } = input;
+  const { id, workspaceDir, cacheRoots, runner, options } = input;
   const generationId = input.generationId ?? randomUUID();
   const tags = input.tags ?? {};
   let networkPolicy: "allow-all" | "deny-all" = options.networkPolicy;
@@ -287,10 +298,9 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       ...options.env,
       ...spawnOptions.env,
     };
-    const hidePaths = [
-      resolveBwrapCacheRoot(appRoot, options.cacheDir),
-      ...options.hidePaths,
-    ].filter((path) => existsSync(path));
+    const hidePaths = [...new Set([...cacheRoots, ...options.hidePaths])].filter((path) =>
+      existsSync(path),
+    );
     const argv = buildBwrapExecArgs({
       bwrapPath: options.bwrapPath,
       workspaceDir,

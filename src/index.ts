@@ -1,12 +1,34 @@
-import type { SandboxBackend } from "eve/sandbox";
 import { createBwrapSandboxBackend } from "./backend.js";
-import type { BwrapSandboxCreateOptions, BwrapSandboxUseOptions } from "./options.js";
+import type { BwrapSandboxBackend } from "./backend-contract.js";
+import type { BwrapSandboxCreateOptions } from "./options.js";
 
 export {
   BWRAP_BACKEND_NAME,
   createBwrapSandboxBackend,
   type CreateBwrapSandboxBackendInput,
 } from "./backend.js";
+export type {
+  BwrapBackendBootstrapContext,
+  BwrapBackendCreateInput,
+  BwrapBackendHandle,
+  BwrapBackendPrewarmInput,
+  BwrapBackendRuntimeContext,
+  BwrapBackendSessionState,
+  BwrapSandboxBackend,
+  BwrapSeedFile,
+} from "./backend-contract.js";
+export { BwrapTemplateNotProvisionedError } from "./errors.js";
+export {
+  BWRAP_PROVIDER_STATE_PROTOCOL_VERSION,
+  createBwrapSandboxProviderDefinition,
+  type BwrapPreparedArtifact,
+  type BwrapSandboxEnvironmentOptions,
+  type BwrapSandboxOpenOptions,
+  type BwrapSandboxProviderDefinition,
+  type BwrapSessionState,
+  type CreateBwrapSandboxProviderDefinitionInput,
+} from "./provider-definition.js";
+export type { BwrapSession } from "./session.js";
 export type {
   BwrapNetworkPolicy,
   BwrapSandboxCreateOptions,
@@ -38,7 +60,9 @@ export { isBwrapAvailable } from "./process.js";
 export type { ProcessRunner, SpawnedProcess } from "./process.js";
 
 /**
- * Creates the bubblewrap sandbox backend for `defineSandbox({ backend })`.
+ * Creates the bubblewrap sandbox backend for `defineSandbox({ backend })`, the
+ * sandbox API of eve 0.62 and 0.63. On eve 0.64 and later use `BwrapSandbox`
+ * from `@evelandhq/sandbox-bwrap/provider` instead.
  *
  * ```ts
  * // agent/sandbox.ts
@@ -50,8 +74,6 @@ export type { ProcessRunner, SpawnedProcess } from "./process.js";
  * });
  * ```
  */
-export function bwrap(
-  options?: BwrapSandboxCreateOptions,
-): SandboxBackend<BwrapSandboxUseOptions, BwrapSandboxUseOptions> {
+export function bwrap(options?: BwrapSandboxCreateOptions): BwrapSandboxBackend {
   return createBwrapSandboxBackend({ createOptions: options });
 }

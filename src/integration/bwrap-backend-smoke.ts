@@ -1,4 +1,4 @@
-// Real-bwrap backend contract test. Requires Linux + bubblewrap + bash — run it
+// Real-bwrap backend and provider contract test. Requires Linux + bubblewrap + bash — run it
 // inside the Lima VM via infra/integration/run.sh, not on a dev laptop.
 // It is intentionally run as an unprivileged user under systemd hardening
 // (NoNewPrivileges, ProtectSystem=strict) to mirror a deployed eve agent.
@@ -7,9 +7,14 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { SandboxTemplateNotProvisionedError } from "eve/sandbox";
+import { SandboxTemplateNotProvisionedError } from "eve-floor/sandbox";
+import type { SandboxProviderSessionContext } from "eve/sandbox/provider";
 import { createBwrapSandboxBackend } from "../backend.js";
 import { isBwrapAvailable } from "../process.js";
+import {
+  createBwrapSandboxProviderDefinition,
+  type BwrapSandboxEnvironmentOptions,
+} from "../provider-definition.js";
 
 const SECRET = "smoke-secret-do-not-leak";
 
@@ -39,6 +44,103 @@ async function countBwrapZombies(): Promise<number> {
     }
   }
   return zombies;
+}
+
+const IFACE_COMMAND = `node -e "console.log(Object.keys(require('node:os').networkInterfaces()).join(' '))"`;
+
+function nonLoopbackInterfaces(stdout: string): string[] {
+  return stdout
+    .trim()
+    .split(/\s+/)
+    .filter((name) => name !== "" && name !== "lo");
+}
+
+/**
+ * The eve >=0.64 provider over the same real binary: authored preparation runs
+ * inside bwrap at prepare time, the open-time network policy holds, and a
+ * session resumed by a fresh definition (a restarted process) reopens the same
+ * workspace under the policy it recorded.
+ */
+async function providerSmoke(appRoot: string): Promise<void> {
+  const storagePath = path.join(appRoot, "provider-release", ".eve", "sandbox-cache");
+  const cacheDir = path.join(appRoot, "provider-sessions");
+  const environmentOptions: BwrapSandboxEnvironmentOptions = {
+    cacheDir,
+    async prepare(sandbox) {
+      const result = await sandbox.run({ command: "printf prepared-in-bwrap > prepared.txt" });
+      assert.equal(result.exitCode, 0, `provider prepare command failed: ${result.stderr}`);
+    },
+  };
+  const environment = createBwrapSandboxProviderDefinition().environment(environmentOptions);
+  const artifact = await environment.prepare({
+    files: { list: async () => [], read: async () => new Uint8Array(), readText: async () => "" },
+    host: {
+      loadOptionalPackage: async () => {
+        throw new Error("unused");
+      },
+      resolveProjectPath: (projectPath) => projectPath,
+    },
+    resources: {
+      source: { kind: "inline", key: "smoke" },
+      workspace: {
+        key: "smoke:workspace",
+        mountPath: "/eve/resources/workspace",
+        targetPath: "/workspace",
+        files: [{ relativePath: "seeded.txt", content: "provider-seed" }],
+      },
+    },
+    sourceRevision: "smoke-rev",
+    storagePath,
+  });
+  const ctx = {
+    host: { loadOptionalPackage: async () => undefined, resolveProjectPath: (p: string) => p },
+    session: {
+      auth: { current: null, initiator: null },
+      id: "provider-session-1",
+      turn: { id: "t", sequence: 0 },
+    },
+    storagePath,
+  } as unknown as SandboxProviderSessionContext;
+
+  const { handle, state } = await environment.start(ctx, { networkPolicy: "deny-all" }, artifact);
+  const prepared = await handle.sandbox.run({ command: "cat prepared.txt seeded.txt" });
+  assert.equal(
+    prepared.stdout,
+    "prepared-in-bwrapprovider-seed",
+    "template state must reach the session",
+  );
+  const denied = await handle.sandbox.run({ command: IFACE_COMMAND });
+  assert.equal(nonLoopbackInterfaces(denied.stdout).length, 0, "open-time deny-all must hold");
+  const hidden = await handle.sandbox.run({
+    command: `ls -A ${path.join(storagePath, "bwrap")} ${cacheDir}`,
+  });
+  assert.equal(
+    hidden.stdout.replace(/^\S+:$/gm, "").trim(),
+    "",
+    "template and session roots must be hidden by tmpfs",
+  );
+
+  await handle.sandbox.writeTextFile({ path: "notes/provider.txt", content: "durable" });
+  const sleeper = await handle.sandbox.spawn({ command: "sleep 300" });
+  const sleeperPid = sleeper.pid;
+  await handle.onRuntimeShutdown();
+  assert.ok(sleeperPid !== undefined, "spawn must expose a pid");
+  assert.equal(processIsAlive(sleeperPid), false, "onRuntimeShutdown must kill spawned processes");
+
+  // A fresh definition stands in for the restarted agent process.
+  const restarted = createBwrapSandboxProviderDefinition().environment(environmentOptions);
+  const resumed = await restarted.resume(ctx, artifact, state);
+  assert.equal(await resumed.sandbox.readTextFile({ path: "notes/provider.txt" }), "durable");
+  const stillDenied = await resumed.sandbox.run({ command: IFACE_COMMAND });
+  assert.equal(
+    nonLoopbackInterfaces(stillDenied.stdout).length,
+    0,
+    "a resumed session must keep its recorded network policy",
+  );
+
+  await resumed.onSessionDelete();
+  await assert.rejects(restarted.resume(ctx, artifact, state), /no longer exists/);
+  console.log("PROVIDER SMOKE: prepare, start, restart + resume and delete held under real bwrap");
 }
 
 async function main(): Promise<void> {
@@ -338,6 +440,8 @@ async function main(): Promise<void> {
       "session must recover after output-limit cleanup",
     );
     await boundedHandle.shutdown();
+
+    await providerSmoke(appRoot);
 
     console.log("BWRAP SMOKE OK");
   } finally {

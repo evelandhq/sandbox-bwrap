@@ -1,7 +1,8 @@
 # @evelandhq/sandbox-bwrap
 
-A [bubblewrap](https://github.com/containers/bubblewrap)-based `SandboxBackend` for
-[eve](https://www.npmjs.com/package/eve) agents. It gives agent-executed code a real
+A [bubblewrap](https://github.com/containers/bubblewrap)-based sandbox for
+[eve](https://www.npmjs.com/package/eve) agents: a sandbox provider for eve 0.64 and later,
+and a `SandboxBackend` for eve 0.62 and 0.63. It gives agent-executed code a real
 Linux sandbox — actual binaries, isolated filesystem, coarse network control — without
 requiring a Docker daemon or KVM.
 
@@ -16,7 +17,8 @@ namespaces.
 
 ## Usage
 
-**Deployed on eveland:** you do nothing. eveland's Docker and systemd runtimes generate
+**Deployed on eveland:** you do nothing. (What follows describes the integration for eve
+0.63 and earlier.) eveland's Docker and systemd runtimes generate
 the sandbox module into the release directory at build time — `agent/sandbox.js` for a flat
 agent, or `agent/sandbox/sandbox.js` when a sandbox folder exists, recursively for every
 subagent — and vendors this package's built output beside it, so agent projects never declare
@@ -35,7 +37,47 @@ the eveland build pipeline, so it falls back to eve's default backend chain (usu
 build log looks like and what happens when the sandbox does not work on the host.
 
 **Standalone use of this package** (outside eveland, or in any project that manages its
-own `agent/sandbox.ts`) still works the manual way:
+own `agent/sandbox.ts`) depends on which sandbox API your eve has.
+
+### eve 0.64 and later: `BwrapSandbox`
+
+eve 0.64 replaced sandbox backends with providers. Import the provider from the
+`/provider` entry point and export its environment:
+
+```ts
+// agent/sandbox.ts
+import { defineSandbox } from "eve/sandbox";
+import { BwrapSandbox } from "@evelandhq/sandbox-bwrap/provider";
+
+export const environment = BwrapSandbox.environment({
+  // Optional: setup every new sandbox inherits. Runs once, during `eve build`.
+  prepare: async (sandbox) => {
+    const result = await sandbox.run({ command: "pip install --user requests" });
+    if (result.exitCode !== 0) throw new Error(result.stderr);
+  },
+});
+
+export default defineSandbox(() => environment.open());
+```
+
+- `eve build` prepares the template: it writes the workspace and skill trees, then runs
+  `prepare` inside bwrap, so a build that runs `prepare` needs bwrap on the build host. The
+  template lives under `.eve/sandbox-cache/bwrap/templates` in the built app, and eve records
+  its absolute path. Serve the build from where it was built, or rebuild on the deploy host;
+  a missing template fails the first sandbox access with a rebuild message.
+- eve records which provider prepared each sandbox and refuses to open it with a different
+  one. Choose the provider from something that is the same at build and run time, not from
+  `isBwrapAvailable()` on hosts that differ.
+- `environment.open({ networkPolicy: "deny-all" })` sets a session's initial network policy.
+  It is recorded in the session state and applied again after a restart.
+- eve resumes a session from its recorded state alone. The template is not needed, so with a
+  shared `cacheDir` a session keeps its workspace when it moves to a newer deployment.
+- The `/provider` entry point imports `eve/sandbox/provider`, which exists only from eve
+  0.64 on. The package root imports nothing from eve at runtime and also exports the plain
+  provider definition, `createBwrapSandboxProviderDefinition()`, for callers that call eve's
+  `defineSandboxProvider` themselves.
+
+### eve 0.62 and 0.63: `bwrap()`
 
 ```ts
 // agent/sandbox.ts
@@ -50,20 +92,23 @@ export default defineSandbox({
 
 ### eve version requirement
 
-This package requires `eve` `>=0.27.0 <1.0.0`.
+This package requires `eve` `>=0.62.0 <1.0.0`.
 
 The range is deliberately wide. eve's 0.x releases use caret-incompatible minor bumps,
 so a package that pins a narrow window has to republish for every eve minor — which is
 churn for consumers, not safety, when the surface actually consumed is one small
-interface (`SandboxBackend` from `eve/sandbox`) that changes rarely. Rather than
+interface that changes rarely. The range spans two such interfaces: `SandboxBackend` for
+eve 0.62 and 0.63, and the sandbox provider contract from eve 0.64 on. Rather than
 re-declaring the window, CI keeps the claim honest from both ends:
 `src/eve-compatibility.test.ts` typechecks the backend against the range's exact floor
-(0.27.13) and the newest verified release on every run, and a scheduled workflow re-runs
-the suite against `eve@latest` so a breaking eve minor shows up as a red build here
-instead of a bug report from your deployment. That is not theoretical: eve 0.32.0 added a
-required `stop()` to the backend handle. This package implements it; 0.1.0 does not, and
-pairing that release with eve `>=0.32.0` resolves cleanly and then fails at runtime the
-first time authored code calls `ctx.getSandbox().stop()`.
+(0.62.0; 0.63.0, the last eve that calls backends, ships identical sandbox types), and
+typechecks the provider against the newest verified release; a scheduled workflow re-runs the suite against
+`eve@latest` so a breaking eve minor shows up as a red build here instead of a bug report
+from your deployment. That is not theoretical: eve 0.32.0 added a required `stop()` to the
+backend handle. This package implements it; 0.1.0 does not, and pairing that release with
+eve `>=0.32.0` resolves cleanly and then fails at runtime the first time authored code calls
+`ctx.getSandbox().stop()`. Likewise, releases up to 0.3.0 import a value that eve 0.64
+removed, so they cannot load at all on eve 0.64 and later.
 
 The backend implements both handle lifecycle methods by killing every process the session
 has spawned that has not yet exited: `shutdown()`, which eve calls at server teardown and
@@ -74,29 +119,54 @@ because the processes are the compute. Neither method touches the session's work
 directory — it is durable state. Cleanup closes that compute generation to new commands;
 the next backend `create()` opens a fresh generation over the same workspace. Repeated
 `create()` calls through one backend instance share the live generation, so one handle
-cannot race a new spawn past another handle's cleanup barrier.
+cannot race a new spawn past another handle's cleanup barrier. The provider's
+`onSessionStop()` and `onRuntimeShutdown()` do the same, and its `resume()` shares the live
+generation the same way.
 
 ### Options
 
-| Option                   | Default                              | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ------------------------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `env`                    | `{}`                                 | Environment variables set for every sandboxed command.                                                                                                                                                                                                                                                                                                                                                                                            |
-| `networkPolicy`          | `"allow-all"`                        | `"allow-all"` shares the host network; `"deny-all"` runs each command with no network (`--unshare-net`). `setNetworkPolicy` can switch between the two at run time; granular domain policies are rejected (use the Vercel backend for those).                                                                                                                                                                                                     |
-| `hidePaths`              | `[]`                                 | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                                                                                                                                        |
-| `bwrapPath`              | `"bwrap"`                            | bwrap executable to invoke.                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `cacheDir`               | `<appRoot>/.eve/sandbox-cache/bwrap` | Absolute directory holding templates and durable session workspaces. Pin this outside the release directory so a redeploy does not discard durable session state: since eve 0.22.0, eve keys session sandboxes per durable session, not per deployment, so an `appRoot`-derived default would silently destroy every session's `/workspace` on the next redeploy. The generated eveland module always sets this from `EVELAND_SANDBOX_CACHE_DIR`. |
-| `templateRevision`       | `null`                               | Optional immutable release identity included in the template cache key but not the session path. Change it when seed files change so new Sessions use a fresh template without overwriting durable workspaces. Eveland sets it from its internal `EVELAND_SANDBOX_TEMPLATE_REVISION`.                                                                                                                                                             |
-| `runTimeoutMs`           | `600000`                             | Hard wall-clock limit for one `run()` command. Timeout aborts the command and kills its complete bwrap process group. Set `null` to disable it. The limit deliberately does not apply to `spawn()`, which is the API for long-running processes.                                                                                                                                                                                                  |
-| `maxConcurrentProcesses` | `64`                                 | Maximum live `run()`/`spawn()` commands admitted in one compute generation. A live `spawn()` counts until it actually exits, even when its caller never waits. Set `null` to disable.                                                                                                                                                                                                                                                             |
-| `maxOutputBytes`         | `16777216`                           | Maximum combined stdout and stderr retained by one `run()` call. Exceeding it aborts and reaps the complete process group. Set `null` to disable. Streaming `spawn()` output is not retained by this backend.                                                                                                                                                                                                                                     |
-| `onEvent`                | `undefined`                          | Best-effort structured lifecycle sink for generation, command, and cleanup events. Sink failures are ignored so telemetry cannot change command behavior.                                                                                                                                                                                                                                                                                         |
+| Option                   | Default                              | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------ | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `env`                    | `{}`                                 | Environment variables set for every sandboxed command.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `networkPolicy`          | `"allow-all"`                        | `"allow-all"` shares the host network; `"deny-all"` runs each command with no network (`--unshare-net`). `setNetworkPolicy` can switch between the two at run time; granular domain policies are rejected (use the Vercel backend for those).                                                                                                                                                                                                                                                                                                            |
+| `hidePaths`              | `[]`                                 | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `bwrapPath`              | `"bwrap"`                            | bwrap executable to invoke.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `cacheDir`               | `<appRoot>/.eve/sandbox-cache/bwrap` | Absolute directory holding durable session workspaces, and, for the backend, templates. The provider always keeps templates in eve's build storage, where eve records them. Pin this outside the release directory so a redeploy does not discard durable session state: since eve 0.22.0, eve keys session sandboxes per durable session, not per deployment, so an `appRoot`-derived default would silently destroy every session's `/workspace` on the next redeploy. The generated eveland module always sets this from `EVELAND_SANDBOX_CACHE_DIR`. |
+| `templateRevision`       | `null`                               | Backend only. Optional immutable release identity included in the template cache key but not the session path. Change it when seed files change so new Sessions use a fresh template without overwriting durable workspaces. Eveland sets it from its internal `EVELAND_SANDBOX_TEMPLATE_REVISION`.                                                                                                                                                                                                                                                      |
+| `runTimeoutMs`           | `600000`                             | Hard wall-clock limit for one `run()` command. Timeout aborts the command and kills its complete bwrap process group. Set `null` to disable it. The limit deliberately does not apply to `spawn()`, which is the API for long-running processes.                                                                                                                                                                                                                                                                                                         |
+| `maxConcurrentProcesses` | `64`                                 | Maximum live `run()`/`spawn()` commands admitted in one compute generation. A live `spawn()` counts until it actually exits, even when its caller never waits. Set `null` to disable.                                                                                                                                                                                                                                                                                                                                                                    |
+| `maxOutputBytes`         | `16777216`                           | Maximum combined stdout and stderr retained by one `run()` call. Exceeding it aborts and reaps the complete process group. Set `null` to disable. Streaming `spawn()` output is not retained by this backend.                                                                                                                                                                                                                                                                                                                                            |
+| `onEvent`                | `undefined`                          | Best-effort structured lifecycle sink for generation, command, and cleanup events. Sink failures are ignored so telemetry cannot change command behavior.                                                                                                                                                                                                                                                                                                                                                                                                |
 
-Both lifecycle callbacks may call `use({ networkPolicy: "allow-all" | "deny-all" })`. The
+`BwrapSandbox.environment()` takes the same options except `templateRevision`, which the
+provider does not need: eve's source revision and resource keys already key its templates.
+It adds `prepare`, described above.
+
+With the backend, both lifecycle callbacks may call `use({ networkPolicy: "allow-all" | "deny-all" })`. The
 policy is applied before `use()` returns the template or live Session, so subsequent commands in
 that callback use the requested network boundary. Calling `use()` without options keeps the
 backend's configured policy.
 
 ## How it works
+
+The provider (eve 0.64 and later):
+
+- **prepare** (`eve build`): writes eve's workspace tree and skill tree
+  (`$HOME/.agents/skills/**` lands at `/workspace/.agents/skills/**`) into a staging
+  directory, runs the authored `prepare` inside bwrap, stops anything it left running, and
+  atomically renames the result into `<storage>/bwrap/templates/<hash>`, where `<storage>`
+  is eve's sandbox storage directory, `<appRoot>/.eve/sandbox-cache`. The key covers eve's
+  source revision, the resource keys, the options, and the source of `prepare`.
+- **start** (first sandbox access of a session): clones the template into
+  `<cacheDir>/sessions/<hash>`, keyed by eve's session id, and returns the session state eve
+  persists: the session key and the network policy.
+- **resume** (every later access, and after restarts): reopens the recorded workspace and
+  applies the recorded network policy to a new compute generation. It fails instead of
+  recreating a workspace that is gone.
+- **onSessionDelete**: kills the session's processes and removes its workspace and
+  metadata; the template survives.
+
+The backend (eve 0.62 and 0.63):
 
 - **prewarm** (build time): resolves Eve's `$HOME/.agents/skills/**` seed paths to
   `/workspace/.agents/skills/**`, writes every seed into a staging directory, then runs the
@@ -123,7 +193,10 @@ backend's configured policy.
 ## Disk usage and cache management
 
 Session and template directories persist under `<cacheDir>/{sessions,templates}` across
-process restarts and reconnects, enabling fast reattach. `stop()` and `shutdown()` never
+process restarts and reconnects, enabling fast reattach. The provider keeps its templates
+under eve's storage directory instead (`<appRoot>/.eve/sandbox-cache/bwrap/templates`), so
+they go away with the build that prepared them; pass that `appRoot` without `cacheDir` to the
+APIs below to inspect them. `stop()` and `shutdown()` never
 delete durable state, and this package never schedules automatic deletion. On Eveland,
 the cache lives at `EVELAND_SANDBOX_CACHE_DIR` outside every release directory, so a
 redeploy does not touch it.

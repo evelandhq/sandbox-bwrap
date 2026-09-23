@@ -59,7 +59,7 @@ jobs:
         with:
           script: |
             const version = "${{ steps.eve.outputs.version }}";
-            const title = `eve ${version} breaks the SandboxBackend contract`;
+            const title = `eve ${version} breaks the sandbox contract`;
             const { data: existing } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -74,7 +74,7 @@ jobs:
               labels: ["eve-drift"],
               body: [
                 `The scheduled drift check failed against \`eve@${version}\`, which the`,
-                "declared peer range `>=0.27.0 <1.0.0` currently accepts.",
+                "declared peer range `>=0.62.0 <1.0.0` currently accepts.",
                 "",
                 `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
                 "",

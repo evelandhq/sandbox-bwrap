@@ -105,10 +105,10 @@ jobs:
         # Both ends of the declared peer range, resolved from npm exactly as a
         # consumer would get them. The typecheck job proves structural
         # compatibility; this proves the *runtime* import works, which is a
-        # separate claim -- dist/backend.js imports a value from eve/sandbox
-        # (SandboxTemplateNotProvisionedError), so a peer that typechecks could
-        # still fail to load.
-        eve: ["0.27.13", "latest"]
+        # separate claim: the package root must load without eve's runtime on
+        # every eve in the range, and the /provider entry point needs
+        # eve/sandbox/provider, which the floor (0.62) does not have.
+        eve: ["0.62.0", "latest"]
     steps:
       - uses: actions/checkout@v4
 
@@ -143,12 +143,26 @@ jobs:
           npm install --no-audit --no-fund "eve@${{ matrix.eve }}" /tmp/sandbox-bwrap-pack/evelandhq-sandbox-bwrap-*.tgz
           node -p "'resolved eve: ' + require('./node_modules/eve/package.json').version"
           cat > smoke.mjs <<'EOF'
-          import { bwrap, isBwrapAvailable, createBwrapSandboxBackend } from "@evelandhq/sandbox-bwrap";
+          import { createRequire } from "node:module";
+          import {
+            bwrap,
+            createBwrapSandboxBackend,
+            createBwrapSandboxProviderDefinition,
+            isBwrapAvailable,
+          } from "@evelandhq/sandbox-bwrap";
 
           if (typeof bwrap !== "function") throw new Error("bwrap export missing");
           if (typeof isBwrapAvailable !== "function") throw new Error("isBwrapAvailable export missing");
           if (createBwrapSandboxBackend().name !== "bwrap") throw new Error("backend name changed");
-          console.log("pack import ok");
+          if (createBwrapSandboxProviderDefinition().name !== "bwrap") throw new Error("provider name changed");
+
+          const eve = createRequire(import.meta.url)("./node_modules/eve/package.json").version;
+          const [major, minor] = eve.split(".").map(Number);
+          if (major > 0 || minor >= 64) {
+            const { BwrapSandbox } = await import("@evelandhq/sandbox-bwrap/provider");
+            if (BwrapSandbox.environment().provider !== "bwrap") throw new Error("provider entry broken");
+          }
+          console.log(`pack import ok against eve ${eve}`);
           EOF
           node smoke.mjs
 
