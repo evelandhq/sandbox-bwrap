@@ -5,8 +5,12 @@ agents; user-facing behavior belongs in `README.md`.
 
 ## What this repository is
 
-One published package, `@evelandhq/sandbox-bwrap`: a bubblewrap-backed
-implementation of eve's `SandboxBackend` interface. It was extracted from the
+One published package, `@evelandhq/sandbox-bwrap`: a bubblewrap-backed eve
+sandbox with two faces. eve 0.64 replaced sandbox backends with providers, so
+the package implements both: the `SandboxBackend` interface for eve 0.62 and
+0.63 (`bwrap()` from the root), and a sandbox provider for eve 0.64 and later
+(`BwrapSandbox` from `/provider`, a plain definition from the root). Both run
+on the same session machinery in `src/runtime.ts`. It was extracted from the
 eveland monorepo (`packages/sandbox-bwrap`) with its full history; commits
 before the extraction still carry eveland-wide subjects such as
 "feat: track eve 0.29.4".
@@ -31,7 +35,7 @@ non-obvious behaviors are deliberate and documented there:
 
 ## The eve peer range is the central invariant
 
-`peerDependencies.eve` is `>=0.27.0 <1.0.0`. That range is wide on purpose: a
+`peerDependencies.eve` is `>=0.62.0 <1.0.0`. That range is wide on purpose: a
 narrow window forced a republish for every eve minor, which is churn for
 consumers rather than safety, when the consumed surface is one small interface.
 Three mechanisms keep the wide range honest — do not remove one without
@@ -39,13 +43,16 @@ replacing it:
 
 1. `src/eve-compatibility.test.ts` typechecks the backend against the range's
    exact floor (`eve-floor`, pinned to the newest patch of the floor's minor
-   line) and against the newest verified eve. These are **type-level** tests;
-   their annotations are the assertion, so `pnpm typecheck` must run in CI, not
-   just `pnpm test`.
+   line) and the provider against the newest verified eve. These are
+   **type-level** tests; their annotations are the assertion, so
+   `pnpm typecheck` must run in CI, not just `pnpm test`. The backend's eve
+   types are declared locally in `src/backend-contract.ts`, because eve 0.64
+   removed them; only the floor test proves those copies still match.
 2. The CI `pack` job installs the real tarball against both ends of the range
-   and imports it. This is a separate claim from typechecking: `dist/backend.js`
-   imports a _value_ from `eve/sandbox`, so a version that typechecks could
-   still fail to load.
+   and imports it. This is a separate claim from typechecking. The package root
+   must import nothing from eve at runtime, so it loads on every eve in the
+   range; the `/provider` entry point imports `eve/sandbox/provider`, which
+   exists only from 0.64 on, so the job imports it only on the newest end.
 3. `.github/workflows/eve-drift.yml` re-runs the suite against `eve@latest` on a
    schedule. It is the only thing covering the `<1.0.0` ceiling, since no pinned
    dependency can verify eve releases that do not exist yet.

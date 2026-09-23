@@ -24,11 +24,7 @@ export function resolveTemplatePath(
   optionsHash: string,
   cacheDir?: string | null,
 ): string {
-  return join(
-    resolveBwrapCacheRoot(appRoot, cacheDir),
-    "templates",
-    `${keyDigest(templateKey)}-${optionsHash}`,
-  );
+  return templatePathIn(resolveBwrapCacheRoot(appRoot, cacheDir), templateKey, optionsHash);
 }
 
 export function resolveSessionPath(
@@ -36,7 +32,30 @@ export function resolveSessionPath(
   sessionKey: string,
   cacheDir?: string | null,
 ): string {
-  return join(resolveBwrapCacheRoot(appRoot, cacheDir), "sessions", keyDigest(sessionKey));
+  return sessionPathIn(resolveBwrapCacheRoot(appRoot, cacheDir), sessionKey);
+}
+
+/**
+ * The provider's cache root inside eve's sandbox storage directory
+ * (`<appRoot>/.eve/sandbox-cache`), the same place the backend's default
+ * cache root resolves to. eve prepares templates there at build time and
+ * records their path, so templates always live here, even when `cacheDir`
+ * moves session workspaces elsewhere.
+ */
+export function resolveProviderCacheRoot(storagePath: string): string {
+  return join(storagePath, "bwrap");
+}
+
+export function templatePathIn(
+  cacheRoot: string,
+  templateKey: string,
+  optionsHash: string,
+): string {
+  return join(cacheRoot, "templates", `${keyDigest(templateKey)}-${optionsHash}`);
+}
+
+export function sessionPathIn(cacheRoot: string, sessionKey: string): string {
+  return join(cacheRoot, "sessions", keyDigest(sessionKey));
 }
 
 /** Anchors a sandbox-relative path to /workspace; absolute paths pass through. */

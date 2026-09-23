@@ -2,31 +2,21 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, rename, rm } from "node:fs/promises";
 import { basename } from "node:path";
-import type { SandboxBackend, SandboxSeedFile } from "eve/sandbox";
-import { SandboxTemplateNotProvisionedError } from "eve/sandbox";
+import type { BwrapSandboxBackend } from "./backend-contract.js";
+import { BwrapTemplateNotProvisionedError } from "./errors.js";
 import type { BwrapSandboxCreateOptions, BwrapSandboxUseOptions } from "./options.js";
 import { createBwrapOptionsHash, resolveBwrapSandboxOptions } from "./options.js";
-import {
-  resolveBwrapCacheRoot,
-  resolveSessionPath,
-  resolveTemplatePath,
-  WORKSPACE_ROOT,
-} from "./paths.js";
+import { resolveBwrapCacheRoot, resolveSessionPath, resolveTemplatePath } from "./paths.js";
 import type { ProcessRunner } from "./process.js";
-import { createNodeProcessRunner, describeMissingPrereqs, isBwrapAvailable } from "./process.js";
+import { createBwrapRuntime, writeSeedFiles } from "./runtime.js";
 import type { BwrapSession } from "./session.js";
-import { createBwrapSession } from "./session.js";
 import {
   cloneDirectoryAtomically,
-  createBwrapCacheLease,
-  registerActiveCachePath,
   removeCacheMetadata,
   touchCacheMetadata,
   type BwrapCloneStrategy,
   type BwrapDirectoryCopier,
 } from "./cache.js";
-
-const EVE_MODEL_SKILL_ROOT = "$HOME/.agents/skills";
 
 /**
  * Stable backend name. Participates in eve's template/session cache-key
@@ -42,104 +32,13 @@ export interface CreateBwrapSandboxBackendInput {
   readonly copyDirectory?: BwrapDirectoryCopier;
 }
 
+/** The backend for eve 0.62 and 0.63. eve 0.64 and later use `BwrapSandbox` instead. */
 export function createBwrapSandboxBackend(
   input: CreateBwrapSandboxBackendInput = {},
-): SandboxBackend<BwrapSandboxUseOptions, BwrapSandboxUseOptions> {
+): BwrapSandboxBackend {
   const options = resolveBwrapSandboxOptions(input.createOptions);
   const optionsHash = createBwrapOptionsHash(options);
-  const runner = input.runner ?? createNodeProcessRunner();
-  const generations = new Map<string, BwrapSession>();
-  // Probe only when running against the real bwrap; injected runners skip it.
-  const shouldProbe = input.runner === undefined;
-  let probed = false;
-
-  function assertBwrapAvailable(): void {
-    if (!shouldProbe || probed) return;
-    const missing = describeMissingPrereqs({
-      bwrapPresent: isBwrapAvailable(options.bwrapPath),
-      workspaceMountpointPresent: existsSync(WORKSPACE_ROOT),
-      bwrapPath: options.bwrapPath,
-    });
-    if (missing) throw new Error(missing);
-    probed = true;
-  }
-
-  function openSession(
-    id: string,
-    workspaceDir: string,
-    appRoot: string,
-    tags?: Readonly<Record<string, string>>,
-    generationId?: string,
-    onStopped?: () => void | Promise<void>,
-  ): BwrapSession {
-    return createBwrapSession({
-      id,
-      workspaceDir,
-      appRoot,
-      runner,
-      options,
-      tags,
-      generationId,
-      onStopped,
-    });
-  }
-
-  async function openRuntimeSession(
-    id: string,
-    workspaceDir: string,
-    appRoot: string,
-    tags?: Readonly<Record<string, string>>,
-  ): Promise<BwrapSession> {
-    const current = generations.get(workspaceDir);
-    if (current && current.lifecycleState() !== "stopped") return current;
-    const releaseActive = registerActiveCachePath(workspaceDir);
-    const cacheRoot = resolveBwrapCacheRoot(appRoot, options.cacheDir);
-    const activeLease = await createBwrapCacheLease({
-      cacheRoot,
-      sessionId: basename(workspaceDir),
-    });
-    let session: BwrapSession;
-    try {
-      session = openSession(
-        id,
-        workspaceDir,
-        appRoot,
-        tags,
-        activeLease.lease.generationId,
-        async () => {
-          releaseActive();
-          await activeLease.release();
-        },
-      );
-    } catch (error) {
-      releaseActive();
-      await activeLease.release();
-      throw error;
-    }
-    generations.set(workspaceDir, session);
-    return session;
-  }
-
-  function resolveSeedPath(seedPath: string): string {
-    if (seedPath === EVE_MODEL_SKILL_ROOT || seedPath.startsWith(`${EVE_MODEL_SKILL_ROOT}/`)) {
-      return `${WORKSPACE_ROOT}/.agents/skills${seedPath.slice(EVE_MODEL_SKILL_ROOT.length)}`;
-    }
-    return seedPath;
-  }
-
-  async function writeSeedFiles(
-    session: BwrapSession,
-    seedFiles: ReadonlyArray<SandboxSeedFile>,
-  ): Promise<void> {
-    for (const seed of seedFiles) {
-      const seedPath = resolveSeedPath(seed.path);
-      if (typeof seed.content === "string") {
-        await session.writeTextFile({ path: seedPath, content: seed.content });
-      } else {
-        await session.writeBinaryFile({ path: seedPath, content: seed.content });
-      }
-    }
-  }
+  const runtime = createBwrapRuntime({ options, runner: input.runner });
 
   async function useSession(
     session: BwrapSession,
@@ -155,7 +54,7 @@ export function createBwrapSandboxBackend(
     name: BWRAP_BACKEND_NAME,
 
     async prewarm({ templateKey, bootstrap, seedFiles, log, runtimeContext }) {
-      assertBwrapAvailable();
+      runtime.assertBwrapAvailable();
       const templatePath = resolveTemplatePath(
         runtimeContext.appRoot,
         templateKey,
@@ -178,7 +77,11 @@ export function createBwrapSandboxBackend(
       const stagingPath = `${templatePath}.staging-${randomUUID()}`;
       await mkdir(stagingPath, { recursive: true });
       try {
-        const session = openSession(templateKey, stagingPath, runtimeContext.appRoot);
+        const session = runtime.openTemplateSession({
+          id: templateKey,
+          workspaceDir: stagingPath,
+          cacheRoots: [resolveBwrapCacheRoot(runtimeContext.appRoot, options.cacheDir)],
+        });
         await writeSeedFiles(session, seedFiles);
         if (bootstrap) {
           await bootstrap({ use: async (useOptions) => await useSession(session, useOptions) });
@@ -198,7 +101,7 @@ export function createBwrapSandboxBackend(
     },
 
     async create({ templateKey, sessionKey, runtimeContext, tags }) {
-      assertBwrapAvailable();
+      runtime.assertBwrapAvailable();
       const sessionPath = resolveSessionPath(runtimeContext.appRoot, sessionKey, options.cacheDir);
       let cloneStrategy: BwrapCloneStrategy = "existing";
       if (!existsSync(sessionPath)) {
@@ -213,10 +116,7 @@ export function createBwrapSandboxBackend(
             options.cacheDir,
           );
           if (!existsSync(templatePath)) {
-            throw new SandboxTemplateNotProvisionedError({
-              backendName: BWRAP_BACKEND_NAME,
-              templateKey,
-            });
+            throw new BwrapTemplateNotProvisionedError({ templateKey });
           }
           cloneStrategy = await cloneDirectoryAtomically({
             sourcePath: templatePath,
@@ -232,12 +132,14 @@ export function createBwrapSandboxBackend(
         tags,
         cloneStrategy,
       });
-      const session = await openRuntimeSession(
-        sessionKey,
-        sessionPath,
-        runtimeContext.appRoot,
+      const cacheRoot = resolveBwrapCacheRoot(runtimeContext.appRoot, options.cacheDir);
+      const { session } = await runtime.openRuntimeSession({
+        id: sessionKey,
+        workspaceDir: sessionPath,
+        cacheRoots: [cacheRoot],
+        leaseRoot: cacheRoot,
         tags,
-      );
+      });
       return {
         session,
         useSessionFn: async (useOptions) => await useSession(session, useOptions),
@@ -269,7 +171,7 @@ export function createBwrapSandboxBackend(
         async delete(deleteOptions) {
           deleteOptions?.abortSignal?.throwIfAborted();
           await session.killAll();
-          generations.delete(sessionPath);
+          runtime.forgetRuntimeSession(sessionPath);
           await rm(sessionPath, { force: true, recursive: true });
           await removeCacheMetadata({
             cacheRoot: resolveBwrapCacheRoot(runtimeContext.appRoot, options.cacheDir),

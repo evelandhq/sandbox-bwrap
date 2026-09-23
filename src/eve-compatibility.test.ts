@@ -2,17 +2,22 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import type { SandboxBackend as FloorEveSandboxBackend } from "eve-floor/sandbox";
-import type { SandboxBackend as LatestEveSandboxBackend } from "eve/sandbox";
+import type { MutableNetworkSandboxSession, SandboxEnvironment } from "eve/sandbox";
+import type { SandboxProviderDefinition } from "eve/sandbox/provider";
 import { createBwrapSandboxBackend } from "./backend.js";
+import type { BwrapSandboxOpenOptions } from "./provider-definition.js";
+import { createBwrapSandboxProviderDefinition } from "./provider-definition.js";
+import { BwrapSandbox } from "./provider.js";
 
 /**
- * The peer range is deliberately wide (`>=0.27.0 <1.0.0`): this backend
- * implements one small eve interface, `SandboxBackend`, and re-declaring a
- * narrow window every time eve ships a minor produced nothing but version-bump
- * churn for consumers. The two type-level tests below are what makes the wide
- * range a verified claim rather than a hope — they pin the range's floor and
- * the newest eve release to real installed packages and fail the build if
- * either drifts out of structural compatibility.
+ * The peer range is deliberately wide (`>=0.62.0 <1.0.0`), and it spans two
+ * sandbox APIs: eve 0.62 and 0.63 call a `SandboxBackend`, and eve 0.64
+ * replaced that with sandbox providers. This package implements both, so the
+ * type-level tests below pin each face to real installed eve packages:
+ *
+ * - the backend against the range's floor (`eve-floor`); 0.63, the last eve
+ *   that calls backends, ships byte-identical sandbox types, and
+ * - the provider against the newest verified eve (`eve`).
  *
  * The ceiling is not pinnable the same way: eve releases newer than this
  * package cannot be typechecked here at all. `.github/workflows/eve-drift.yml`
@@ -27,14 +32,27 @@ describe("published Eve compatibility", () => {
     expect(floorBackend.name).toBe("bwrap");
   });
 
-  test("the backend remains structurally compatible with the newest verified Eve", () => {
-    const latestBackend: LatestEveSandboxBackend = createBwrapSandboxBackend();
+  test("the provider definition satisfies the newest verified Eve's provider contract", () => {
+    const definition: SandboxProviderDefinition<
+      object,
+      BwrapSandboxOpenOptions,
+      { readonly version: 1; readonly templatePath: string },
+      unknown,
+      MutableNetworkSandboxSession
+    > = createBwrapSandboxProviderDefinition();
 
-    expect(latestBackend.name).toBe("bwrap");
+    expect(definition.name).toBe("bwrap");
+  });
+
+  test("the provider yields an eve sandbox environment with mutable networking", () => {
+    const environment: SandboxEnvironment<BwrapSandboxOpenOptions, MutableNetworkSandboxSession> =
+      BwrapSandbox.environment();
+
+    expect(environment.provider).toBe("bwrap");
   });
 
   /**
-   * The declared floor names a minor line (`>=0.27.0`) while `eve-floor` pins
+   * The declared floor names a minor line (`>=0.62.0`) while `eve-floor` pins
    * that line's newest patch, so these are compared at minor granularity, not
    * exactly. What this catches is the drift that actually happens: raising the
    * peer floor without moving the pin the typecheck above runs against, which

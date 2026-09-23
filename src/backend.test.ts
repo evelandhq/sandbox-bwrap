@@ -3,11 +3,22 @@ import { constants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import { SandboxTemplateNotProvisionedError } from "eve/sandbox";
+import { SandboxTemplateNotProvisionedError as BackendEraTemplateError } from "eve-floor/sandbox";
 import { BWRAP_BACKEND_NAME, createBwrapSandboxBackend } from "./backend.js";
-import { bwrap, isBwrapAvailable } from "./index.js";
+import {
+  bwrap,
+  BwrapTemplateNotProvisionedError,
+  createBwrapSandboxProviderDefinition,
+  isBwrapAvailable,
+} from "./index.js";
 import type { ProcessRunner } from "./process.js";
 import type { BwrapSandboxEvent } from "./events.js";
+
+// Recognized by the guard of the eve lines that call the backend (0.62 and
+// 0.63 ship the same one), not by the eve this package is built against.
+function isTemplateNotProvisioned(error: unknown): boolean {
+  return BackendEraTemplateError.is(error);
+}
 
 const fakeRunner: ProcessRunner = {
   spawn() {
@@ -287,11 +298,11 @@ describe("create", () => {
     expect(result).toBeNull();
   });
 
-  test("missing template throws the typed eve error", async () => {
+  test("missing template throws an error every backend-era eve recognizes", async () => {
     const { backend, runtimeContext } = await makeBackend();
     await expect(
       backend.create({ templateKey: "never-prewarmed", sessionKey: "s", runtimeContext }),
-    ).rejects.toSatisfy((error: unknown) => SandboxTemplateNotProvisionedError.is(error));
+    ).rejects.toSatisfy(isTemplateNotProvisioned);
   });
 
   test("options changes re-key templates but not sessions", async () => {
@@ -303,7 +314,7 @@ describe("create", () => {
     // same templateKey under different options is a distinct template
     await expect(
       b.create({ templateKey: "tpl", sessionKey: "s", runtimeContext }),
-    ).rejects.toSatisfy((error: unknown) => SandboxTemplateNotProvisionedError.is(error));
+    ).rejects.toSatisfy(isTemplateNotProvisioned);
   });
 
   test("shutdown kills the session's live processes and leaves the workspace on disk", async () => {
@@ -643,5 +654,13 @@ describe("public API", () => {
     expect(BWRAP_BACKEND_NAME).toBe("bwrap");
     expect(bwrap().name).toBe("bwrap");
     expect(typeof isBwrapAvailable).toBe("function");
+  });
+
+  test("exposes the provider definition and the template error from the root", () => {
+    expect(createBwrapSandboxProviderDefinition().name).toBe("bwrap");
+    expect(new BwrapTemplateNotProvisionedError({ templateKey: "k" })).toMatchObject({
+      name: "SandboxTemplateNotProvisionedError",
+      templateKey: "k",
+    });
   });
 });

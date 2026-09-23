@@ -41,7 +41,7 @@ async function makeSession(result?: { exitCode?: number; stdout?: string; stderr
   const session = createBwrapSession({
     id: "s1",
     workspaceDir,
-    appRoot,
+    cacheRoots: [path.join(appRoot, ".eve", "sandbox-cache", "bwrap")],
     runner,
     options: resolveBwrapSandboxOptions({ env: { FACTORY: "yes" } }),
   });
@@ -86,24 +86,26 @@ describe("run and spawn", () => {
     ]);
   });
 
-  test("the overridden cache root is the path hidden by tmpfs", async () => {
+  test("every cache root it is given is hidden by tmpfs, before the workspace bind", async () => {
     const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-cachedir-"));
+    const templateRoot = path.join(appRoot, ".eve", "sandbox-cache", "bwrap");
     const cacheDir = path.join(appRoot, "stable-cache");
     const workspaceDir = path.join(cacheDir, "sessions", "s1");
     await mkdir(workspaceDir, { recursive: true });
+    await mkdir(templateRoot, { recursive: true });
     const { runner, calls } = createFakeRunner();
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [templateRoot, cacheDir, templateRoot],
       runner,
       options: resolveBwrapSandboxOptions({ cacheDir }),
     });
     await session.spawn({ command: "true" });
     const argv = calls[0]!;
-    const secondTmpfs = argv.indexOf("--tmpfs", argv.indexOf("--tmpfs") + 1);
-    expect(argv.slice(secondTmpfs, secondTmpfs + 2)).toEqual(["--tmpfs", cacheDir]);
-    expect(argv).not.toContain(path.join(appRoot, ".eve", "sandbox-cache", "bwrap"));
+    const tmpfs = argv.flatMap((arg, index) => (arg === "--tmpfs" ? [argv[index + 1]] : []));
+    expect(tmpfs).toEqual(["/tmp", templateRoot, cacheDir]);
+    expect(argv.indexOf(cacheDir)).toBeLessThan(argv.indexOf("--bind"));
   });
 
   test("run aborts the process after the configured hard timeout", async () => {
@@ -146,7 +148,7 @@ describe("run and spawn", () => {
       const session = createBwrapSession({
         id: "s1",
         workspaceDir,
-        appRoot,
+        cacheRoots: [],
         runner,
         options: resolveBwrapSandboxOptions({ runTimeoutMs: 1_000 }),
       });
@@ -183,7 +185,7 @@ describe("run and spawn", () => {
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [],
       runner,
       options: resolveBwrapSandboxOptions({ runTimeoutMs: 1 }),
     });
@@ -218,7 +220,7 @@ describe("run and spawn", () => {
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [],
       runner,
       options: resolveBwrapSandboxOptions({ maxOutputBytes: 8 }),
     });
@@ -249,7 +251,7 @@ describe("run and spawn", () => {
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [],
       runner,
       options: resolveBwrapSandboxOptions({ maxConcurrentProcesses: 1 }),
     });
@@ -388,7 +390,7 @@ describe("killAll", () => {
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [],
       runner,
       options: resolveBwrapSandboxOptions(),
     });
@@ -422,7 +424,7 @@ describe("killAll", () => {
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [],
       runner,
       options: resolveBwrapSandboxOptions(),
     });
@@ -456,7 +458,7 @@ describe("killAll", () => {
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [],
       runner,
       options: resolveBwrapSandboxOptions(),
     });
@@ -490,7 +492,7 @@ describe("killAll", () => {
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [],
       runner,
       options: resolveBwrapSandboxOptions(),
     });
@@ -525,7 +527,7 @@ describe("killAll", () => {
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [],
       runner,
       options: resolveBwrapSandboxOptions(),
     });
@@ -549,7 +551,7 @@ describe("killAll", () => {
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
-      appRoot,
+      cacheRoots: [],
       runner,
       options: resolveBwrapSandboxOptions(),
       onStopped: async () => {
