@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.3.0...v0.4.0) (2026-09-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* peerDependencies.eve is now >=0.62.0 <1.0.0. eve 0.62 and 0.63 keep using the bwrap backend; eve 0.64 and later use the BwrapSandbox provider.
+
+### Features
+
+* add an eve 0.64 sandbox provider and require eve 0.62 or later ([#37](https://github.com/evelandhq/sandbox-bwrap/issues/37)) ([9e916e0](https://github.com/evelandhq/sandbox-bwrap/commit/9e916e0c4573adcc16742656ce51515fb8b7e0f4))
+
 ## [0.3.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.2.0...v0.3.0) (2026-08-28)
 
 
