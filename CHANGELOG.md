@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/evelandhq/sandbox-bwrap/compare/v0.4.0...v0.4.1) (2026-10-07)
+
+
+### Fixes
+
+* declare MutableNetworkSandboxSession locally for eve 0.66+ ([#41](https://github.com/evelandhq/sandbox-bwrap/issues/41)) ([ab36f6c](https://github.com/evelandhq/sandbox-bwrap/commit/ab36f6c6f1fc83e96fff24897174b67fc33cde11)), closes [#39](https://github.com/evelandhq/sandbox-bwrap/issues/39) [#40](https://github.com/evelandhq/sandbox-bwrap/issues/40)
+
 ## [0.4.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.3.0...v0.4.0) (2026-09-23)
 
 
