@@ -2,10 +2,13 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import type { SandboxBackend as FloorEveSandboxBackend } from "eve-floor/sandbox";
-import type { MutableNetworkSandboxSession, SandboxEnvironment } from "eve/sandbox";
+import type { SandboxEnvironment } from "eve/sandbox";
 import type { SandboxProviderDefinition } from "eve/sandbox/provider";
 import { createBwrapSandboxBackend } from "./backend.js";
-import type { BwrapSandboxOpenOptions } from "./provider-definition.js";
+import type {
+  BwrapSandboxOpenOptions,
+  MutableNetworkSandboxSession,
+} from "./provider-definition.js";
 import { createBwrapSandboxProviderDefinition } from "./provider-definition.js";
 import { BwrapSandbox } from "./provider.js";
 

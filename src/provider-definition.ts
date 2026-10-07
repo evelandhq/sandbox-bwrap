@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, rename, rm } from "node:fs/promises";
 import { basename } from "node:path";
-import type { MutableNetworkSandboxSession } from "eve/sandbox";
+import type { SandboxNetworkPolicy, SandboxSession } from "eve/sandbox";
 import type {
   SandboxProviderDefinition,
   SandboxProviderHandle,
@@ -31,6 +31,16 @@ import type { BwrapSession } from "./session.js";
  * with a reader for the old shape.
  */
 export const BWRAP_PROVIDER_STATE_PROTOCOL_VERSION = 1;
+
+/**
+ * The session this provider hands eve: a `SandboxSession` whose egress can be
+ * changed while it runs. eve exported this type itself until 0.66 removed it,
+ * so it is declared here from the parts eve still exports, the same shape eve
+ * now uses for its own `DockerSandboxSession`. `prepare` callbacks receive it.
+ */
+export type MutableNetworkSandboxSession = SandboxSession & {
+  setNetworkPolicy(policy: SandboxNetworkPolicy): Promise<void>;
+};
 
 /** Options for `BwrapSandbox.environment(...)`. */
 export type BwrapSandboxEnvironmentOptions = Omit<BwrapSandboxCreateOptions, "templateRevision"> & {
