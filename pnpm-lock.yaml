@@ -15,8 +15,8 @@ importers:
         specifier: ^7.0.44
         version: 7.0.52(zod@4.4.3)
       eve:
-        specifier: 0.64.1
-        version: 0.64.1(ai@7.0.52(zod@4.4.3))
+        specifier: 0.72.1
+        version: 0.72.1(ai@7.0.52(zod@4.4.3))
       eve-floor:
         specifier: npm:eve@0.62.0
         version: eve@0.62.0(ai@7.0.52(zod@4.4.3))
@@ -684,13 +684,13 @@ packages:
       microsandbox:
         optional: true
 
-  eve@0.64.1:
-    resolution: {integrity: sha512-dOvgtqg6RAx1I8x5cuzQeKyMXx8YXhEwixQGjdDRJUne6g46tcHNHz4IObOq92+SfSiL4wdS0SqnZnMrH4oOeQ==}
+  eve@0.72.1:
+    resolution: {integrity: sha512-D72hUlYoJVwsmS7JMcHLDmMgYozHujNy5VvWiEpXmhia8TnzT0do7hcM1A4SXjVhoZRiVRgKo8LZGBx8LH4gTw==}
     engines: {node: '>=24'}
     hasBin: true
     peerDependencies:
       '@opentelemetry/api': ^1.0.0
-      ai: ^7.0.105
+      ai: ^7.0.128
       braintrust: ^3.0.0
       chat: ^4.41.0
       dd-trace: ^6.13.0
@@ -955,6 +955,10 @@ packages:
   undici@7.29.0:
     resolution: {integrity: sha512-IDxfleLmmbSskfWSUATiN1nfn2rDuvnMOqb5CWR92iIfojA0Ud+ulOAAEQ57LPr9rWmsreUyf5lwyao+7GNNVw==}
     engines: {node: '>=20.18.1'}
+
+  undici@8.10.2:
+    resolution: {integrity: sha512-/y4/bH9YNU5hi9NIrpOuvGXFcxrj3CMrV+/AYpowAYTpHn8gX/XPFjNy766FPoYY0miQhdW977JFWKGNhBdwyQ==}
+    engines: {node: '>=22.19.0'}
 
   undici@8.9.0:
     resolution: {integrity: sha512-aWZpUj7XoGonMClx4gdDRfgBjqeA+F473aDmROQQbM9n6PRfK/u1q/a0X4wMTgcHfT8H6fpbt98PFuDUwFg2YA==}
@@ -1454,11 +1458,11 @@ snapshots:
       nitro: 3.0.260903-beta
       undici: 8.9.0
 
-  eve@0.64.1(ai@7.0.52(zod@4.4.3)):
+  eve@0.72.1(ai@7.0.52(zod@4.4.3)):
     dependencies:
       ai: 7.0.52(zod@4.4.3)
       nitro: 3.0.260903-beta
-      undici: 8.9.0
+      undici: 8.10.2
 
   eventsource-parser@3.1.0: {}
 
@@ -1679,6 +1683,8 @@ snapshots:
   undici-types@8.3.0: {}
 
   undici@7.29.0: {}
+
+  undici@8.10.2: {}
 
   undici@8.9.0: {}
 
