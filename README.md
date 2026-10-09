@@ -120,8 +120,11 @@ directory — it is durable state. Cleanup closes that compute generation to new
 the next backend `create()` opens a fresh generation over the same workspace. Repeated
 `create()` calls through one backend instance share the live generation, so one handle
 cannot race a new spawn past another handle's cleanup barrier. The provider's
-`onSessionStop()` and `onRuntimeShutdown()` do the same, and its `resume()` shares the live
-generation the same way.
+`onSandboxStop()` and `onRuntimeShutdown()` do the same, and its `resume()` shares the live
+generation the same way. eve 0.75 renamed the handle hooks from `onSessionStop()` and
+`onSessionDelete()` to `onSandboxStop()` and `onSandboxDelete()` and calls only the new names,
+while eve 0.64 through 0.74 call only the old ones; the handle carries both pairs, each pair
+the same function, so one installed copy serves every eve in the peer range.
 
 ### Options
 
@@ -163,8 +166,12 @@ The provider (eve 0.64 and later):
 - **resume** (every later access, and after restarts): reopens the recorded workspace and
   applies the recorded network policy to a new compute generation. It fails instead of
   recreating a workspace that is gone.
-- **onSessionDelete**: kills the session's processes and removes its workspace and
-  metadata; the template survives.
+- **onSandboxDelete** (`onSessionDelete` before eve 0.75): kills the session's processes
+  and removes its workspace and metadata; the template survives.
+- **onSessionEnd** (eve 0.75 and later, once a durable session has completed, expired or
+  failed): releases the session's workspace and metadata from the persisted state alone,
+  stopping the live generation if this process holds one, without resuming the sandbox. It
+  is idempotent, so eve may retry it, and a workspace that is already gone stays gone.
 
 The backend (eve 0.62 and 0.63):
 

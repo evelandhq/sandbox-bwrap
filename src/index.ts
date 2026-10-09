@@ -27,6 +27,8 @@ export {
   type BwrapSandboxProviderDefinition,
   type BwrapSessionState,
   type CreateBwrapSandboxProviderDefinitionInput,
+  type BwrapProviderHandle,
+  type BwrapSandboxDeleteOptions,
   type MutableNetworkSandboxSession,
 } from "./provider-definition.js";
 export type { BwrapSession } from "./session.js";

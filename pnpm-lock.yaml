@@ -15,8 +15,8 @@ importers:
         specifier: ^7.0.44
         version: 7.0.52(zod@4.4.3)
       eve:
-        specifier: 0.72.1
-        version: 0.72.1(ai@7.0.52(zod@4.4.3))
+        specifier: 0.75.1
+        version: 0.75.1(ai@7.0.52(zod@4.4.3))
       eve-floor:
         specifier: npm:eve@0.62.0
         version: eve@0.62.0(ai@7.0.52(zod@4.4.3))
@@ -684,8 +684,8 @@ packages:
       microsandbox:
         optional: true
 
-  eve@0.72.1:
-    resolution: {integrity: sha512-D72hUlYoJVwsmS7JMcHLDmMgYozHujNy5VvWiEpXmhia8TnzT0do7hcM1A4SXjVhoZRiVRgKo8LZGBx8LH4gTw==}
+  eve@0.75.1:
+    resolution: {integrity: sha512-z9A0ZvfQZVnmuYerwWyxKhIlyqDiwplH9E0skuoP+du/UIh9526W51CktuKDvzJaVUY1+2IPT59ILSIPjaAGJg==}
     engines: {node: '>=24'}
     hasBin: true
     peerDependencies:
@@ -1458,7 +1458,7 @@ snapshots:
       nitro: 3.0.260903-beta
       undici: 8.9.0
 
-  eve@0.72.1(ai@7.0.52(zod@4.4.3)):
+  eve@0.75.1(ai@7.0.52(zod@4.4.3)):
     dependencies:
       ai: 7.0.52(zod@4.4.3)
       nitro: 3.0.260903-beta
