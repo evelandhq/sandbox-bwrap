@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.4.1...v0.5.0) (2026-10-09)
+
+
+### Features
+
+* answer eve 0.75's renamed handle hooks and release sessions on end ([#43](https://github.com/evelandhq/sandbox-bwrap/issues/43)) ([3f75f9c](https://github.com/evelandhq/sandbox-bwrap/commit/3f75f9c0099be05a3248133c5cfd22bfc8212050))
+
 ## [0.4.1](https://github.com/evelandhq/sandbox-bwrap/compare/v0.4.0...v0.4.1) (2026-10-07)
 
 
