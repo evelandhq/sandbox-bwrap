@@ -9,7 +9,7 @@ import type {
 } from "eve/sandbox/provider";
 import { listBwrapCache } from "./cache.js";
 import type { ProcessRunner } from "./process.js";
-import type { BwrapSandboxEnvironmentOptions } from "./provider-definition.js";
+import type { BwrapProviderHandle, BwrapSandboxEnvironmentOptions } from "./provider-definition.js";
 import {
   BWRAP_PROVIDER_STATE_PROTOCOL_VERSION,
   createBwrapSandboxProviderDefinition,
@@ -336,7 +336,7 @@ describe("start and resume", () => {
       undefined,
       artifact,
     );
-    await handle.onSessionDelete();
+    await handle.onSandboxDelete();
 
     await expect(env.resume(sessionContext(storagePath, "s"), artifact, state)).rejects.toThrow(
       /no longer exists/,
@@ -387,7 +387,7 @@ describe("handle lifecycle", () => {
     await handle.sandbox.writeTextFile({ path: "keep.txt", content: "durable" });
     await handle.sandbox.spawn({ command: "sleep 60" });
 
-    await handle.onSessionStop();
+    await handle.onSandboxStop();
     await handle.onRuntimeShutdown();
 
     expect(killed).toEqual([1]);
@@ -409,7 +409,7 @@ describe("handle lifecycle", () => {
     await handle.sandbox.writeTextFile({ path: "scratch.txt", content: "doomed" });
     await handle.sandbox.spawn({ command: "sleep 60" });
 
-    await handle.onSessionDelete();
+    await handle.onSandboxDelete();
 
     expect(killed).toEqual([1]);
     expect((await listBwrapCache({ appRoot })).map((entry) => entry.kind)).toEqual(["template"]);
@@ -427,10 +427,105 @@ describe("handle lifecycle", () => {
     await handle.sandbox.writeTextFile({ path: "keep.txt", content: "durable" });
 
     await expect(
-      handle.onSessionDelete({ abortSignal: AbortSignal.abort() }),
+      handle.onSandboxDelete({ abortSignal: AbortSignal.abort() }),
     ).rejects.toMatchObject({ name: "AbortError" });
 
     expect(await handle.sandbox.readTextFile({ path: "keep.txt" })).toBe("durable");
+  });
+
+  // eve 0.64 through 0.74 call the hooks by their pre-0.75 names. The same
+  // installed copy of this package serves those lines, so the handle keeps
+  // answering to them with the very same behaviour.
+  test("the handle also answers the pre-0.75 lifecycle names eve 0.64 to 0.74 call", async () => {
+    const { appRoot, storagePath } = await makeRelease();
+    const { runner, killed } = createLiveRunner();
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const started = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
+    const handle = started.handle as BwrapProviderHandle;
+    await handle.sandbox.writeTextFile({ path: "keep.txt", content: "durable" });
+    await handle.sandbox.spawn({ command: "sleep 60" });
+
+    await handle.onSessionStop();
+    expect(killed).toEqual([1]);
+    const resumed = (await env.resume(
+      sessionContext(storagePath, "s"),
+      artifact,
+      started.state,
+    )) as BwrapProviderHandle;
+    expect(await resumed.sandbox.readTextFile({ path: "keep.txt" })).toBe("durable");
+    await resumed.sandbox.spawn({ command: "sleep 60" });
+
+    await expect(
+      resumed.onSessionDelete({ abortSignal: AbortSignal.abort() }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    await resumed.onSessionDelete();
+
+    expect(killed).toEqual([1, 2]);
+    expect((await listBwrapCache({ appRoot })).map((entry) => entry.kind)).toEqual(["template"]);
+    await expect(readdir(path.join(storagePath, "bwrap", "sessions"))).resolves.toEqual([]);
+  });
+});
+
+describe("session end", () => {
+  test("releases a session's workspace and metadata from persisted state without resuming it", async () => {
+    const { appRoot, storagePath } = await makeRelease();
+    const { runner, calls } = createLiveRunner();
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { state } = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
+    const spawnedBeforeEnd = calls.length;
+
+    // A fresh definition stands in for the process that runs the cleanup step
+    // after a restart: it never opened this session's sandbox.
+    const later = environment(undefined, runner);
+    await later.onSessionEnd!(sessionContext(storagePath, "s"), artifact, state, {
+      reason: "completed",
+    });
+
+    expect(calls.length).toBe(spawnedBeforeEnd);
+    expect((await listBwrapCache({ appRoot })).map((entry) => entry.kind)).toEqual(["template"]);
+    await expect(readdir(path.join(storagePath, "bwrap", "sessions"))).resolves.toEqual([]);
+    await expect(env.resume(sessionContext(storagePath, "s"), artifact, state)).rejects.toThrow(
+      /no longer exists/,
+    );
+  });
+
+  test("stops the live generation in this process and is idempotent across retries", async () => {
+    const { storagePath } = await makeRelease();
+    const { runner, killed } = createLiveRunner();
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { handle, state } = await env.start(
+      sessionContext(storagePath, "s"),
+      undefined,
+      artifact,
+    );
+    await handle.sandbox.spawn({ command: "sleep 60" });
+
+    const end = async (reason: "completed" | "expired" | "failed") =>
+      await env.onSessionEnd!(sessionContext(storagePath, "s"), artifact, state, { reason });
+    await end("expired");
+    await end("expired");
+    await end("failed");
+
+    expect(killed).toEqual([1]);
+    await expect(readdir(path.join(storagePath, "bwrap", "sessions"))).resolves.toEqual([]);
+    // A session started afresh after the end gets a clean clone, not the old files.
+    const fresh = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
+    expect(await fresh.handle.sandbox.readTextFile({ path: "keep.txt" })).toBeNull();
+  });
+
+  test("rejects state this provider did not write instead of guessing a workspace", async () => {
+    const { storagePath } = await makeRelease();
+    const env = environment();
+    const artifact = await env.prepare(prepareContext(storagePath));
+
+    await expect(
+      env.onSessionEnd!(sessionContext(storagePath, "s"), artifact, { version: 2 } as never, {
+        reason: "completed",
+      }),
+    ).rejects.toThrow(/invalid session state/);
   });
 });
 

@@ -138,9 +138,14 @@ async function providerSmoke(appRoot: string): Promise<void> {
     "a resumed session must keep its recorded network policy",
   );
 
-  await resumed.onSessionDelete();
+  await resumed.onSandboxDelete();
   await assert.rejects(restarted.resume(ctx, artifact, state), /no longer exists/);
-  console.log("PROVIDER SMOKE: prepare, start, restart + resume and delete held under real bwrap");
+  // eve 0.75's terminal cleanup runs from persisted state, possibly after the
+  // workspace is already gone, and must stay quiet about it.
+  await restarted.onSessionEnd!(ctx, artifact, state, { reason: "completed" });
+  console.log(
+    "PROVIDER SMOKE: prepare, start, restart + resume, delete and session end held under real bwrap",
+  );
 }
 
 async function main(): Promise<void> {

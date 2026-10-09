@@ -43,6 +43,12 @@ export interface BwrapRuntime {
   ): Promise<{ readonly session: BwrapSession; readonly created: boolean }>;
   /** Drops a deleted workspace's generation so the next open starts fresh. */
   forgetRuntimeSession(workspaceDir: string): void;
+  /**
+   * Stops the live generation over this workspace, if there is one, and drops
+   * it. Nothing is started for a workspace that has no generation, so this is
+   * safe to call for a session whose sandbox was never resumed in this process.
+   */
+  closeRuntimeSession(workspaceDir: string): Promise<void>;
 }
 
 export function createBwrapRuntime(input: {
@@ -117,6 +123,12 @@ export function createBwrapRuntime(input: {
 
     forgetRuntimeSession(workspaceDir) {
       generations.delete(workspaceDir);
+    },
+
+    async closeRuntimeSession(workspaceDir) {
+      const current = generations.get(workspaceDir);
+      generations.delete(workspaceDir);
+      await current?.killAll();
     },
   };
 }

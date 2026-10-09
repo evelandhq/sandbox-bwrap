@@ -42,6 +42,23 @@ export type MutableNetworkSandboxSession = SandboxSession & {
   setNetworkPolicy(policy: SandboxNetworkPolicy): Promise<void>;
 };
 
+/**
+ * The handle this provider hands eve. eve 0.75 renamed the handle's lifecycle
+ * hooks from `onSessionStop`/`onSessionDelete` to `onSandboxStop`/`onSandboxDelete`
+ * and calls only the new names, while 0.64 through 0.74 call only the old ones.
+ * One installed copy of this package serves every eve in the peer range, so the
+ * handle answers to both names, each pair being the same function.
+ */
+export type BwrapProviderHandle = SandboxProviderHandle<MutableNetworkSandboxSession> & {
+  onSessionStop(): Promise<void>;
+  onSessionDelete(options?: BwrapSandboxDeleteOptions): Promise<void>;
+};
+
+/** What eve passes when it deletes a sandbox: at most an abort signal. */
+export type BwrapSandboxDeleteOptions = Parameters<
+  SandboxProviderHandle<MutableNetworkSandboxSession>["onSandboxDelete"]
+>[0];
+
 /** Options for `BwrapSandbox.environment(...)`. */
 export type BwrapSandboxEnvironmentOptions = Omit<BwrapSandboxCreateOptions, "templateRevision"> & {
   /**
@@ -116,7 +133,7 @@ export function createBwrapSandboxProviderDefinition(
         sessionKey: string,
         cloneStrategy: BwrapCloneStrategy,
         applyNetworkPolicy: (session: BwrapSession, created: boolean) => Promise<void>,
-      ): Promise<SandboxProviderHandle<MutableNetworkSandboxSession>> {
+      ): Promise<BwrapProviderHandle> {
         const roots = cacheRoots(ctx.storagePath);
         const sessionPath = sessionPathIn(roots.sessionRoot, sessionKey);
         await touchCacheMetadata({
@@ -133,30 +150,38 @@ export function createBwrapSandboxProviderDefinition(
           leaseRoot: roots.sessionRoot,
         });
         await applyNetworkPolicy(session, created);
+        // The processes are the compute and the workspace directory is the
+        // durable session: stopping kills the processes and keeps the files.
+        const stop = async () => {
+          await session.killAll();
+        };
+        // The session's own workspace is disposable; the template it was
+        // cloned from is shared by every other session and must survive.
+        const remove = async (deleteOptions?: BwrapSandboxDeleteOptions) => {
+          deleteOptions?.abortSignal?.throwIfAborted();
+          await session.killAll();
+          runtime.forgetRuntimeSession(sessionPath);
+          await removeSessionWorkspace(roots.sessionRoot, sessionPath);
+        };
         return {
           sandbox: session,
-          // The processes are the compute and the workspace directory is the
-          // durable session: stopping kills the processes and keeps the files.
-          async onSessionStop() {
-            await session.killAll();
-          },
+          onSandboxStop: stop,
+          onSessionStop: stop,
           async onRuntimeShutdown() {
             await session.killAll();
           },
-          // The session's own workspace is disposable; the template it was
-          // cloned from is shared by every other session and must survive.
-          async onSessionDelete(deleteOptions) {
-            deleteOptions?.abortSignal?.throwIfAborted();
-            await session.killAll();
-            runtime.forgetRuntimeSession(sessionPath);
-            await rm(sessionPath, { force: true, recursive: true });
-            await removeCacheMetadata({
-              cacheRoot: roots.sessionRoot,
-              kind: "session",
-              id: basename(sessionPath),
-            });
-          },
+          onSandboxDelete: remove,
+          onSessionDelete: remove,
         };
+      }
+
+      async function removeSessionWorkspace(sessionRoot: string, sessionPath: string) {
+        await rm(sessionPath, { force: true, recursive: true });
+        await removeCacheMetadata({
+          cacheRoot: sessionRoot,
+          kind: "session",
+          id: basename(sessionPath),
+        });
       }
 
       return {
@@ -263,6 +288,19 @@ export function createBwrapSandboxProviderDefinition(
           return await openHandle(ctx, state.sessionKey, "existing", async (session, created) => {
             if (created) await session.setNetworkPolicy(state.networkPolicy);
           });
+        },
+
+        // eve 0.75 releases a durable session's sandbox once the session has
+        // completed, expired or failed, from persisted state alone. Only the
+        // workspace is touched, never the template, and nothing is resumed to
+        // do it: a live generation in this process is stopped, a workspace that
+        // is already gone is left gone, so the step may retry.
+        async onSessionEnd(ctx, _preparedArtifact, sessionState) {
+          const state = requireSessionState(sessionState);
+          const roots = cacheRoots(ctx.storagePath);
+          const sessionPath = sessionPathIn(roots.sessionRoot, state.sessionKey);
+          await runtime.closeRuntimeSession(sessionPath);
+          await removeSessionWorkspace(roots.sessionRoot, sessionPath);
         },
       };
     },
