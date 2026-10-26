@@ -17,7 +17,7 @@ export type {
   BwrapSandboxBackend,
   BwrapSeedFile,
 } from "./backend-contract.js";
-export { BwrapTemplateNotProvisionedError } from "./errors.js";
+export { BwrapSandboxSessionGoneError, BwrapTemplateNotProvisionedError } from "./errors.js";
 export {
   BWRAP_PROVIDER_STATE_PROTOCOL_VERSION,
   createBwrapSandboxProviderDefinition,
@@ -25,12 +25,14 @@ export {
   type BwrapSandboxEnvironmentOptions,
   type BwrapSandboxOpenOptions,
   type BwrapSandboxProviderDefinition,
+  type BwrapSandboxProviderImplementation,
   type BwrapSessionState,
   type CreateBwrapSandboxProviderDefinitionInput,
   type BwrapProviderHandle,
   type BwrapSandboxDeleteOptions,
   type MutableNetworkSandboxSession,
 } from "./provider-definition.js";
+export type { BwrapConnectionExtensions, BwrapSandboxConnection } from "./provider-contract.js";
 export type { BwrapSession } from "./session.js";
 export type {
   BwrapNetworkPolicy,

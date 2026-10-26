@@ -10,7 +10,16 @@ sandbox with two faces. eve 0.64 replaced sandbox backends with providers, so
 the package implements both: the `SandboxBackend` interface for eve 0.62 and
 0.63 (`bwrap()` from the root), and a sandbox provider for eve 0.64 and later
 (`BwrapSandbox` from `/provider`, a plain definition from the root). Both run
-on the same session machinery in `src/runtime.ts`. It was extracted from the
+on the same session machinery in `src/runtime.ts`.
+
+eve 0.83 replaced the provider contract itself: 0.64 through 0.82 take a
+session handle from the provider, 0.83 and later a byte-level connection
+(`src/connection.ts`) from which eve derives the session. The one definition in
+`src/provider-definition.ts` answers both, overloaded per method and dispatched
+on the context eve passes (`populate` on a prepare context, `kind` on a session
+context). Both contracts are declared locally in `src/provider-contract.ts`,
+because 0.83 removed every handle-era type, and both must record the same
+session state: Eveland promotes and rolls back Deployments across eve lines. It was extracted from the
 eveland monorepo (`packages/sandbox-bwrap`) with its full history; commits
 before the extraction still carry eveland-wide subjects such as
 "feat: track eve 0.29.4".
@@ -43,7 +52,8 @@ replacing it:
 
 1. `src/eve-compatibility.test.ts` typechecks the backend against the range's
    exact floor (`eve-floor`, pinned to the newest patch of the floor's minor
-   line) and the provider against the newest verified eve. These are
+   line), the provider against the last handle-era eve (`eve-legacy`) and
+   against the newest verified eve. These are
    **type-level** tests; their annotations are the assertion, so
    `pnpm typecheck` must run in CI, not just `pnpm test`. The backend's eve
    types are declared locally in `src/backend-contract.ts`, because eve 0.64

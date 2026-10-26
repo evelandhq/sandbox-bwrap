@@ -44,9 +44,10 @@
   },
   "devDependencies": {
     "@types/node": "^26.0.1",
-    "ai": "^7.0.44",
-    "eve": "0.75.1",
+    "ai": "^7.0.137",
+    "eve": "0.83.3",
     "eve-floor": "npm:eve@0.62.0",
+    "eve-legacy": "npm:eve@0.81.1",
     "oxfmt": "0.58.0",
     "oxlint": "1.73.0",
     "tsx": "^4.22.4",

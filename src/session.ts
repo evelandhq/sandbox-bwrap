@@ -1,11 +1,11 @@
 import { createReadStream, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createWriteStream } from "node:fs";
-import type { SandboxNetworkPolicy, SandboxSession } from "eve/sandbox";
+import type { SandboxSession } from "eve/sandbox";
 import { buildBwrapExecArgs, DEFAULT_SANDBOX_PATH } from "./args.js";
 import type { ResolvedBwrapSandboxOptions } from "./options.js";
 import {
@@ -120,8 +120,14 @@ export type BwrapSession = SandboxSession & {
    * dropped `id` from `SandboxSession`, but every earlier line requires it.
    */
   readonly id: string;
-  /** Coarse egress switch; always present here, optional on eve 0.64's `SandboxSession`. */
-  setNetworkPolicy(policy: SandboxNetworkPolicy): Promise<void>;
+  /**
+   * Coarse egress switch; always present here, optional on eve 0.64's
+   * `SandboxSession`. Only `"allow-all"` and `"deny-all"` are accepted, checked
+   * at runtime: the parameter is typed wide because every eve line types the
+   * policy differently (the Vercel SDK's, then eve's own from 0.83), and this
+   * one session must satisfy all of them.
+   */
+  setNetworkPolicy(policy: unknown): Promise<void>;
   /** Kills every process this session spawned that has not yet exited. Idempotent. */
   killAll(): Promise<void>;
   /** Internal compute-generation state used to coordinate repeated handles. */
@@ -408,7 +414,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       }
     },
 
-    async setNetworkPolicy(policy: SandboxNetworkPolicy) {
+    async setNetworkPolicy(policy: unknown) {
       if (policy !== "allow-all" && policy !== "deny-all") {
         throw new Error(
           'bwrap backend supports only the "allow-all" and "deny-all" network policies',
@@ -419,7 +425,16 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
 
     async readFile({ path }) {
       const hostPath = host(path);
-      if (!existsSync(hostPath)) return null;
+      // Only a missing path reads as null; a directory rejects up front rather
+      // than as a stream that fails on its first read.
+      const entry = await stat(hostPath).catch((error: unknown) => {
+        if (isMissingFileError(error)) return null;
+        throw error;
+      });
+      if (entry === null) return null;
+      if (entry.isDirectory()) {
+        throw new Error(`bwrap sandbox: cannot read a directory as a file: ${path}`);
+      }
       return Readable.toWeb(createReadStream(hostPath)) as unknown as ReadableStream<Uint8Array>;
     },
 
@@ -460,6 +475,19 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       await mkdir(dirname(hostPath), { recursive: true });
       const enc = encoding === undefined || encoding === "utf-8" ? "utf8" : encoding;
       await writeFile(hostPath, Buffer.from(content, enc as BufferEncoding));
+    },
+
+    async writeFiles({ files }) {
+      // Every target is checked before anything is written, so a batch with
+      // one path outside the workspace writes none of them.
+      const targets = files.map((file) => ({
+        hostPath: writableHostPath(file.path, "write"),
+        content: file.content,
+      }));
+      for (const { hostPath, content } of targets) {
+        await mkdir(dirname(hostPath), { recursive: true });
+        await writeFile(hostPath, content);
+      }
     },
 
     async removePath({ path, force, recursive }) {

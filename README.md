@@ -60,8 +60,9 @@ export const environment = BwrapSandbox.environment({
 export default defineSandbox(() => environment.open());
 ```
 
-- `eve build` prepares the template: it writes the workspace and skill trees, then runs
-  `prepare` inside bwrap, so a build that runs `prepare` needs bwrap on the build host. The
+- `eve build` prepares the template: the workspace and skill trees are written into it, then
+  `prepare` runs inside bwrap, so a build that runs `prepare` needs bwrap on the build host; a
+  build without one does not. The
   template lives under `.eve/sandbox-cache/bwrap/templates` in the built app, and eve records
   its absolute path. Serve the build from where it was built, or rebuild on the deploy host;
   a missing template fails the first sandbox access with a rebuild message.
@@ -72,8 +73,15 @@ export default defineSandbox(() => environment.open());
   It is recorded in the session state and applied again after a restart.
 - eve resumes a session from its recorded state alone. The template is not needed, so with a
   shared `cacheDir` a session keeps its workspace when it moves to a newer deployment.
+- eve 0.83 replaced the provider contract: instead of a session object, a provider hands eve
+  a byte-level connection (`spawn`, `readFile`, `writeFiles`, `removePath`, `stop`), eve
+  derives the session from it, and eve itself seeds templates and runs `prepare`. The same
+  definition answers both contracts, telling them apart by the context eve passes, and
+  records the same session state under both, so a deployment rolled back across 0.83 still
+  opens its sessions. On 0.83 and later `setNetworkPolicy` reaches the session as a
+  connection extension.
 - The `/provider` entry point imports `eve/sandbox/provider`, which exists only from eve
-  0.64 on. The package root imports nothing from eve at runtime and also exports the plain
+  0.64 on. Its published types follow eve 0.83's connection contract. The package root imports nothing from eve at runtime and also exports the plain
   provider definition, `createBwrapSandboxProviderDefinition()`, for callers that call eve's
   `defineSandboxProvider` themselves.
 
@@ -97,12 +105,13 @@ This package requires `eve` `>=0.62.0 <1.0.0`.
 The range is deliberately wide. eve's 0.x releases use caret-incompatible minor bumps,
 so a package that pins a narrow window has to republish for every eve minor — which is
 churn for consumers, not safety, when the surface actually consumed is one small
-interface that changes rarely. The range spans two such interfaces: `SandboxBackend` for
-eve 0.62 and 0.63, and the sandbox provider contract from eve 0.64 on. Rather than
-re-declaring the window, CI keeps the claim honest from both ends:
-`src/eve-compatibility.test.ts` typechecks the backend against the range's exact floor
-(0.62.0; 0.63.0, the last eve that calls backends, ships identical sandbox types), and
-typechecks the provider against the newest verified release; a scheduled workflow re-runs the suite against
+interface that changes rarely. The range spans three such interfaces: `SandboxBackend` for
+eve 0.62 and 0.63, the handle provider contract for eve 0.64 through 0.82, and the
+connection provider contract from eve 0.83 on. Rather than re-declaring the window, CI
+keeps the claim honest from both ends: `src/eve-compatibility.test.ts` typechecks the
+backend against the range's exact floor (0.62.0; 0.63.0, the last eve that calls backends,
+ships identical sandbox types), the provider against the last handle-era release (0.81.1;
+0.82.0's provider types are identical) and against the newest verified release; a scheduled workflow re-runs the suite against
 `eve@latest` so a breaking eve minor shows up as a red build here instead of a bug report
 from your deployment. That is not theoretical: eve 0.32.0 added a required `stop()` to the
 backend handle. This package implements it; 0.1.0 does not, and pairing that release with
@@ -152,24 +161,34 @@ backend's configured policy.
 
 ## How it works
 
-The provider (eve 0.64 and later):
+The provider (eve 0.64 and later; eve 0.83 changed who does what, noted inline):
 
 - **prepare** (`eve build`): writes eve's workspace tree and skill tree
   (`$HOME/.agents/skills/**` lands at `/workspace/.agents/skills/**`) into a staging
   directory, runs the authored `prepare` inside bwrap, stops anything it left running, and
   atomically renames the result into `<storage>/bwrap/templates/<hash>`, where `<storage>`
   is eve's sandbox storage directory, `<appRoot>/.eve/sandbox-cache`. The key covers eve's
-  source revision, the resource keys, the options, and the source of `prepare`.
+  source revision, the resource keys, the options, and the source of `prepare`. From eve
+  0.83, eve writes the trees and runs `prepare` itself through a connection over the staging
+  directory, and derives the key from the same inputs; it asks that connection for `$HOME`
+  first, which is answered without launching bwrap.
 - **start** (first sandbox access of a session): clones the template into
   `<cacheDir>/sessions/<hash>`, keyed by eve's session id, and returns the session state eve
-  persists: the session key and the network policy.
+  persists: the session key and the network policy. From eve 0.83 it is an upsert: a
+  session whose workspace already exists, such as one a subagent sharing the sandbox
+  started, keeps it and the policy its live generation has.
 - **resume** (every later access, and after restarts): reopens the recorded workspace and
   applies the recorded network policy to a new compute generation. It fails instead of
-  recreating a workspace that is gone.
+  recreating a workspace that is gone, with the error eve 0.83 and later answer by starting
+  a fresh sandbox.
 - **onSandboxDelete** (`onSessionDelete` before eve 0.75): kills the session's processes
   and removes its workspace and metadata; the template survives.
+- **close** (eve 0.83 and later, at the end of every step): releases nothing. The compute
+  generation outlives the step; `stop`, server exit, and bwrap's `--die-with-parent` end it.
 - **onSessionEnd** (eve 0.75 and later, once a durable session has completed, expired or
-  failed): releases the session's workspace and metadata from the persisted state alone,
+  failed, and from eve 0.83 also for `sandbox.delete()` and for a session that never
+  recorded its sandbox, by its session id): releases the session's workspace and metadata
+  from the persisted state alone,
   stopping the live generation if this process holds one, without resuming the sandbox. It
   is idempotent, so eve may retry it, and a workspace that is already gone stays gone.
 
