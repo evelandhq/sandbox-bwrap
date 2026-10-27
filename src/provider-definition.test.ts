@@ -6,53 +6,15 @@ import type {
   SandboxProviderPrepareContext,
   SandboxProviderResources,
   SandboxProviderSessionContext,
-} from "eve/sandbox/provider";
+} from "eve-legacy/sandbox/provider";
 import { listBwrapCache } from "./cache.js";
 import type { ProcessRunner } from "./process.js";
+import { createLiveRunner, exitingRunner, makeRelease } from "./provider.test-support.js";
 import type { BwrapProviderHandle, BwrapSandboxEnvironmentOptions } from "./provider-definition.js";
 import {
   BWRAP_PROVIDER_STATE_PROTOCOL_VERSION,
   createBwrapSandboxProviderDefinition,
 } from "./provider-definition.js";
-
-const empty = () => new ReadableStream<Uint8Array>({ start: (c) => c.close() });
-
-/** Records every argv; each process exits only when killed. */
-function createLiveRunner() {
-  const calls: string[][] = [];
-  const killed: number[] = [];
-  const exits = new Map<number, (value: { exitCode: number }) => void>();
-  let pid = 0;
-  const runner: ProcessRunner = {
-    spawn(argv) {
-      calls.push([...argv]);
-      const id = ++pid;
-      const exit = new Promise<{ exitCode: number }>((resolve) => exits.set(id, resolve));
-      return {
-        pid: id,
-        stdout: empty(),
-        stderr: empty(),
-        wait: async () => await exit,
-        kill: async () => {
-          killed.push(id);
-          exits.get(id)?.({ exitCode: 137 });
-        },
-      };
-    },
-  };
-  return { runner, calls, killed };
-}
-
-const exitingRunner: ProcessRunner = {
-  spawn() {
-    return {
-      stdout: empty(),
-      stderr: empty(),
-      wait: async () => ({ exitCode: 0 }),
-      kill: async () => {},
-    };
-  },
-};
 
 const unusedHost: SandboxProviderPrepareContext["host"] = {
   loadOptionalPackage: async () => {
@@ -87,11 +49,6 @@ function resources(input: {
     workspace: tree("workspace", "/workspace", input.workspace),
     skills: tree("skills", "$HOME/.agents/skills", input.skills),
   };
-}
-
-async function makeRelease() {
-  const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-provider-"));
-  return { appRoot, storagePath: path.join(appRoot, ".eve", "sandbox-cache") };
 }
 
 function prepareContext(

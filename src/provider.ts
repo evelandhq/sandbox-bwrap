@@ -1,5 +1,12 @@
 import { defineSandboxProvider } from "eve/sandbox/provider";
-import { createBwrapSandboxProviderDefinition } from "./provider-definition.js";
+import type { BwrapConnectionExtensions } from "./provider-contract.js";
+import {
+  createBwrapSandboxProviderDefinition,
+  type BwrapPreparedArtifact,
+  type BwrapSandboxEnvironmentOptions,
+  type BwrapSandboxOpenOptions,
+  type BwrapSessionState,
+} from "./provider-definition.js";
 
 export {
   BWRAP_PROVIDER_STATE_PROTOCOL_VERSION,
@@ -8,12 +15,14 @@ export {
   type BwrapSandboxEnvironmentOptions,
   type BwrapSandboxOpenOptions,
   type BwrapSandboxProviderDefinition,
+  type BwrapSandboxProviderImplementation,
   type BwrapSessionState,
   type CreateBwrapSandboxProviderDefinitionInput,
   type BwrapProviderHandle,
   type BwrapSandboxDeleteOptions,
   type MutableNetworkSandboxSession,
 } from "./provider-definition.js";
+export type { BwrapConnectionExtensions, BwrapSandboxConnection } from "./provider-contract.js";
 export { isBwrapAvailable } from "./process.js";
 
 /**
@@ -29,6 +38,14 @@ export { isBwrapAvailable } from "./process.js";
  * ```
  *
  * This entry point imports `eve/sandbox/provider`, which exists only from eve
- * 0.64 on. On eve 0.62 and 0.63 use `bwrap()` from the package root.
+ * 0.64 on. On eve 0.62 and 0.63 use `bwrap()` from the package root. Its
+ * published types follow the eve line this package was built against (0.83's
+ * connection contract); the definition behind it answers every line from 0.64.
  */
-export const BwrapSandbox = defineSandboxProvider(createBwrapSandboxProviderDefinition());
+export const BwrapSandbox = defineSandboxProvider<
+  BwrapSandboxEnvironmentOptions,
+  BwrapSandboxOpenOptions,
+  BwrapPreparedArtifact,
+  BwrapSessionState,
+  BwrapConnectionExtensions
+>(createBwrapSandboxProviderDefinition());

@@ -21,3 +21,13 @@ export class BwrapTemplateNotProvisionedError extends Error {
     this.templateKey = input.templateKey;
   }
 }
+
+/**
+ * Thrown by `resume` when the session's workspace no longer exists. eve 0.83
+ * and later recognize it by `name` and start a fresh sandbox for the session
+ * instead of failing every later sandbox call; earlier eve lines treat it like
+ * any other resume failure.
+ */
+export class BwrapSandboxSessionGoneError extends Error {
+  override readonly name = "SandboxSessionGoneError";
+}

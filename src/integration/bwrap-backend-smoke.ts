@@ -8,8 +8,13 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { SandboxTemplateNotProvisionedError } from "eve-floor/sandbox";
-import type { SandboxProviderSessionContext } from "eve/sandbox/provider";
+import type {
+  SandboxProviderPrepareContext,
+  SandboxProviderSessionContext,
+} from "eve-legacy/sandbox/provider";
 import { createBwrapSandboxBackend } from "../backend.js";
+import { EVE_SANDBOX_HOME_PROBE } from "../connection.js";
+import type { BwrapSandboxConnection } from "../provider-contract.js";
 import { isBwrapAvailable } from "../process.js";
 import {
   createBwrapSandboxProviderDefinition,
@@ -56,7 +61,7 @@ function nonLoopbackInterfaces(stdout: string): string[] {
 }
 
 /**
- * The eve >=0.64 provider over the same real binary: authored preparation runs
+ * The eve 0.64-0.82 handle provider over the same real binary: authored preparation runs
  * inside bwrap at prepare time, the open-time network policy holds, and a
  * session resumed by a fresh definition (a restarted process) reopens the same
  * workspace under the policy it recorded.
@@ -72,7 +77,7 @@ async function providerSmoke(appRoot: string): Promise<void> {
     },
   };
   const environment = createBwrapSandboxProviderDefinition().environment(environmentOptions);
-  const artifact = await environment.prepare({
+  const prepareContext: SandboxProviderPrepareContext = {
     files: { list: async () => [], read: async () => new Uint8Array(), readText: async () => "" },
     host: {
       loadOptionalPackage: async () => {
@@ -91,7 +96,8 @@ async function providerSmoke(appRoot: string): Promise<void> {
     },
     sourceRevision: "smoke-rev",
     storagePath,
-  });
+  };
+  const artifact = await environment.prepare(prepareContext);
   const ctx = {
     host: { loadOptionalPackage: async () => undefined, resolveProjectPath: (p: string) => p },
     session: {
@@ -145,6 +151,91 @@ async function providerSmoke(appRoot: string): Promise<void> {
   await restarted.onSessionEnd!(ctx, artifact, state, { reason: "completed" });
   console.log(
     "PROVIDER SMOKE: prepare, start, restart + resume, delete and session end held under real bwrap",
+  );
+}
+
+async function runOver(
+  connection: BwrapSandboxConnection,
+  command: string,
+): Promise<{ exitCode: number; stdout: string }> {
+  const proc = await connection.spawn({ command, env: {}, workingDirectory: "/workspace" });
+  const [stdout, { exitCode }] = await Promise.all([
+    new Response(proc.stdout).text(),
+    proc.wait(),
+    new Response(proc.stderr).text(),
+  ]);
+  return { exitCode, stdout };
+}
+
+/**
+ * The eve 0.83+ connection provider over the same real binary. eve's own
+ * `populate` is stood in for by the calls it makes -- the `$HOME` probe, file
+ * seeding, and an authored command -- so what this proves is the connection:
+ * commands run in bwrap, deny-all holds, a restarted process resumes the same
+ * workspace, and a session that never recorded state still ends by key.
+ */
+async function connectionProviderSmoke(appRoot: string): Promise<void> {
+  const storagePath = path.join(appRoot, "connection-release", ".eve", "sandbox-cache");
+  const cacheDir = path.join(appRoot, "connection-sessions");
+  const environment = createBwrapSandboxProviderDefinition().environment({ cacheDir });
+  const artifact = await environment.prepare({
+    storagePath,
+    log: () => {},
+    templateKey: (identity) => `connection-smoke:${JSON.stringify(identity)}`,
+    async populate(connection) {
+      const home = await runOver(connection, EVE_SANDBOX_HOME_PROBE);
+      assert.equal(home.stdout, "/workspace\n", "the template must report the sandbox HOME");
+      await connection.writeFiles({
+        files: [
+          { path: "/workspace/seeded.txt", content: new TextEncoder().encode("connection-seed") },
+        ],
+      });
+      const prepared = await runOver(connection, "printf prepared-in-bwrap > prepared.txt");
+      assert.equal(prepared.exitCode, 0, "authored preparation must run in bwrap");
+    },
+  });
+  const ctx = {
+    kind: "session" as const,
+    session: { id: "connection-session-1" },
+    storagePath,
+  };
+
+  const { connection, state } = await environment.start(
+    ctx,
+    { networkPolicy: "deny-all" },
+    artifact,
+  );
+  const prepared = await runOver(connection, "cat prepared.txt seeded.txt");
+  assert.equal(prepared.stdout, "prepared-in-bwrapconnection-seed");
+  const denied = await runOver(connection, IFACE_COMMAND);
+  assert.equal(nonLoopbackInterfaces(denied.stdout).length, 0, "open-time deny-all must hold");
+  await assert.rejects(connection.readFile({ path: "/workspace" }), /directory/);
+
+  const sleeper = await connection.spawn({
+    command: "sleep 300",
+    env: {},
+    workingDirectory: "/workspace",
+  });
+  // eve closes the connection at the end of every step; the process lives on.
+  await connection.close();
+  assert.ok(sleeper.pid !== undefined && processIsAlive(sleeper.pid), "close must not kill");
+  await connection.stop();
+  assert.equal(processIsAlive(sleeper.pid), false, "stop must kill spawned processes");
+
+  const restarted = createBwrapSandboxProviderDefinition().environment({ cacheDir });
+  const resumed = await restarted.resume(ctx, artifact, state);
+  const reread = await runOver(resumed, "cat seeded.txt");
+  assert.equal(reread.stdout, "connection-seed");
+  const stillDenied = await runOver(resumed, IFACE_COMMAND);
+  assert.equal(nonLoopbackInterfaces(stillDenied.stdout).length, 0);
+
+  await restarted.onSessionEnd(ctx, null, { reason: "deleted" });
+  await assert.rejects(
+    restarted.resume(ctx, artifact, state),
+    (error: unknown) => error instanceof Error && error.name === "SandboxSessionGoneError",
+  );
+  console.log(
+    "CONNECTION SMOKE: prepare, start, close, stop, restart + resume, and end by key held under real bwrap",
   );
 }
 
@@ -447,6 +538,7 @@ async function main(): Promise<void> {
     await boundedHandle.shutdown();
 
     await providerSmoke(appRoot);
+    await connectionProviderSmoke(appRoot);
 
     console.log("BWRAP SMOKE OK");
   } finally {

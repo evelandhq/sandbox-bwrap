@@ -107,8 +107,9 @@ jobs:
         # compatibility; this proves the *runtime* import works, which is a
         # separate claim: the package root must load without eve's runtime on
         # every eve in the range, and the /provider entry point needs
-        # eve/sandbox/provider, which the floor (0.62) does not have.
-        eve: ["0.62.0", "latest"]
+        # eve/sandbox/provider, which the floor (0.62) does not have. 0.81.1 is
+        # the last handle-era provider contract; latest is the connection one.
+        eve: ["0.62.0", "0.81.1", "latest"]
     steps:
       - uses: actions/checkout@v4
 
