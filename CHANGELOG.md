@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.5.0...v0.6.0) (2026-10-27)
+
+
+### Features
+
+* answer eve 0.83's connection provider contract alongside the handle one ([#46](https://github.com/evelandhq/sandbox-bwrap/issues/46)) ([04dfc9c](https://github.com/evelandhq/sandbox-bwrap/commit/04dfc9c23287497bd85ceee1dc95789aed08da46))
+
 ## [0.5.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.4.1...v0.5.0) (2026-10-09)
 
 
