@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.6.0...v0.7.0) (2026-11-02)
+
+
+### Features
+
+* support eve 0.84 through 1.x, including spawn stdin ([6124211](https://github.com/evelandhq/sandbox-bwrap/commit/6124211c7d658cb9f40d838e77a6c2e4c34aa118))
+
 ## [0.6.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.5.0...v0.6.0) (2026-10-27)
 
 
