@@ -19,7 +19,11 @@ session handle from the provider, 0.83 and later a byte-level connection
 on the context eve passes (`populate` on a prepare context, `kind` on a session
 context). Both contracts are declared locally in `src/provider-contract.ts`,
 because 0.83 removed every handle-era type, and both must record the same
-session state: Eveland promotes and rolls back Deployments across eve lines. It was extracted from the
+session state: Eveland promotes and rolls back Deployments across eve lines.
+eve 0.84 then renamed every sandbox `abortSignal` option to `signal` and 0.84.1
+added `spawn({ stdin })`; the connection and the session read either abort
+name (`abortSignalOf` in `src/provider-contract.ts`) and honor `stdin`, so they
+must never be typed against one eve's option shapes. It was extracted from the
 eveland monorepo (`packages/sandbox-bwrap`) with its full history; commits
 before the extraction still carry eveland-wide subjects such as
 "feat: track eve 0.29.4".
@@ -44,28 +48,46 @@ non-obvious behaviors are deliberate and documented there:
 
 ## The eve peer range is the central invariant
 
-`peerDependencies.eve` is `>=0.62.0 <1.0.0`. That range is wide on purpose: a
-narrow window forced a republish for every eve minor, which is churn for
-consumers rather than safety, when the consumed surface is one small interface.
+`peerDependencies.eve` is `>=0.62.0 <1.0.0 || >=1.0.0-0 <2.0.0-0`. That range is
+wide on purpose: a narrow window forced a republish for every eve minor, which is
+churn for consumers rather than safety, when the consumed surface is one small
+interface. eve 1.0 puts `eve/sandbox/provider` under semver (stable until 2.0),
+so the ceiling is the next major. The second comparator set is spelled with
+`-0` because npm rejects prereleases unless a comparator in the same set names
+that exact version tuple: `>=0.62.0 <2.0.0-0` would accept 1.0.0 but not
+1.0.0-rc.1. Check any change to the range with `semver.satisfies` against the
+release candidates as well as releases.
 Three mechanisms keep the wide range honest — do not remove one without
 replacing it:
 
 1. `src/eve-compatibility.test.ts` typechecks the backend against the range's
    exact floor (`eve-floor`, pinned to the newest patch of the floor's minor
-   line), the provider against the last handle-era eve (`eve-legacy`) and
-   against the newest verified eve. These are
+   line), the provider against the last handle-era eve (`eve-legacy`), against
+   the last eve before the 0.84 `abortSignal` -> `signal` rename
+   (`eve-connection-legacy`), and against the newest verified eve (`eve`). It
+   also asserts that every option name each of those eves passes is declared
+   on this side, which plain assignability cannot catch because every such
+   option is optional. These are
    **type-level** tests; their annotations are the assertion, so
    `pnpm typecheck` must run in CI, not just `pnpm test`. The backend's eve
    types are declared locally in `src/backend-contract.ts`, because eve 0.64
    removed them; only the floor test proves those copies still match.
-2. The CI `pack` job installs the real tarball against both ends of the range
-   and imports it. This is a separate claim from typechecking. The package root
+2. The CI `pack` job installs the real tarball with npm against both ends of
+   the range and each contract era in between, and imports it. This is a
+   separate claim from typechecking, and it is also what proves npm's peer
+   resolution accepts an eve 1.0 release candidate. The package root
    must import nothing from eve at runtime, so it loads on every eve in the
    range; the `/provider` entry point imports `eve/sandbox/provider`, which
-   exists only from 0.64 on, so the job imports it only on the newest end.
+   exists only from 0.64 on, so the job imports it only there.
 3. `.github/workflows/eve-drift.yml` re-runs the suite against `eve@latest` on a
-   schedule. It is the only thing covering the `<1.0.0` ceiling, since no pinned
-   dependency can verify eve releases that do not exist yet.
+   schedule. It is the only thing covering the `<2.0.0-0` ceiling, since no
+   pinned dependency can verify eve releases that do not exist yet. eve's 1.x
+   stability policy makes a break there a bug in eve rather than an expected
+   minor, but the same policy lets a minor add values eve passes into a
+   provider: the session context's `kind`, `onSessionEnd`'s `reason`, and
+   `SandboxNetworkRule` variants. Never branch exhaustively on those; the
+   local contract types keep `kind` and `reason` open, and `setNetworkPolicy`
+   accepts `"allow-all"`/`"deny-all"` and rejects everything else.
 
 Raising the floor means changing `peerDependencies.eve` **and** the `eve-floor`
 devDependency together; a test asserts they name the same minor line.

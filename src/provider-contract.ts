@@ -1,4 +1,4 @@
-import type { SandboxProcess } from "eve/sandbox";
+import type { SpawnedProcess } from "./process.js";
 
 /**
  * The two sandbox provider contracts this package answers, declared locally.
@@ -9,7 +9,9 @@ import type { SandboxProcess } from "eve/sandbox";
  * handle-era type. One installed copy of this package serves every eve in the
  * peer range, so neither contract can be imported from the installed eve:
  * `src/eve-compatibility.test.ts` proves these copies against a real eve of
- * each era instead.
+ * each era instead. eve 0.84 then changed the connection's options in place
+ * (`abortSignal` became `signal`, and 0.84.1 added `spawn`'s `stdin`), so the
+ * connection declares both sides of that rename too.
  */
 
 /** One tree of authored files eve 0.64-0.82 asks `prepare` to seed. */
@@ -61,12 +63,19 @@ export interface HandleProviderHandle<Session> {
 }
 
 /**
- * eve 0.84 renamed every `abortSignal` option to `signal`; 0.83 passes only the
- * old name. A connection reads whichever arrived.
+ * eve 0.84 renamed every sandbox `abortSignal` option to `signal`; eve 0.62
+ * through 0.83 -- backends, handles, and 0.83's connection alike -- pass only
+ * the old name. Every call this package answers reads whichever arrived, via
+ * `abortSignalOf`, so the same build serves both sides of the rename.
  */
-export interface ConnectionAbortOptions {
+export interface EveAbortOptions {
   readonly abortSignal?: AbortSignal;
   readonly signal?: AbortSignal;
+}
+
+/** The caller's abort signal, under eve 0.84's name or the older one. */
+export function abortSignalOf(options: EveAbortOptions): AbortSignal | undefined {
+  return options.signal ?? options.abortSignal;
 }
 
 /** Capabilities merged onto the session eve derives from a connection. */
@@ -78,22 +87,28 @@ export interface BwrapConnectionExtensions {
 export interface BwrapSandboxConnection {
   readonly workspaceRoot: string;
   spawn(
-    options: ConnectionAbortOptions & {
+    options: EveAbortOptions & {
       readonly command: string;
       readonly env: Readonly<Record<string, string>>;
+      /**
+       * eve 0.84.1 and later: return the process's stdin as a writable stream.
+       * eve kills the process and fails the call when a requested stdin is
+       * missing, so this is honored, never ignored.
+       */
+      readonly stdin?: boolean;
       readonly workingDirectory: string;
     },
-  ): Promise<SandboxProcess>;
+  ): Promise<SpawnedProcess>;
   readFile(
-    options: ConnectionAbortOptions & { readonly path: string },
+    options: EveAbortOptions & { readonly path: string },
   ): Promise<ReadableStream<Uint8Array> | null>;
   writeFiles(
-    options: ConnectionAbortOptions & {
+    options: EveAbortOptions & {
       readonly files: readonly { readonly content: Uint8Array; readonly path: string }[];
     },
   ): Promise<void>;
   removePath(
-    options: ConnectionAbortOptions & {
+    options: EveAbortOptions & {
       readonly force?: boolean;
       readonly path: string;
       readonly recursive?: boolean;
@@ -112,16 +127,23 @@ export interface ConnectionProviderPrepareContext {
   templateKey(identity: { readonly [key: string]: unknown }): string;
 }
 
-/** eve 0.83+ `start`/`resume`/`onSessionEnd` context; `kind` marks the era. */
+/**
+ * eve 0.83+ `start`/`resume`/`onSessionEnd` context; `kind` marks the era.
+ * Only its presence is checked: eve 1.0's stability policy lets a minor add
+ * kinds, so nothing here may branch on the value itself.
+ */
 export interface ConnectionProviderSessionContext {
-  readonly kind: "session" | "tool-session";
+  readonly kind: "session" | "tool-session" | (string & {});
   readonly session: { readonly id: string };
   readonly storagePath: string;
 }
 
-/** What eve 0.83+ passes to `onSessionEnd`. */
-export interface ConnectionSessionEndOptions extends ConnectionAbortOptions {
-  readonly reason: "completed" | "expired" | "failed" | "deleted";
+/**
+ * What eve 0.83+ passes to `onSessionEnd`. Every reason releases the session
+ * the same way, so an end reason a later eve minor adds is handled already.
+ */
+export interface ConnectionSessionEndOptions extends EveAbortOptions {
+  readonly reason: "completed" | "expired" | "failed" | "deleted" | (string & {});
 }
 
 /** What eve 0.64-0.82 passes to `onSessionEnd`. */

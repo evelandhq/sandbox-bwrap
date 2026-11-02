@@ -128,6 +128,51 @@ describe("createNodeProcessRunner", () => {
     const proc = runner.spawn(["definitely-not-a-real-binary-xyz"]);
     await expect(proc.wait()).rejects.toThrow();
   });
+
+  test("without a stdin request the process has no stdin stream and reads EOF", async () => {
+    const proc = runner.spawn(["cat"]);
+    expect(proc.stdin).toBeUndefined();
+    const [stdout, result] = await Promise.all([readAll(proc.stdout), proc.wait()]);
+    expect(stdout).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("a stdin request pipes a writable stdin; closing it sends EOF", async () => {
+    const proc = runner.spawn(["sh", "-c", "cat; echo done"], { stdin: true });
+    if (proc.stdin === undefined) throw new Error("expected a stdin stream");
+    const writer = proc.stdin.getWriter();
+    await writer.write(new TextEncoder().encode("hello "));
+    await writer.write(new TextEncoder().encode("stdin\n"));
+    await writer.close();
+    const [stdout, result] = await Promise.all([readAll(proc.stdout), proc.wait()]);
+    expect(stdout).toBe("hello stdin\ndone\n");
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("a write to a stdin the command closed rejects instead of crashing the host", async () => {
+    const proc = runner.spawn(["sh", "-c", "exec 0<&-; echo closed; sleep 30"], { stdin: true });
+    if (proc.stdin === undefined) throw new Error("expected a stdin stream");
+    const reader = proc.stdout.getReader();
+    await reader.read();
+    const writer = proc.stdin.getWriter();
+    // Nothing reads the pipe any more, so a write fails with EPIPE. That must
+    // reject on the stream rather than surface as an unhandled 'error' event
+    // on the child's stdin socket, which would take the whole server down.
+    const outcome = await (async () => {
+      for (let index = 0; index < 8; index += 1) await writer.write(new Uint8Array(64 * 1024));
+    })().then(
+      () => "resolved",
+      (error: unknown) => (error as NodeJS.ErrnoException).code,
+    );
+    await proc.kill();
+    expect(outcome).toBe("EPIPE");
+  });
+
+  test("kill with an open stdin still terminates the process", async () => {
+    const proc = runner.spawn(["cat"], { stdin: true });
+    await proc.kill();
+    await expect(proc.wait()).resolves.toEqual({ exitCode: 137 });
+  });
 });
 
 describe("isBwrapAvailable", () => {

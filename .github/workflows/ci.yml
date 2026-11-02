@@ -51,8 +51,8 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # Covers src/eve-compatibility.test.ts, whose type annotations are what
-      # actually prove the backend still satisfies SandboxBackend on both ends
-      # of the declared peer range.
+      # actually prove the backend and provider still satisfy each eve contract
+      # era across the declared peer range.
       - name: Typecheck
         run: pnpm typecheck
 
@@ -108,8 +108,12 @@ jobs:
         # separate claim: the package root must load without eve's runtime on
         # every eve in the range, and the /provider entry point needs
         # eve/sandbox/provider, which the floor (0.62) does not have. 0.81.1 is
-        # the last handle-era provider contract; latest is the connection one.
-        eve: ["0.62.0", "0.81.1", "latest"]
+        # the last handle-era provider contract, 0.83.3 the last connection
+        # contract before eve 0.84 renamed `abortSignal` to `signal`, and
+        # 1.0.0-rc.1 an eve 1.0 release candidate: npm's peer check rejects a
+        # prerelease the range does not name explicitly, so this is what proves
+        # the `>=1.0.0-0` spelling in peerDependencies works.
+        eve: ["0.62.0", "0.81.1", "0.83.3", "1.0.0-rc.1", "latest"]
     steps:
       - uses: actions/checkout@v4
 

@@ -15,6 +15,7 @@ import {
   WORKSPACE_ROOT,
 } from "./paths.js";
 import type { ProcessRunner, SpawnedProcess } from "./process.js";
+import { abortSignalOf, type EveAbortOptions } from "./provider-contract.js";
 import type {
   BwrapCommandFinishReason,
   BwrapSandboxEvent,
@@ -110,11 +111,42 @@ function createRunAbortSignal(
 }
 
 /**
+ * What `run` accepts from every eve in the peer range. Declared here rather
+ * than taken from the installed eve, because eve 0.84 renamed `abortSignal` to
+ * `signal` and one session object must answer both: eve 0.62 through 0.82 call
+ * it directly with the old name, eve 0.84 and later with the new one.
+ */
+export interface BwrapRunOptions extends EveAbortOptions {
+  readonly command: string;
+  readonly workingDirectory?: string;
+  readonly env?: Readonly<Record<string, string>>;
+}
+
+/** What `spawn` accepts from every eve in the peer range. */
+export interface BwrapSpawnOptions extends BwrapRunOptions {
+  /**
+   * eve 0.84.1 and later: pipe the command's stdin and return it as the
+   * process's `stdin`; closing that stream sends EOF. Without it the command
+   * reads EOF at once.
+   */
+  readonly stdin?: boolean;
+}
+
+/** What `run` resolves to on every eve line. */
+export interface BwrapCommandResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/**
  * A sandbox session plus the lifecycle hook the backend handle needs.
  * eve's `shutdown()` contract requires that nothing is left running, so the
  * session tracks the processes it spawned and can terminate them on demand.
  */
-export type BwrapSession = SandboxSession & {
+export type BwrapSession = Omit<SandboxSession, "run" | "spawn"> & {
+  run(options: BwrapRunOptions): Promise<BwrapCommandResult>;
+  spawn(options: BwrapSpawnOptions): Promise<SpawnedProcess>;
   /**
    * Stable identifier of the durable session this handle wraps. eve 0.64
    * dropped `id` from `SandboxSession`, but every earlier line requires it.
@@ -225,6 +257,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     const exit = proc.wait();
     const wrapped: TrackedProcess = {
       pid: proc.pid,
+      ...(proc.stdin === undefined ? {} : { stdin: proc.stdin }),
       stdout: countedStream(proc.stdout, (count) => (stdoutBytes += count)),
       stderr: countedStream(proc.stderr, (count) => (stderrBytes += count)),
       async wait() {
@@ -284,10 +317,11 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
   }
 
   async function spawnProcess(spawnOptions: {
-    command: string;
-    workingDirectory?: string;
-    env?: Record<string, string>;
-    abortSignal?: AbortSignal;
+    readonly command: string;
+    readonly workingDirectory?: string;
+    readonly env?: Readonly<Record<string, string>>;
+    readonly signal?: AbortSignal;
+    readonly stdin?: boolean;
   }) {
     if (lifecycle !== "running") {
       throw new Error(`bwrap sandbox: compute generation is ${lifecycle}; refusing to spawn`);
@@ -316,7 +350,12 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       chdir: resolveWorkspacePath(spawnOptions.workingDirectory ?? WORKSPACE_ROOT),
       command: spawnOptions.command,
     });
-    return track(runner.spawn(argv, { abortSignal: spawnOptions.abortSignal }));
+    return track(
+      runner.spawn(argv, {
+        abortSignal: spawnOptions.signal,
+        ...(spawnOptions.stdin === true ? { stdin: true } : {}),
+      }),
+    );
   }
 
   return {
@@ -390,19 +429,30 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     },
 
     async spawn(spawnOptions) {
-      return await spawnProcess(spawnOptions);
+      return await spawnProcess({
+        command: spawnOptions.command,
+        workingDirectory: spawnOptions.workingDirectory,
+        env: spawnOptions.env,
+        signal: abortSignalOf(spawnOptions),
+        stdin: spawnOptions.stdin,
+      });
     },
 
     async run(runOptions) {
       const outputAbort = new AbortController();
       const runAbort = createRunAbortSignal(
-        runOptions.abortSignal,
+        abortSignalOf(runOptions),
         options.runTimeoutMs,
         outputAbort.signal,
       );
       const budget: OutputBudget = { limit: options.maxOutputBytes, used: 0 };
       try {
-        const proc = await spawnProcess({ ...runOptions, abortSignal: runAbort.signal });
+        const proc = await spawnProcess({
+          command: runOptions.command,
+          workingDirectory: runOptions.workingDirectory,
+          env: runOptions.env,
+          signal: runAbort.signal,
+        });
         const [stdout, stderr, { exitCode }] = await Promise.all([
           collectStream(proc.stdout, budget, (reason) => outputAbort.abort(reason)),
           collectStream(proc.stderr, budget, (reason) => outputAbort.abort(reason)),

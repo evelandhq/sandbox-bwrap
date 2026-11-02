@@ -80,8 +80,14 @@ export default defineSandbox(() => environment.open());
   records the same session state under both, so a deployment rolled back across 0.83 still
   opens its sessions. On 0.83 and later `setNetworkPolicy` reaches the session as a
   connection extension.
+- eve 0.84 renamed the abort option on every sandbox call from `abortSignal` to `signal`,
+  and eve 0.84.1 added `spawn({ stdin: true })`. The connection and the session read
+  whichever abort option name arrives, so one installed copy serves eve on both sides of the
+  rename. A `stdin: true` spawn returns the process with a writable `stdin` stream piped to
+  the sandboxed command; closing it sends EOF. Without it the command's stdin is
+  `/dev/null`.
 - The `/provider` entry point imports `eve/sandbox/provider`, which exists only from eve
-  0.64 on. Its published types follow eve 0.83's connection contract. The package root imports nothing from eve at runtime and also exports the plain
+  0.64 on. Its published types follow the connection contract of eve 0.83 and later. The package root imports nothing from eve at runtime and also exports the plain
   provider definition, `createBwrapSandboxProviderDefinition()`, for callers that call eve's
   `defineSandboxProvider` themselves.
 
@@ -100,20 +106,27 @@ export default defineSandbox({
 
 ### eve version requirement
 
-This package requires `eve` `>=0.62.0 <1.0.0`.
+This package requires `eve` `>=0.62.0 <1.0.0 || >=1.0.0-0 <2.0.0-0`: eve 0.62 and every
+later 0.x release, eve 1.0's release candidates, and every eve 1.x release. The second set
+is spelled with `-0` so that npm accepts the 1.0.0 release candidates, which a plain
+`<2.0.0` ceiling would reject as prereleases; prereleases of later 1.x minors are not
+included.
 
 The range is deliberately wide. eve's 0.x releases use caret-incompatible minor bumps,
 so a package that pins a narrow window has to republish for every eve minor — which is
 churn for consumers, not safety, when the surface actually consumed is one small
-interface that changes rarely. The range spans three such interfaces: `SandboxBackend` for
-eve 0.62 and 0.63, the handle provider contract for eve 0.64 through 0.82, and the
-connection provider contract from eve 0.83 on. Rather than re-declaring the window, CI
-keeps the claim honest from both ends: `src/eve-compatibility.test.ts` typechecks the
-backend against the range's exact floor (0.62.0; 0.63.0, the last eve that calls backends,
-ships identical sandbox types), the provider against the last handle-era release (0.81.1;
-0.82.0's provider types are identical) and against the newest verified release; a scheduled workflow re-runs the suite against
-`eve@latest` so a breaking eve minor shows up as a red build here instead of a bug report
-from your deployment. That is not theoretical: eve 0.32.0 added a required `stop()` to the
+interface that changes rarely. eve 1.0 puts `eve/sandbox/provider` under semantic
+versioning, stable until 2.0, so the ceiling is the next major. The range spans three such
+interfaces: `SandboxBackend` for eve 0.62 and 0.63, the handle provider contract for eve
+0.64 through 0.82, and the connection provider contract from eve 0.83 on (with the 0.84
+option rename). Rather than re-declaring the window, CI keeps the claim honest from both
+ends: `src/eve-compatibility.test.ts` typechecks the backend against the range's exact
+floor (0.62.0; 0.63.0, the last eve that calls backends, ships identical sandbox types),
+the provider against the last handle-era release (0.81.1; 0.82.0's provider types are
+identical), against the last release before the 0.84 rename (0.83.3), and against the
+newest verified release (1.0.0-rc.1); a scheduled workflow re-runs the suite against
+`eve@latest` so an eve release that breaks the contract shows up as a red build here instead
+of a bug report from your deployment. That is not theoretical: eve 0.32.0 added a required `stop()` to the
 backend handle. This package implements it; 0.1.0 does not, and pairing that release with
 eve `>=0.32.0` resolves cleanly and then fails at runtime the first time authored code calls
 `ctx.getSandbox().stop()`. Likewise, releases up to 0.3.0 import a value that eve 0.64
@@ -379,7 +392,9 @@ unprivileged systemd path below, where host PID 1 already reaps orphans.
 
 - `pnpm test` — unit tests, run anywhere, including macOS (process execution is
   injectable; no bwrap and no Linux needed). This is what CI runs on every push, and it
-  includes the eve floor/latest compatibility typechecks.
+  includes the eve compatibility typechecks against the floor (0.62), the last handle-era
+  release (0.81), the last release before the 0.84 option rename (0.83), and the newest
+  verified release (1.0).
 - `bash infra/smoke.sh` — the contract test against **real** bwrap, on macOS or Linux.
   It provisions a Lima VM (`brew install lima`), streams this worktree in, and runs the
   test as an unprivileged user under the systemd hardening a deployed eve agent actually

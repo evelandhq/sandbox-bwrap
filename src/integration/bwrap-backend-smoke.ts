@@ -211,6 +211,29 @@ async function connectionProviderSmoke(appRoot: string): Promise<void> {
   assert.equal(nonLoopbackInterfaces(denied.stdout).length, 0, "open-time deny-all must hold");
   await assert.rejects(connection.readFile({ path: "/workspace" }), /directory/);
 
+  // eve 0.84.1's spawn({ stdin: true }): the bytes must cross bwrap into the
+  // sandboxed command, and closing the stream must reach it as EOF -- `cat`
+  // only exits once it does.
+  const piped = await connection.spawn({
+    command: "cat; printf ':eof'",
+    env: {},
+    workingDirectory: "/workspace",
+    stdin: true,
+  });
+  assert.ok(piped.stdin !== undefined, "a stdin request must return a stdin stream");
+  const stdinWriter = piped.stdin.getWriter();
+  await stdinWriter.write(new TextEncoder().encode("piped-through-bwrap"));
+  await stdinWriter.close();
+  const [pipedOut, pipedExit] = await Promise.all([
+    new Response(piped.stdout).text(),
+    piped.wait(),
+    new Response(piped.stderr).text(),
+  ]);
+  assert.equal(pipedOut, "piped-through-bwrap:eof", "stdin must reach the sandboxed command");
+  assert.equal(pipedExit.exitCode, 0);
+  const unpiped = await runOver(connection, "cat; printf ':eof'");
+  assert.equal(unpiped.stdout, ":eof", "without a stdin request the command reads EOF at once");
+
   const sleeper = await connection.spawn({
     command: "sleep 300",
     env: {},
@@ -235,7 +258,7 @@ async function connectionProviderSmoke(appRoot: string): Promise<void> {
     (error: unknown) => error instanceof Error && error.name === "SandboxSessionGoneError",
   );
   console.log(
-    "CONNECTION SMOKE: prepare, start, close, stop, restart + resume, and end by key held under real bwrap",
+    "CONNECTION SMOKE: prepare, start, stdin, close, stop, restart + resume, and end by key held under real bwrap",
   );
 }
 

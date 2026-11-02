@@ -1,10 +1,15 @@
 import { spawn, spawnSync } from "node:child_process";
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { WORKSPACE_ROOT } from "./paths.js";
 
 /** Mirrors the AI SDK SandboxProcess surface so sessions can return it directly. */
 export interface SpawnedProcess {
   readonly pid?: number;
+  /**
+   * The command's stdin, present only when the spawn asked for it (eve 0.84.1
+   * and later, `spawn({ stdin: true })`). Closing it sends EOF.
+   */
+  readonly stdin?: WritableStream<Uint8Array>;
   readonly stdout: ReadableStream<Uint8Array>;
   readonly stderr: ReadableStream<Uint8Array>;
   wait(): Promise<{ exitCode: number }>;
@@ -13,7 +18,16 @@ export interface SpawnedProcess {
 
 /** Injectable process launcher so backend logic is unit-testable without bwrap. */
 export interface ProcessRunner {
-  spawn(argv: readonly string[], options?: { readonly abortSignal?: AbortSignal }): SpawnedProcess;
+  spawn(argv: readonly string[], options?: ProcessRunnerSpawnOptions): SpawnedProcess;
+}
+
+export interface ProcessRunnerSpawnOptions {
+  readonly abortSignal?: AbortSignal;
+  /**
+   * Pipe the process's stdin and return it as `SpawnedProcess.stdin`. Without
+   * it stdin is `/dev/null`, so a command that reads stdin sees EOF at once.
+   */
+  readonly stdin?: boolean;
 }
 
 const SIGNAL_EXIT_CODES: Record<string, number> = { SIGINT: 130, SIGKILL: 137, SIGTERM: 143 };
@@ -56,7 +70,10 @@ export function createNodeProcessRunner(): ProcessRunner {
       }
       // detached: the child leads its own process group, so kill(-pid) reaps
       // the entire sandboxed tree (bwrap and everything inside it).
-      const child = spawn(command, rest, { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+      const child =
+        options?.stdin === true
+          ? spawn(command, rest, { detached: true, stdio: ["pipe", "pipe", "pipe"] })
+          : spawn(command, rest, { detached: true, stdio: ["ignore", "pipe", "pipe"] });
       const exit = new Promise<{ exitCode: number }>((resolvePromise, reject) => {
         child.once("error", reject);
         child.once("exit", (code, signal) => {
@@ -103,6 +120,12 @@ export function createNodeProcessRunner(): ProcessRunner {
       void exit.then(removeAbortListener, removeAbortListener);
       return {
         pid: child.pid,
+        // Writable.toWeb listens for the socket's errors, so an EPIPE from a
+        // write the command no longer reads rejects that write instead of
+        // surfacing as an unhandled 'error' event that would crash the host.
+        ...(child.stdin === null
+          ? {}
+          : { stdin: Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array> }),
         stdout: Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>,
         stderr: Readable.toWeb(child.stderr) as unknown as ReadableStream<Uint8Array>,
         async wait() {

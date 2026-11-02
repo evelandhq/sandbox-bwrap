@@ -1,6 +1,6 @@
-import type { SandboxProcess } from "eve/sandbox";
 import { WORKSPACE_ROOT } from "./paths.js";
-import type { BwrapSandboxConnection, ConnectionAbortOptions } from "./provider-contract.js";
+import type { SpawnedProcess } from "./process.js";
+import { abortSignalOf, type BwrapSandboxConnection } from "./provider-contract.js";
 import type { BwrapSession } from "./session.js";
 
 /**
@@ -32,7 +32,7 @@ export function createBwrapConnection(input: CreateBwrapConnectionInput): BwrapS
     workspaceRoot: WORKSPACE_ROOT,
 
     async spawn(options) {
-      if (template && options.command === EVE_SANDBOX_HOME_PROBE) {
+      if (template && options.command === EVE_SANDBOX_HOME_PROBE && options.stdin !== true) {
         return answeredProcess(`${template.home}\n`);
       }
       template?.assertBwrapAvailable();
@@ -40,7 +40,8 @@ export function createBwrapConnection(input: CreateBwrapConnectionInput): BwrapS
         command: options.command,
         env: { ...options.env },
         workingDirectory: options.workingDirectory,
-        abortSignal: abortSignalOf(options),
+        signal: abortSignalOf(options),
+        stdin: options.stdin,
       });
     },
 
@@ -87,11 +88,7 @@ export function sandboxHome(env: Readonly<Record<string, string>>): string {
   return env.HOME ?? WORKSPACE_ROOT;
 }
 
-function abortSignalOf(options: ConnectionAbortOptions): AbortSignal | undefined {
-  return options.signal ?? options.abortSignal;
-}
-
-function answeredProcess(stdout: string): SandboxProcess {
+function answeredProcess(stdout: string): SpawnedProcess {
   const bytes = new TextEncoder().encode(stdout);
   return {
     stdout: new ReadableStream({
