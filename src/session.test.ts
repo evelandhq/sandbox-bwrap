@@ -264,6 +264,79 @@ describe("run and spawn", () => {
   });
 });
 
+describe("eve 0.84 spawn options", () => {
+  function recordingSession() {
+    const received: { abortSignal?: AbortSignal; stdin?: boolean }[] = [];
+    const stdin = new WritableStream<Uint8Array>();
+    const runner: ProcessRunner = {
+      spawn(_argv, spawnOptions): SpawnedProcess {
+        received.push({ ...spawnOptions });
+        return {
+          pid: 21,
+          ...(spawnOptions?.stdin === true ? { stdin } : {}),
+          stdout: stringStream(""),
+          stderr: stringStream(""),
+          wait: async () => ({ exitCode: 0 }),
+          kill: async () => {},
+        };
+      },
+    };
+    return { runner, received, stdin };
+  }
+
+  async function sessionOver(runner: ProcessRunner) {
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "bwrap-spawn-options-"));
+    return createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      cacheRoots: [],
+      runner,
+      options: resolveBwrapSandboxOptions({ runTimeoutMs: null }),
+    });
+  }
+
+  test("spawn forwards a stdin request and returns the process's stdin stream", async () => {
+    const { runner, received, stdin } = recordingSession();
+    const session = await sessionOver(runner);
+
+    const withStdin = await session.spawn({ command: "cat", stdin: true });
+    const without = await session.spawn({ command: "cat" });
+
+    expect(received.map((options) => options.stdin)).toEqual([true, undefined]);
+    expect(withStdin.stdin).toBe(stdin);
+    expect(without.stdin).toBeUndefined();
+  });
+
+  test("spawn takes eve 0.84's `signal` as well as the older `abortSignal`", async () => {
+    const { runner, received } = recordingSession();
+    const session = await sessionOver(runner);
+    const older = new AbortController().signal;
+    const newer = new AbortController().signal;
+
+    await session.spawn({ command: "a", abortSignal: older });
+    await session.spawn({ command: "b", signal: newer });
+
+    expect(received.map((options) => options.abortSignal)).toEqual([older, newer]);
+  });
+
+  test("run aborts on eve 0.84's `signal` as well as the older `abortSignal`", async () => {
+    const { runner, received } = recordingSession();
+    const session = await sessionOver(runner);
+
+    for (const options of [
+      { command: "a", abortSignal: AbortSignal.abort(new Error("older")) },
+      { command: "b", signal: AbortSignal.abort(new Error("newer")) },
+    ]) {
+      await session.run(options);
+    }
+
+    // run combines the caller's signal with its own output and timeout
+    // signals, so the runner sees a derived signal carrying the caller's reason.
+    const reasons = received.map((options) => options.abortSignal?.reason as Error | undefined);
+    expect(reasons.map((reason) => reason?.message)).toEqual(["older", "newer"]);
+  });
+});
+
 describe("network policy", () => {
   test("deny-all option and setNetworkPolicy toggle --unshare-net per call", async () => {
     const { session, calls } = await makeSession();

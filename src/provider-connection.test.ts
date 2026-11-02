@@ -361,4 +361,42 @@ describe("connection", () => {
 
     expect(signals).toEqual([older, newer]);
   });
+
+  /**
+   * eve 0.84.1 checks for `stdin` only after the provider returned the process,
+   * then kills it and fails the call -- so a provider that ignored the request
+   * would already have started the command once.
+   */
+  test("honors eve 0.84.1's stdin request with the process's writable stdin", async () => {
+    const { storagePath } = await makeRelease();
+    const requested: (boolean | undefined)[] = [];
+    const stdin = new WritableStream<Uint8Array>();
+    const runner: ProcessRunner = {
+      spawn(_argv, options) {
+        requested.push(options?.stdin);
+        return {
+          ...(options?.stdin === true ? { stdin } : {}),
+          stdout: empty(),
+          stderr: empty(),
+          wait: async () => ({ exitCode: 0 }),
+          kill: async () => {},
+        };
+      },
+    };
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { connection } = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
+
+    const piped = await connection.spawn({
+      command: "cat",
+      env: {},
+      workingDirectory: "/workspace",
+      stdin: true,
+    });
+    const plain = await connection.spawn({ command: "cat", env: {}, workingDirectory: "/" });
+
+    expect(requested).toEqual([true, undefined]);
+    expect(piped.stdin).toBe(stdin);
+    expect(plain.stdin).toBeUndefined();
+  });
 });

@@ -1,10 +1,11 @@
 name: eve drift
 
-# The peer range's ceiling (`<1.0.0`) accepts eve releases that did not exist
+# The peer range's ceiling (`<2.0.0-0`) accepts eve releases that did not exist
 # when this package was published, so no pinned devDependency can verify it.
 # This job is what makes that range a maintained claim instead of an
 # unfalsifiable one: it installs whatever eve is newest today and re-runs the
-# suite, so a breaking 0.x minor surfaces here first.
+# suite, so a 1.x minor that breaks the sandbox provider contract -- despite
+# eve's semver promise for `eve/sandbox/provider` -- surfaces here first.
 
 on:
   schedule:
@@ -74,7 +75,7 @@ jobs:
               labels: ["eve-drift"],
               body: [
                 `The scheduled drift check failed against \`eve@${version}\`, which the`,
-                "declared peer range `>=0.62.0 <1.0.0` currently accepts.",
+                "declared peer range `>=0.62.0 <1.0.0 || >=1.0.0-0 <2.0.0-0` currently accepts.",
                 "",
                 `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
                 "",
