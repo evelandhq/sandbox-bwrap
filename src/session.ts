@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
-import { buildBwrapExecArgs, DEFAULT_SANDBOX_PATH } from "./args.js";
+import { buildBwrapExecArgs, DEFAULT_SANDBOX_PATH, SANDBOX_AGENT_ENV } from "./args.js";
 import type { ResolvedBwrapSandboxOptions } from "./options.js";
 import {
   isWithinWorkspaceReal,
@@ -314,6 +314,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       PATH: DEFAULT_SANDBOX_PATH,
       HOME: WORKSPACE_ROOT,
       LANG: "C.UTF-8",
+      ...SANDBOX_AGENT_ENV,
       ...options.env,
       ...spawnOptions.env,
     };

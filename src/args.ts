@@ -3,6 +3,14 @@ import { WORKSPACE_ROOT } from "./paths.js";
 /** PATH the sandbox sees; the host rootfs is visible read-only, so the standard dirs apply. */
 export const DEFAULT_SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/**
+ * eve's `SANDBOX_AGENT_ENV` from `eve/sandbox/provider`: tells agent-aware CLIs
+ * to skip interactive prompts. eve asks providers to set it beneath their own
+ * environment variables. Copied rather than imported so the package root
+ * loads without eve's runtime; a test pins it to eve's value.
+ */
+export const SANDBOX_AGENT_ENV: Readonly<Record<string, string>> = { AI_AGENT: "eve" };
+
 export interface BwrapExecInput {
   readonly bwrapPath: string;
   readonly workspaceDir: string;

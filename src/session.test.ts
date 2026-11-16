@@ -72,6 +72,37 @@ describe("spawn", () => {
     expect(setenv).not.toContain("OPENAI");
   });
 
+  /**
+   * eve asks every provider to set `SANDBOX_AGENT_ENV` beneath the sandbox's
+   * own variables, so agent-aware CLIs skip interactive prompts. eve does not
+   * add it to the per-call env itself.
+   */
+  test("sets AI_AGENT=eve beneath the configured and per-call env", async () => {
+    const setenvs = (argv: readonly string[]) =>
+      Object.fromEntries(
+        argv.flatMap((arg, index) =>
+          arg === "--setenv" ? [[argv[index + 1], argv[index + 2]]] : [],
+        ),
+      );
+    const { session, calls } = await makeSession();
+    await session.spawn({ command: "true" });
+    await session.spawn({ command: "true", env: { AI_AGENT: "per-call" } });
+    expect(setenvs(calls[0]!).AI_AGENT).toBe("eve");
+    expect(setenvs(calls[1]!).AI_AGENT).toBe("per-call");
+
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "bwrap-agent-env-"));
+    const { runner, calls: configuredCalls } = createFakeRunner();
+    const configured = createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      cacheRoots: [],
+      runner,
+      options: resolveBwrapSandboxOptions({ env: { AI_AGENT: "configured" } }),
+    });
+    await configured.spawn({ command: "true" });
+    expect(setenvs(configuredCalls[0]!).AI_AGENT).toBe("configured");
+  });
+
   test("workingDirectory resolves against /workspace", async () => {
     const { session, calls } = await makeSession();
     await session.spawn({ command: "true", workingDirectory: "sub/dir" });

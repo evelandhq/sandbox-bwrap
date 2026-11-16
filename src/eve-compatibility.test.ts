@@ -3,12 +3,14 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import type { SandboxEnvironment, SandboxSession } from "eve/sandbox";
+import { SANDBOX_AGENT_ENV as EVE_SANDBOX_AGENT_ENV } from "eve/sandbox/provider";
 import type {
   SandboxConnection,
   SandboxProviderDefinition,
   SandboxSessionContext,
   SandboxSessionEndOptions,
 } from "eve/sandbox/provider";
+import { SANDBOX_AGENT_ENV } from "./args.js";
 import { EVE_SANDBOX_HOME_PROBE } from "./connection.js";
 import type { BwrapSandboxEnvironmentOptions } from "./options.js";
 import type {
@@ -95,6 +97,14 @@ describe("eve sandbox provider contract", () => {
     ];
 
     expect([...accepted, ...reasons]).toHaveLength(4);
+  });
+
+  /**
+   * The package root imports nothing from eve at run time, so it carries its
+   * own copy of the variables eve asks providers to set in every sandbox.
+   */
+  test("the sandbox environment carries eve's SANDBOX_AGENT_ENV", () => {
+    expect(SANDBOX_AGENT_ENV).toEqual(EVE_SANDBOX_AGENT_ENV);
   });
 
   /**
