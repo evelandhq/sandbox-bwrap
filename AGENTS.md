@@ -5,33 +5,28 @@ agents; user-facing behavior belongs in `README.md`.
 
 ## What this repository is
 
-One published package, `@evelandhq/sandbox-bwrap`: a bubblewrap-backed eve
-sandbox with two faces. eve 0.64 replaced sandbox backends with providers, so
-the package implements both: the `SandboxBackend` interface for eve 0.62 and
-0.63 (`bwrap()` from the root), and a sandbox provider for eve 0.64 and later
-(`BwrapSandbox` from `/provider`, a plain definition from the root). Both run
-on the same session machinery in `src/runtime.ts`.
-
-eve 0.83 replaced the provider contract itself: 0.64 through 0.82 take a
-session handle from the provider, 0.83 and later a byte-level connection
-(`src/connection.ts`) from which eve derives the session. The one definition in
-`src/provider-definition.ts` answers both, overloaded per method and dispatched
-on the context eve passes (`populate` on a prepare context, `kind` on a session
-context). Both contracts are declared locally in `src/provider-contract.ts`,
-because 0.83 removed every handle-era type, and both must record the same
-session state: Eveland promotes and rolls back Deployments across eve lines.
-eve 0.84 then renamed every sandbox `abortSignal` option to `signal` and 0.84.1
-added `spawn({ stdin })`; the connection and the session read either abort
-name (`abortSignalOf` in `src/provider-contract.ts`) and honor `stdin`, so they
-must never be typed against one eve's option shapes. It was extracted from the
+One published package, `@evelandhq/sandbox-bwrap`: a bubblewrap-backed sandbox
+provider for eve 1.x. It implements eve's connection provider contract
+(`eve/sandbox/provider`): `src/provider-definition.ts` is the lifecycle
+(`prepare`, `start`, `resume`, `onSessionEnd`), `src/connection.ts` the
+connection eve derives the sandbox session from, and `src/session.ts` /
+`src/runtime.ts` the per-workspace compute generations underneath. The ready
+`BwrapSandbox` is exported from `/provider`; the root exports the plain
+definition and imports nothing from eve at run time. It was extracted from the
 eveland monorepo (`packages/sandbox-bwrap`) with its full history; commits
-before the extraction still carry eveland-wide subjects such as
-"feat: track eve 0.29.4".
+before the extraction still carry eveland-wide subjects.
 
 Eveland is the primary consumer, but it consumes this as a published npm
 package like anyone else — it vendors the built `dist/` into every Release it
 builds. Nothing here may depend on eveland, and eveland-specific behavior does
 not belong in this repository.
+
+Recorded data must keep working across releases: the provider name `bwrap`,
+`stateProtocolVersion` 1, the `BwrapSessionState` and `BwrapPreparedArtifact`
+shapes, and the session workspace path `sessions/<sha256("session:<id>")[:32]>`
+(pinned in `src/paths.test.ts`). Durable session workspaces outlive every
+deployment, so changing any of these loses them; raise
+`stateProtocolVersion` only for a deliberate, incompatible state change.
 
 ## Start here
 
@@ -39,58 +34,44 @@ Before changing code, read `README.md` — particularly **Security boundary**,
 which states what this sandbox does and does not protect against. Several
 non-obvious behaviors are deliberate and documented there:
 
-- Host-side _read_ methods are intentionally not containment-checked; only
-  write and remove calls are. That asymmetry follows eve's contract and is not
-  a bug to fix.
-- `shutdown()` kills the session's processes but deliberately leaves the
+- The host-side `readFile` is intentionally not containment-checked; only
+  `writeFiles` and `removePath` are. That asymmetry follows eve's contract and
+  is not a bug to fix.
+- `connection.stop()` kills the session's processes but deliberately leaves the
   workspace directory on disk. It is durable state.
-- The cache is intentionally never pruned. See **Disk usage**.
+- The cache is never pruned on its own. See **Disk usage**.
+- `runTimeoutMs` and `maxOutputBytes` apply to every spawned command, because
+  eve builds `run()` from `spawn()` and bwrap's PID namespace ends everything a
+  command started when it exits. See **How it works**.
 
-## The eve peer range is the central invariant
+## The eve peer range
 
-`peerDependencies.eve` is `>=0.62.0 <1.0.0 || >=1.0.0-0 <2.0.0-0`. That range is
-wide on purpose: a narrow window forced a republish for every eve minor, which is
-churn for consumers rather than safety, when the consumed surface is one small
-interface. eve 1.0 puts `eve/sandbox/provider` under semver (stable until 2.0),
-so the ceiling is the next major. The second comparator set is spelled with
-`-0` because npm rejects prereleases unless a comparator in the same set names
-that exact version tuple: `>=0.62.0 <2.0.0-0` would accept 1.0.0 but not
-1.0.0-rc.1. Check any change to the range with `semver.satisfies` against the
-release candidates as well as releases.
-Three mechanisms keep the wide range honest — do not remove one without
-replacing it:
+`peerDependencies.eve` is `>=1.0.0 <2.0.0-0`. eve 1.0 puts
+`eve/sandbox/provider` under semver, so the ceiling is the next major. Two
+mechanisms keep the range honest — do not remove one without replacing it:
 
-1. `src/eve-compatibility.test.ts` typechecks the backend against the range's
-   exact floor (`eve-floor`, pinned to the newest patch of the floor's minor
-   line), the provider against the last handle-era eve (`eve-legacy`), against
-   the last eve before the 0.84 `abortSignal` -> `signal` rename
-   (`eve-connection-legacy`), and against the newest verified eve (`eve`). It
-   also asserts that every option name each of those eves passes is declared
-   on this side, which plain assignability cannot catch because every such
-   option is optional. These are
-   **type-level** tests; their annotations are the assertion, so
-   `pnpm typecheck` must run in CI, not just `pnpm test`. The backend's eve
-   types are declared locally in `src/backend-contract.ts`, because eve 0.64
-   removed them; only the floor test proves those copies still match.
-2. The CI `pack` job installs the real tarball with npm against both ends of
-   the range and each contract era in between, and imports it. This is a
-   separate claim from typechecking, and it is also what proves npm's peer
-   resolution accepts an eve 1.0 release candidate. The package root
-   must import nothing from eve at runtime, so it loads on every eve in the
-   range; the `/provider` entry point imports `eve/sandbox/provider`, which
-   exists only from 0.64 on, so the job imports it only there.
-3. `.github/workflows/eve-drift.yml` re-runs the suite against `eve@latest` on a
-   schedule. It is the only thing covering the `<2.0.0-0` ceiling, since no
-   pinned dependency can verify eve releases that do not exist yet. eve's 1.x
-   stability policy makes a break there a bug in eve rather than an expected
-   minor, but the same policy lets a minor add values eve passes into a
-   provider: the session context's `kind`, `onSessionEnd`'s `reason`, and
-   `SandboxNetworkRule` variants. Never branch exhaustively on those; the
-   local contract types keep `kind` and `reason` open, and `setNetworkPolicy`
+1. `src/eve-compatibility.test.ts` checks, against the installed `eve`
+   devDependency, that the definition satisfies eve's
+   `SandboxProviderDefinition`, that every option eve passes is declared on
+   this side (assignability alone cannot catch a dropped optional option), that
+   the template connection answers eve's `$HOME` probe, that the copied
+   `SANDBOX_AGENT_ENV` matches eve's, and that the devDependency lies inside
+   the peer range. These are largely **type-level** tests; their annotations
+   are the assertion, so `pnpm typecheck` must run in CI, not just `pnpm test`.
+   The contract types in `src/provider-contract.ts` are declared narrowly on
+   purpose, so a host can drive the definition directly; this test is what
+   ties them to eve's.
+2. `.github/workflows/eve-drift.yml` re-runs the suite against `eve@latest` on
+   a schedule. It is the only thing covering releases newer than the
+   devDependency. eve's stability policy lets a minor add values eve passes
+   into a provider — the session context's `kind`, `onSessionEnd`'s `reason`,
+   and network policy variants. Never branch exhaustively on those: the local
+   contract types keep `kind` and `reason` open, and `setNetworkPolicy`
    accepts `"allow-all"`/`"deny-all"` and rejects everything else.
 
-Raising the floor means changing `peerDependencies.eve` **and** the `eve-floor`
-devDependency together; a test asserts they name the same minor line.
+The CI `pack` job installs the real tarball with npm against `eve@1.0.0` and
+`eve@latest` and imports both entry points, which is a separate claim from
+typechecking.
 
 ## How to work here
 
@@ -105,7 +86,8 @@ devDependency together; a test asserts they name the same minor line.
   by unit tests. Argv that looks right and a kernel that accepts it are
   different things.
 - Ground changes in the real files and real runtime behavior. Do not guess at
-  eve's contract when the installed `eve/sandbox` types can be inspected.
+  eve's contract when the installed `eve/sandbox/provider` types and
+  `node_modules/eve/docs/sandbox/custom-providers.mdx` can be inspected.
 
 ## Verification
 

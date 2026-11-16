@@ -134,7 +134,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
   /**
    * Applies `runTimeoutMs` and `maxOutputBytes` to one spawned process.
    *
-   * Every command reaches this package as a spawn -- eve 1.0 builds `run()`
+   * Every command reaches this package as a spawn -- eve builds `run()`
    * from `spawn()` itself -- and bwrap's PID namespace ends every process a
    * command started when that command exits, so bounding each spawn bounds all
    * sandboxed work. A timeout kills the process group and rejects `wait()`.
