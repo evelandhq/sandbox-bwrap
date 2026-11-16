@@ -181,7 +181,7 @@ async function connectionProviderSmoke(appRoot: string): Promise<void> {
 }
 
 /**
- * eve 1.0 builds `sandbox.run()` and the bash tool from `connection.spawn`, so
+ * eve builds `sandbox.run()` and the bash tool from `connection.spawn`, so
  * the run limits must hold there: a command past `runTimeoutMs` is killed with
  * every process it started, and output past `maxOutputBytes` is cut at the
  * limit and fails the command. `eveRun` reads a command the way eve's `run()`

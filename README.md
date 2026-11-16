@@ -1,48 +1,22 @@
 # @evelandhq/sandbox-bwrap
 
-A [bubblewrap](https://github.com/containers/bubblewrap)-based sandbox for
-[eve](https://www.npmjs.com/package/eve) agents: a sandbox provider for eve 0.64 and later,
-and a `SandboxBackend` for eve 0.62 and 0.63. It gives agent-executed code a real
-Linux sandbox — actual binaries, isolated filesystem, coarse network control — without
-requiring a Docker daemon or KVM.
+A [bubblewrap](https://github.com/containers/bubblewrap) sandbox provider for
+[eve](https://www.npmjs.com/package/eve) agents. It gives agent-executed code a real Linux
+sandbox — actual binaries, an isolated writable workspace, coarse network control — with
+nothing but the `bwrap` binary and unprivileged user namespaces: no Docker daemon, no KVM.
 
 ## Why
 
-eve's built-in backend chain is Vercel → Docker → microsandbox → just-bash. On a
-self-hosted Linux box without a Docker daemon or KVM (for example an eveland systemd
-deployment host), that chain bottoms out at `just-bash`: a pure-JS interpreter with a
-virtual filesystem that cannot run real binaries. This backend fills that gap with
-bubblewrap, which needs nothing but the `bwrap` binary and unprivileged user
-namespaces.
+eve's built-in providers need a hosted service (Vercel Sandbox), a Docker daemon, or settle
+for just-bash, a pure-JS interpreter over a virtual filesystem that cannot run real binaries.
+On a self-hosted Linux host without Docker or KVM, such as a systemd deployment, this
+provider runs real commands with bubblewrap instead.
 
 ## Usage
 
-**Deployed on eveland:** you do nothing. (What follows describes the integration for eve
-0.63 and earlier.) eveland's Docker and systemd runtimes generate
-the sandbox module into the release directory at build time — `agent/sandbox.js` for a flat
-agent, or `agent/sandbox/sandbox.js` when a sandbox folder exists, recursively for every
-subagent — and vendors this package's built output beside it, so agent projects never declare
-a deployment backend themselves. If a project shipped its own sandbox module, the build
-wraps that definition and reports it in the build log: Eveland overrides only `backend`, while
-authored `bootstrap()`, `onSession()`, `description`, and `revalidationKey` remain active. The
-sibling `agent/sandbox/workspace/**` tree is preserved, so Eve still seeds those files into each
-Session's `/workspace`. Each Eveland Release supplies a distinct template revision, so Sessions
-created against a new Deployment see its updated seeds while existing durable Session workspaces
-remain untouched. The systemd runtime invokes
-bwrap as its unprivileged deployment user. The local Docker runtime installs bwrap inside the Agent
-image and grants the outer container only the capabilities nested bwrap requires; the
-Agent container still receives no Docker socket. Local `eve dev` is untouched — it never runs
-the eveland build pipeline, so it falls back to eve's default backend chain (usually
-`just-bash`, or Docker where available). See eveland's `docs/deploy/linux.md` for what the
-build log looks like and what happens when the sandbox does not work on the host.
-
-**Standalone use of this package** (outside eveland, or in any project that manages its
-own `agent/sandbox.ts`) depends on which sandbox API your eve has.
-
-### eve 0.64 and later: `BwrapSandbox`
-
-eve 0.64 replaced sandbox backends with providers. Import the provider from the
-`/provider` entry point and export its environment:
+Requires `eve` `>=1.0.0 <2.0.0-0`. eve 1.0 puts `eve/sandbox/provider` under semantic
+versioning, so every eve 1.x release is accepted. A scheduled CI job re-runs the suite
+against the newest eve to catch a release that breaks the contract anyway.
 
 ```ts
 // agent/sandbox.ts
@@ -60,196 +34,116 @@ export const environment = BwrapSandbox.environment({
 export default defineSandbox(() => environment.open());
 ```
 
-- `eve build` prepares the template: the workspace and skill trees are written into it, then
-  `prepare` runs inside bwrap, so a build that runs `prepare` needs bwrap on the build host; a
-  build without one does not. The
-  template lives under `.eve/sandbox-cache/bwrap/templates` in the built app, and eve records
-  its absolute path. Serve the build from where it was built, or rebuild on the deploy host;
-  a missing template fails the first sandbox access with a rebuild message.
+- `eve build` prepares the template: eve writes the workspace and skill files into it and
+  runs `prepare` inside bwrap, so a build that runs `prepare` needs bwrap on the build host;
+  a build without one does not. The template lives under eve's sandbox storage directory in
+  the built app (`.eve/sandbox-cache/bwrap/templates`), and eve records its absolute path.
+  Serve the build from where it was built, or rebuild on the deploy host; a missing template
+  fails the first sandbox access with a rebuild message.
 - eve records which provider prepared each sandbox and refuses to open it with a different
   one. Choose the provider from something that is the same at build and run time, not from
   `isBwrapAvailable()` on hosts that differ.
 - `environment.open({ networkPolicy: "deny-all" })` sets a session's initial network policy.
-  It is recorded in the session state and applied again after a restart.
+  It is recorded in the session state and applied again after a restart. The session also
+  has `setNetworkPolicy("allow-all" | "deny-all")`.
 - eve resumes a session from its recorded state alone. The template is not needed, so with a
   shared `cacheDir` a session keeps its workspace when it moves to a newer deployment.
-- eve 0.83 replaced the provider contract: instead of a session object, a provider hands eve
-  a byte-level connection (`spawn`, `readFile`, `writeFiles`, `removePath`, `stop`), eve
-  derives the session from it, and eve itself seeds templates and runs `prepare`. The same
-  definition answers both contracts, telling them apart by the context eve passes, and
-  records the same session state under both, so a deployment rolled back across 0.83 still
-  opens its sessions. On 0.83 and later `setNetworkPolicy` reaches the session as a
-  connection extension.
-- eve 0.84 renamed the abort option on every sandbox call from `abortSignal` to `signal`,
-  and eve 0.84.1 added `spawn({ stdin: true })`. The connection and the session read
-  whichever abort option name arrives, so one installed copy serves eve on both sides of the
-  rename. A `stdin: true` spawn returns the process with a writable `stdin` stream piped to
-  the sandboxed command; closing it sends EOF. Without it the command's stdin is
-  `/dev/null`.
-- The `/provider` entry point imports `eve/sandbox/provider`, which exists only from eve
-  0.64 on. Its published types follow the connection contract of eve 0.83 and later. The package root imports nothing from eve at runtime and also exports the plain
-  provider definition, `createBwrapSandboxProviderDefinition()`, for callers that call eve's
-  `defineSandboxProvider` themselves.
-
-### eve 0.62 and 0.63: `bwrap()`
-
-```ts
-// agent/sandbox.ts
-import { defineSandbox, defaultBackend } from "eve/sandbox";
-import { bwrap, isBwrapAvailable } from "@evelandhq/sandbox-bwrap";
-
-export default defineSandbox({
-  // bwrap on the Linux deploy host; eve's default chain everywhere else (dev laptops).
-  backend: () => (isBwrapAvailable() ? bwrap() : defaultBackend()),
-});
-```
-
-### eve version requirement
-
-This package requires `eve` `>=0.62.0 <1.0.0 || >=1.0.0-0 <2.0.0-0`: eve 0.62 and every
-later 0.x release, eve 1.0's release candidates, and every eve 1.x release. The second set
-is spelled with `-0` so that npm accepts the 1.0.0 release candidates, which a plain
-`<2.0.0` ceiling would reject as prereleases; prereleases of later 1.x minors are not
-included.
-
-The range is deliberately wide. eve's 0.x releases use caret-incompatible minor bumps,
-so a package that pins a narrow window has to republish for every eve minor — which is
-churn for consumers, not safety, when the surface actually consumed is one small
-interface that changes rarely. eve 1.0 puts `eve/sandbox/provider` under semantic
-versioning, stable until 2.0, so the ceiling is the next major. The range spans three such
-interfaces: `SandboxBackend` for eve 0.62 and 0.63, the handle provider contract for eve
-0.64 through 0.82, and the connection provider contract from eve 0.83 on (with the 0.84
-option rename). Rather than re-declaring the window, CI keeps the claim honest from both
-ends: `src/eve-compatibility.test.ts` typechecks the backend against the range's exact
-floor (0.62.0; 0.63.0, the last eve that calls backends, ships identical sandbox types),
-the provider against the last handle-era release (0.81.1; 0.82.0's provider types are
-identical), against the last release before the 0.84 rename (0.83.3), and against the
-newest verified release (1.0.0-rc.1); a scheduled workflow re-runs the suite against
-`eve@latest` so an eve release that breaks the contract shows up as a red build here instead
-of a bug report from your deployment. That is not theoretical: eve 0.32.0 added a required `stop()` to the
-backend handle. This package implements it; 0.1.0 does not, and pairing that release with
-eve `>=0.32.0` resolves cleanly and then fails at runtime the first time authored code calls
-`ctx.getSandbox().stop()`. Likewise, releases up to 0.3.0 import a value that eve 0.64
-removed, so they cannot load at all on eve 0.64 and later.
-
-The backend implements both handle lifecycle methods by killing every process the session
-has spawned that has not yet exited: `shutdown()`, which eve calls at server teardown and
-which requires that nothing be left running afterwards, and `stop()`, which authored code
-triggers mid-run through `ctx.getSandbox().stop()`. Backends with provider-side compute
-distinguish the two — a container to pause, a VM to snapshot; bwrap has no such resource,
-because the processes are the compute. Neither method touches the session's workspace
-directory — it is durable state. Cleanup closes that compute generation to new commands;
-the next backend `create()` opens a fresh generation over the same workspace. Repeated
-`create()` calls through one backend instance share the live generation, so one handle
-cannot race a new spawn past another handle's cleanup barrier. The provider's
-`onSandboxStop()` and `onRuntimeShutdown()` do the same, and its `resume()` shares the live
-generation the same way. eve 0.75 renamed the handle hooks from `onSessionStop()` and
-`onSessionDelete()` to `onSandboxStop()` and `onSandboxDelete()` and calls only the new names,
-while eve 0.64 through 0.74 call only the old ones; the handle carries both pairs, each pair
-the same function, so one installed copy serves every eve in the peer range.
+- The package root imports nothing from eve at run time. It exports the plain definition,
+  `createBwrapSandboxProviderDefinition()`, for callers that pass it to eve's
+  `defineSandboxProvider` themselves or drive it directly — a host self-check, for example,
+  can `prepare`, `start`, and run a command over the returned connection with a context of
+  `{ kind: "session", session: { id }, storagePath }`.
 
 ### Options
 
-| Option                   | Default                              | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ------------------------ | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `env`                    | `{}`                                 | Environment variables set for every sandboxed command.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `networkPolicy`          | `"allow-all"`                        | `"allow-all"` shares the host network; `"deny-all"` runs each command with no network (`--unshare-net`). `setNetworkPolicy` can switch between the two at run time; granular domain policies are rejected (use the Vercel backend for those).                                                                                                                                                                                                                                                                                                            |
-| `hidePaths`              | `[]`                                 | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `bwrapPath`              | `"bwrap"`                            | bwrap executable to invoke.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `cacheDir`               | `<appRoot>/.eve/sandbox-cache/bwrap` | Absolute directory holding durable session workspaces, and, for the backend, templates. The provider always keeps templates in eve's build storage, where eve records them. Pin this outside the release directory so a redeploy does not discard durable session state: since eve 0.22.0, eve keys session sandboxes per durable session, not per deployment, so an `appRoot`-derived default would silently destroy every session's `/workspace` on the next redeploy. The generated eveland module always sets this from `EVELAND_SANDBOX_CACHE_DIR`. |
-| `templateRevision`       | `null`                               | Backend only. Optional immutable release identity included in the template cache key but not the session path. Change it when seed files change so new Sessions use a fresh template without overwriting durable workspaces. Eveland sets it from its internal `EVELAND_SANDBOX_TEMPLATE_REVISION`.                                                                                                                                                                                                                                                      |
-| `runTimeoutMs`           | `600000`                             | Hard wall-clock limit for every sandboxed command: each `spawn()`, and the `run()` built on it. At the limit the command's whole bwrap process group is killed and `wait()` rejects with `command timed out after <n> ms`. A long-running process started with `spawn()` (a dev server, a watcher) is bounded too; raise the limit or set `null` to disable it.                                                                                                                                                                                          |
-| `maxConcurrentProcesses` | `64`                                 | Maximum live commands admitted in one compute generation. A spawned process counts until it actually exits, even when its caller never waits. Set `null` to disable.                                                                                                                                                                                                                                                                                                                                                                                     |
-| `maxOutputBytes`         | `16777216`                           | Maximum combined stdout and stderr bytes one command delivers to its caller, counted as the caller reads them. At the limit both streams fail with `command output exceeded <n> bytes` after the bytes that fit, the process group is killed, and `wait()` rejects with the same error. Set `null` to disable.                                                                                                                                                                                                                                           |
-| `onEvent`                | `undefined`                          | Best-effort structured lifecycle sink for generation, command, and cleanup events. Sink failures are ignored so telemetry cannot change command behavior.                                                                                                                                                                                                                                                                                                                                                                                                |
+| Option                   | Default                   | Meaning                                                                                                                                                                                                                                                                                                                   |
+| ------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `env`                    | `{}`                      | Environment variables set for every sandboxed command, above `AI_AGENT=eve` and below each call's own `env`.                                                                                                                                                                                                              |
+| `networkPolicy`          | `"allow-all"`             | `"allow-all"` shares the host network; `"deny-all"` runs each command with no network (`--unshare-net`). Domain-level and header-rewriting policies are rejected, not weakened.                                                                                                                                           |
+| `hidePaths`              | `[]`                      | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                |
+| `bwrapPath`              | `"bwrap"`                 | bwrap executable to invoke.                                                                                                                                                                                                                                                                                               |
+| `cacheDir`               | eve's sandbox storage dir | Absolute directory holding durable session workspaces. Templates always stay in eve's storage directory, where eve records them. Pin this outside the release directory: eve keys sandboxes per durable session, not per deployment, so a build-relative default loses every session's `/workspace` on the next redeploy. |
+| `runTimeoutMs`           | `600000`                  | Hard wall-clock limit for every sandboxed command. At the limit the command's whole bwrap process group is killed and `wait()` rejects with `command timed out after <n> ms`. A long-running process started with `spawn()` (a dev server, a watcher) is bounded too; raise the limit or set `null` to disable it.        |
+| `maxConcurrentProcesses` | `64`                      | Maximum live commands in one session's compute generation. A spawned process counts until it actually exits, even when its caller never waits. Set `null` to disable.                                                                                                                                                     |
+| `maxOutputBytes`         | `16777216`                | Maximum combined stdout and stderr bytes one command delivers to its caller, counted as the caller reads them. At the limit both streams fail with `command output exceeded <n> bytes` after the bytes that fit, the process group is killed, and `wait()` rejects with the same error. Set `null` to disable.            |
+| `onEvent`                | `undefined`               | Best-effort structured lifecycle sink for generation, command, and cleanup events. Sink failures are ignored so telemetry cannot change command behavior.                                                                                                                                                                 |
 
-`BwrapSandbox.environment()` takes the same options except `templateRevision`, which the
-provider does not need: eve's source revision and resource keys already key its templates.
-It adds `prepare`, described above.
-
-With the backend, both lifecycle callbacks may call `use({ networkPolicy: "allow-all" | "deny-all" })`. The
-policy is applied before `use()` returns the template or live Session, so subsequent commands in
-that callback use the requested network boundary. Calling `use()` without options keeps the
-backend's configured policy.
+`prepare` is eve's standard environment option; eve runs it itself while it prepares the
+template.
 
 ## How it works
 
-The provider (eve 0.64 and later; eve 0.83 changed who does what, noted inline):
+eve calls the provider through its connection contract and builds the sandbox session —
+`run()`, the file helpers, the bash tool — on top of the connection.
 
-- **prepare** (`eve build`): writes eve's workspace tree and skill tree
-  (`$HOME/.agents/skills/**` lands at `/workspace/.agents/skills/**`) into a staging
-  directory, runs the authored `prepare` inside bwrap, stops anything it left running, and
-  atomically renames the result into `<storage>/bwrap/templates/<hash>`, where `<storage>`
-  is eve's sandbox storage directory, `<appRoot>/.eve/sandbox-cache`. The key covers eve's
-  source revision, the resource keys, the options, and the source of `prepare`. From eve
-  0.83, eve writes the trees and runs `prepare` itself through a connection over the staging
-  directory, and derives the key from the same inputs; it asks that connection for `$HOME`
-  first, which is answered without launching bwrap.
+- **prepare** (`eve build`): creates a staging directory and hands eve a connection over it.
+  eve asks it for `$HOME` (answered without launching bwrap), writes the workspace and skill
+  files, and runs the authored `prepare`. Anything `prepare` left running is stopped, and the
+  directory is atomically renamed to `<storage>/bwrap/templates/<key>-<options hash>`. eve
+  derives the key from the workspace and skill files, the sandbox module's source, and this
+  provider's identity.
 - **start** (first sandbox access of a session): clones the template into
-  `<cacheDir>/sessions/<hash>`, keyed by eve's session id, and returns the session state eve
-  persists: the session key and the network policy. From eve 0.83 it is an upsert: a
-  session whose workspace already exists, such as one a subagent sharing the sandbox
-  started, keeps it and the policy its live generation has.
-- **resume** (every later access, and after restarts): reopens the recorded workspace and
-  applies the recorded network policy to a new compute generation. It fails instead of
-  recreating a workspace that is gone, with the error eve 0.83 and later answer by starting
-  a fresh sandbox.
-- **onSandboxDelete** (`onSessionDelete` before eve 0.75): kills the session's processes
-  and removes its workspace and metadata; the template survives.
-- **close** (eve 0.83 and later, at the end of every step): releases nothing. The compute
-  generation outlives the step; `stop`, server exit, and bwrap's `--die-with-parent` end it.
-- **onSessionEnd** (eve 0.75 and later, once a durable session has completed, expired or
-  failed, and from eve 0.83 also for `sandbox.delete()` and for a session that never
-  recorded its sandbox, by its session id): releases the session's workspace and metadata
-  from the persisted state alone,
-  stopping the live generation if this process holds one, without resuming the sandbox. It
-  is idempotent, so eve may retry it, and a workspace that is already gone stays gone.
+  `<cacheDir>/sessions/<hash>`, keyed by eve's session id alone. The clone requests a
+  filesystem reflink (copy-on-write) and falls back to a recursive copy; the strategy is
+  recorded in cache metadata. It returns the state eve persists: the session key and the
+  network policy. It is an upsert: a session whose workspace already exists, such as one a
+  subagent sharing the sandbox started, keeps it and the policy its live generation has.
+- **resume** (later steps, and after restarts): reopens the recorded workspace and applies the
+  recorded network policy to a new compute generation. A workspace that is gone throws
+  `SandboxSessionGoneError`, on which eve starts a fresh sandbox.
+- **connection.spawn**: every command is one transient bwrap invocation — read-only host
+  root, the session directory bound read-write at `/workspace`, a fresh tmpfs `/tmp`,
+  PID/IPC/UTS namespaces unshared, `--die-with-parent`, `--clearenv`. Each command is bounded
+  by `runTimeoutMs` and `maxOutputBytes` and counts against `maxConcurrentProcesses`; its
+  whole process group is killed when a limit or the caller's abort signal fires. eve builds
+  `run()` from `spawn()`, so the provider cannot tell a short command from a long-running
+  one, and it does not need to: bwrap's PID namespace ends every process a command started
+  when that command exits, so bounding each command bounds all work in the sandbox.
+- **connection.readFile / writeFiles / removePath**: host-side operations on the session
+  directory; no subprocess. Writes and removals outside `/workspace` are refused.
+- **connection.stop**: kills the session's processes and keeps the workspace. The next
+  `start` or `resume` opens a fresh compute generation over the same files.
+- **connection.close** (end of every step): releases nothing. The compute generation outlives
+  the step; `stop`, server exit, and bwrap's `--die-with-parent` end it.
+- **onSessionEnd** (a durable session completed, expired or failed, or `sandbox.delete()`):
+  stops the live generation if this process holds one and removes the workspace and its
+  metadata, from the recorded state alone or, when eve has none, from the session id. The
+  template survives. It is idempotent, so eve may retry it, and it honors an already-aborted
+  `signal` before touching anything.
 
-The backend (eve 0.62 and 0.63):
+What this means for commands in the sandbox:
 
-- **prewarm** (build time): resolves Eve's `$HOME/.agents/skills/**` seed paths to
-  `/workspace/.agents/skills/**`, writes every seed into a staging directory, then runs the
-  authored `bootstrap` inside bwrap so it can consume those canonical inputs, before atomically
-  renaming the result into
-  `<cacheDir>/templates/<hash>` (`<cacheDir>` defaults to
-  `<appRoot>/.eve/sandbox-cache/bwrap` when the `cacheDir` option is not set). Idempotent
-  per template key + options hash; `templateRevision` participates in that hash.
-- **create** (runtime): atomically clones the template into
-  `<cacheDir>/sessions/<hash>` on first use. It first requests a filesystem reflink
-  (copy-on-write); filesystems without reflink support fall back to a normal recursive
-  copy. The selected strategy is recorded in cache metadata. The directory IS the durable
-  session state: it persists across reconnects and process restarts.
-- **run/spawn**: every command is one transient bwrap invocation —
-  read-only host rootfs, the session directory bound read-write at `/workspace`,
-  tmpfs `/tmp`, PID/IPC/UTS namespaces unshared, `--die-with-parent`.
-  Every command is bounded by `runTimeoutMs` and `maxOutputBytes` and counts against
-  `maxConcurrentProcesses`; the entire detached process group is killed when a limit
-  or the caller's abort signal fires. eve 1.0 builds `run()` from `spawn()`, so the
-  provider cannot tell a short command from a long-running one, and it does not need
-  to: bwrap's PID namespace ends every process a command started when that command
-  exits, so bounding each spawned command bounds all work in the sandbox.
-- **File I/O** (`readTextFile`, `writeFile`, …): host-side operations on the session
-  directory; no subprocess. Writes outside `/workspace` are refused.
+- Host tools are visible read-only, so whatever the host has installed — `git`, `node`,
+  `python3`, and so on — runs inside. Nothing can be installed into system paths: the host
+  root is read-only and commands run as the agent's unprivileged user, so `apt-get`, `sudo`,
+  and eve's `installCodeTooling` fail. Install user-level tools into the workspace (for
+  example with `pip install --user` or `npm install --prefix`), or onto the host.
+- Each command gets its own empty `/tmp`, and no process outlives the command that started
+  it. Keep files that must persist between commands under `/workspace`. For eve's bash tool
+  this means a command still running after the tool's yield window is not handed off as a
+  background job: the tool waits for it to finish, within `runTimeoutMs`.
+- `AI_AGENT=eve` (eve's `SANDBOX_AGENT_ENV`) is set in every command, beneath `env` and each
+  call's own `env`, so agent-aware CLIs skip interactive prompts.
+- Keyed `invokeTool` calls cannot keep a sandbox (`toolSessions` is not set): eve never ends
+  such sandboxes, and this provider has no retention bound for them.
 
 ## Disk usage and cache management
 
-Session and template directories persist under `<cacheDir>/{sessions,templates}` across
-process restarts and reconnects, enabling fast reattach. The provider keeps its templates
-under eve's storage directory instead (`<appRoot>/.eve/sandbox-cache/bwrap/templates`), so
-they go away with the build that prepared them; pass that `appRoot` without `cacheDir` to the
-APIs below to inspect them. `stop()` and `shutdown()` never
-delete durable state, and this package never schedules automatic deletion. On Eveland,
-the cache lives at `EVELAND_SANDBOX_CACHE_DIR` outside every release directory, so a
-redeploy does not touch it.
+Session workspaces persist under `<cacheDir>/sessions` across process restarts and
+reconnects; templates live under eve's storage directory
+(`<appRoot>/.eve/sandbox-cache/bwrap/templates`) and go away with the build that prepared
+them. Stopping a sandbox never deletes durable state, ending a session deletes only its own
+workspace, and this package never schedules deletion on its own.
 
 Operator metadata lives separately under `<cacheDir>/metadata`; sandboxed code cannot
 rewrite its own retention timestamps, tags, clone strategy, or active-generation leases.
-Use the explicit APIs to inspect and reclaim storage:
+Use the explicit APIs to inspect and reclaim storage. Pass the app root alone to inspect
+templates, and `cacheDir` too to inspect session workspaces:
 
 ```ts
 import { listBwrapCache, pruneBwrapCache } from "@evelandhq/sandbox-bwrap";
 
-const location = { appRoot: "/srv/my-agent", cacheDir: "/var/lib/eveland/sandbox/project" };
+const location = { appRoot: "/srv/my-agent", cacheDir: "/var/lib/my-agent/sandbox" };
 const entries = await listBwrapCache(location);
 
 // Dry-run is the default. Age and LRU policies may be combined independently
@@ -270,11 +164,11 @@ const applied = await pruneBwrapCache({
 ```
 
 Active compute generations are skipped and rechecked immediately before deletion. The
-backend uses both process-local reference counts and lease files outside the writable
+provider uses both process-local reference counts and lease files outside the writable
 workspace, so a separate pruning process can see active sessions. A process crash can
-leave a conservative stale lease; inspect `listBwrapCacheLeases(location)` and confirm
-the owning deployment is stopped before removing such a lease. Leases are not expired
-automatically because deleting a live durable workspace is worse than retaining a false
+leave a conservative stale lease; inspect `listBwrapCacheLeases(location)` and confirm the
+owning deployment is stopped before removing such a lease. Leases are not expired
+automatically, because deleting a live durable workspace is worse than retaining a false
 positive.
 
 ## Lifecycle observability
@@ -282,83 +176,60 @@ positive.
 `onEvent` receives discriminated `generation.started`, `command.started`,
 `command.finished`, `cleanup.started`, `cleanup.completed`, and `cleanup.failed` events.
 They include session/generation/command identities, tags, PID/process-group identity when
-available, duration, output byte counts, live-process counts, finish reason, and cleanup
-errors. Events deliberately omit command text and output. Do not put secrets in `tags`;
-the sink is operator-controlled telemetry, not part of the sandbox boundary.
+available, duration, output byte counts, live-process counts, finish reason (`exit`,
+`abort`, `timeout`, `output-limit`, `killed`, `cleanup`), and cleanup errors. Events omit
+command text and output. Do not put secrets in `tags`; the sink is operator-controlled
+telemetry, not part of the sandbox boundary.
 
 ## Security boundary
 
-- The host process environment is **never** forwarded: every invocation uses
-  `--clearenv` and rebuilds the environment from `PATH`, `HOME=/workspace`, `LANG`,
-  plus your configured `env`. Deployment secrets in the agent's `process.env` stay
-  out of sandboxed code.
-- For code executed inside the sandbox (`run`/`spawn`), the cache root (all
-  other sessions and templates of the app) is hidden behind a tmpfs, so
-  sandboxed code cannot read sibling session state.
-- The host-side read methods (`readFile`, `readBinaryFile`, `readTextFile`)
-  are deliberately **not** containment-checked: eve's contract requires
-  absolute paths to pass through to the host filesystem unchanged, so these
-  calls can read anything the agent process itself can read — including a
-  sibling session's files or a template directory — not just paths inside
-  `/workspace`. Only the write and remove calls (`writeFile`, `writeTextFile`,
-  `writeBinaryFile`, `removePath`) are confined to the workspace, via the
-  realpath-aware check described below. In other words, the tmpfs above is a
-  boundary against a _sandboxed process_, not a boundary between sessions of
-  the same agent — all of an app's sessions and templates share one trust
-  domain on the host.
-- The rest of the host filesystem is _visible read-only_ to sandboxed code, and the
-  sandbox shares the host kernel. This is protection against mistakes and prompt
-  injection — not multi-tenant isolation. If untrusted tenants or code that routinely
-  handles customer credentials must run here, move to VM-level isolation
-  (Firecracker/microsandbox) instead of hardening this backend further.
-  Under Eveland's local Docker runtime, "host filesystem" here means the outer Agent
-  container's filesystem, not the Docker host; no host root or Docker socket is mounted.
-- CPU, memory, and PID limits are inherited from whatever cgroup the agent runs in
-  (on eveland, the deployment's Docker container or systemd unit covers sandbox
-  children too). `maxConcurrentProcesses` is an admission bound, not a kernel PID or
-  thread quota; `runTimeoutMs` and `maxOutputBytes` bound each command's wall-clock time
-  and delivered output. The sandbox does not create a per-command cgroup or impose
-  CPU/memory quotas.
-- Host-side write/remove calls (`writeFile`, `writeTextFile`, `writeBinaryFile`,
-  `removePath`) verify containment with a realpath-aware check
-  (`isWithinWorkspaceReal`): they resolve symlinks along the path and re-check that
-  the real target still lands inside the real session directory, closing the escape
-  where sandboxed code plants a symlink inside `/workspace` pointing outside it and a
-  later host-side write follows it out. A race between that check and the filesystem
-  call it guards remains theoretically possible — Node exposes no
-  `RESOLVE_BENEATH`/`O_NOFOLLOW`-atomic primitive to close it — so treat this as a
-  containment check against planted symlinks, not an atomic guarantee.
-- Symlink resolution cannot see inode aliasing. On the kernel this backend has been
-  tested against (Ubuntu 24.04, aarch64), creating a hard link from inside the
-  sandbox to a file outside `/workspace` (`ln <host file> /workspace/x`) was
-  **refused** — the kernel rejected the hard link across the two bind mounts. The
-  integration contract test prints this as a non-assertive probe
-  (`HARDLINK PROBE: refused …` or `succeeded …`) rather than an assertion, because
-  the outcome depends on kernel/filesystem behavior this package does not control.
-  Do not treat hard-link rejection as a guarantee the backend enforces — verify it on
-  your own kernel if it matters to your threat model.
+- The host process environment is **never** forwarded: every command runs under
+  `--clearenv` with `PATH`, `HOME=/workspace`, `LANG`, `AI_AGENT=eve`, your configured
+  `env`, and the call's own `env`. Secrets in the agent's `process.env` stay out of
+  sandboxed code.
+- The cache roots — every session workspace and template of the app — are hidden from
+  sandboxed commands behind a tmpfs, as are `hidePaths`. The rest of the host filesystem is
+  _visible read-only_. To keep other applications' files out of view, run the agent itself
+  in a boundary that hides them (a systemd unit with `TemporaryFileSystem=`/`BindPaths=`,
+  or a container); bwrap only re-exposes what the agent process can already see.
+- The network is shared with the host under `"allow-all"`, the default. `"deny-all"` leaves
+  only loopback. There is nothing in between.
+- The host-side `readFile` is deliberately **not** containment-checked: eve passes absolute
+  paths through to the host filesystem, so a read can reach anything the agent process can
+  read, including a sibling session's files. Only `writeFiles` and `removePath` are confined
+  to the workspace. The tmpfs above is a boundary against a _sandboxed process_, not between
+  sessions of the same agent — all of an app's sessions and templates share one trust domain
+  on the host.
+- The sandbox shares the host kernel. This is protection against mistakes and prompt
+  injection, not multi-tenant isolation. If untrusted tenants, or code that routinely
+  handles customer credentials, must run here, use VM-level isolation instead.
+- CPU, memory, and PID limits are inherited from the cgroup the agent runs in, which covers
+  sandbox children too. `maxConcurrentProcesses` is an admission bound, not a kernel PID or
+  thread quota; `runTimeoutMs` and `maxOutputBytes` bound each command's wall-clock time and
+  delivered output. No per-command cgroup or CPU/memory quota is created.
+- `writeFiles` and `removePath` verify containment with a realpath-aware check
+  (`isWithinWorkspaceReal`): they resolve symlinks along the path and re-check that the real
+  target lands inside the real session directory, closing the escape where sandboxed code
+  plants a symlink in `/workspace` that points outside it and a later host-side write follows
+  it. A race between that check and the filesystem call it guards remains possible — Node
+  exposes no `RESOLVE_BENEATH`-style primitive — so treat it as a check against planted
+  symlinks, not an atomic guarantee.
+- Symlink resolution cannot see inode aliasing. On the kernels this has been tested against
+  (Ubuntu 24.04), a hard link from inside the sandbox to a file outside `/workspace` was
+  **refused** across the two bind mounts. The contract test prints this as a non-assertive
+  probe (`HARDLINK PROBE: refused …` or `succeeded …`), because the outcome depends on
+  kernel and filesystem behavior this package does not control. Verify it on your own kernel
+  if it matters to your threat model.
 
 ## Requirements
 
-Eveland's generated local Docker image installs `bubblewrap` and `bash`, creates
-`/workspace`, and starts the outer Agent container with its default capability set
-dropped, `SYS_ADMIN` and `NET_ADMIN` added for bwrap namespaces, `no-new-privileges`,
-`seccomp=unconfined`, and Docker `--init`. The init process is required to reap orphaned
-bwrap descendants; without it they can accumulate as zombies until the container PID
-limit is exhausted. Containers created before enabling it must be recreated. This is a
-local-development boundary; the supported Linux production topology uses the
-unprivileged systemd path below, where host PID 1 already reaps orphans.
-
-- Linux with unprivileged user namespaces available to the calling process. Ubuntu's
-  packaged bubblewrap (0.9.0-1ubuntu0.1 on 24.04) ships **no** AppArmor profile. Since
-  Ubuntu sets `kernel.apparmor_restrict_unprivileged_userns=1` by default, an
-  _unconfined non-root_ process calling `bwrap` fails with
-  `bwrap: setting up uid map: Permission denied` unless the host loads an AppArmor
-  profile that grants `bwrap` the `userns` permission. Root is unaffected by this
-  sysctl, but nothing here runs as root: eveland's systemd runtime runs both this
-  backend (as the deployment user) and its own build sandbox (as a separate,
-  unprivileged build user) as unconfined non-root userns creators, so both need the
-  same AppArmor grant. Save this as `/etc/apparmor.d/bwrap`:
+- Linux with unprivileged user namespaces available to the agent's user. Ubuntu's packaged
+  bubblewrap ships **no** AppArmor profile, and Ubuntu sets
+  `kernel.apparmor_restrict_unprivileged_userns=1` by default, so an unconfined non-root
+  process calling `bwrap` fails with `bwrap: setting up uid map: Permission denied` until
+  the host loads a profile that grants `bwrap` the `userns` permission. Root is exempt from
+  the sysctl, which is why a root-only test proves nothing about a deployment. Save this as
+  `/etc/apparmor.d/bwrap`:
 
   ```
   abi <abi/4.0>,
@@ -372,45 +243,39 @@ unprivileged systemd path below, where host PID 1 already reaps orphans.
   }
   ```
 
-  then load it with `apparmor_parser -r -W /etc/apparmor.d/bwrap` (safe to re-run; it
-  replaces an already-loaded profile). A distro whose bubblewrap package ships its own
-  profile, or a host with the sysctl disabled, needs none of this.
+  then load it with `apparmor_parser -r -W /etc/apparmor.d/bwrap` (safe to re-run). A distro
+  whose bubblewrap package ships its own profile, or a host with the sysctl disabled, needs
+  none of this.
 
-- `/workspace` must pre-exist on the host as an empty directory. `bwrap` binds each
-  session directory onto `/workspace` inside the sandbox but cannot create that mount
-  destination itself, because the host root is bind-mounted read-only first
-  (`bwrap: Can't mkdir /workspace: Read-only file system`). If it is missing, the
-  backend fails fast with an actionable error message before invoking `bwrap` (see
-  `describeMissingPrereqs` in `src/process.ts`).
-- `bash` and (for agents that need it) `node` on the host PATH — the sandbox reuses
-  the host rootfs read-only.
-- Works under systemd hardening (`NoNewPrivileges=yes`, `ProtectSystem=strict`):
-  apt's `bwrap` is not setuid, so it needs no privilege escalation to run — but it
-  still needs the AppArmor profile above to create a user namespace as an
-  unprivileged user. There is no Docker-style `--init` setting to add to a systemd
-  Deployment; systemd already provides the host init/subreaper and `TasksMax` cgroup
-  boundary.
+- `/workspace` must exist on the host as an empty directory. bwrap binds each session
+  directory onto it but cannot create the mount point itself, because the host root is
+  bound read-only first. If it is missing, the provider fails with an actionable message
+  before invoking bwrap.
+- `bash`, plus whatever tools the agent needs (`node`, `git`, …), on the host `PATH`.
+- Works under systemd hardening (`NoNewPrivileges=yes`, `ProtectSystem=strict`): the
+  packaged `bwrap` is not setuid, so it needs no privilege escalation, only the AppArmor
+  grant above. systemd's PID 1 reaps orphaned bwrap descendants.
+- Inside a container, run with an init process (`docker run --init`) so orphaned bwrap
+  descendants are reaped instead of accumulating as zombies, and grant what nested bwrap
+  needs to create namespaces (for example `--cap-add SYS_ADMIN --cap-add NET_ADMIN
+--security-opt seccomp=unconfined`). The container's filesystem is then the "host"
+  filesystem sandboxed commands see read-only.
 
 ## Testing
 
-- `pnpm test` — unit tests, run anywhere, including macOS (process execution is
-  injectable; no bwrap and no Linux needed). This is what CI runs on every push, and it
-  includes the eve compatibility typechecks against the floor (0.62), the last handle-era
-  release (0.81), the last release before the 0.84 option rename (0.83), and the newest
-  verified release (1.0).
-- `bash infra/smoke.sh` — the contract test against **real** bwrap, on macOS or Linux.
-  It provisions a Lima VM (`brew install lima`), streams this worktree in, and runs the
-  test as an unprivileged user under the systemd hardening a deployed eve agent actually
-  gets — `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`. Prints
-  `BWRAP SMOKE OK`. The test also churns 500 short bwrap commands and checks that the
-  zombie count returns to baseline. Run this before pushing anything that touches `src/args.ts` or
+- `pnpm test` — unit tests, run anywhere, including macOS: process execution is injected,
+  so no bwrap is needed. `pnpm typecheck` runs the type-level contract checks against the
+  installed eve in `src/eve-compatibility.test.ts`.
+- `bash infra/smoke.sh` — the contract test against **real** bwrap, on macOS or Linux. It
+  provisions a Lima VM (`brew install lima`), streams this worktree in, and runs the test as
+  an unprivileged user under the systemd hardening a deployed agent gets
+  (`NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`). Prints
+  `BWRAP SMOKE OK`. Run it before pushing anything that touches `src/args.ts` or
   `src/process.ts`: CI's smoke job covers the unprivileged-user case but not the systemd
   constraints, and argv that looks right is not the same as a kernel that accepts it.
-- `pnpm tsx src/integration/bwrap-smoke.ts` — the same test, run directly. Needs
-  a Linux host that already has the AppArmor profile loaded and `/workspace` created
-  (see [Requirements](#requirements)), and should be run as an unprivileged user: root
-  is exempt from the userns sysctl, so a root-only pass proves nothing about a real
-  deployment.
+- `pnpm tsx src/integration/bwrap-smoke.ts` — the same test, run directly. Needs a Linux
+  host with the AppArmor profile loaded and `/workspace` created (see
+  [Requirements](#requirements)), run as an unprivileged user.
 
 ## License
 

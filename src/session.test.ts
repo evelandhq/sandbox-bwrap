@@ -186,7 +186,7 @@ describe("spawn", () => {
   }
 
   /**
-   * eve 1.0 builds `run()` from `spawn()` itself, so every command it runs --
+   * eve builds `run()` from `spawn()` itself, so every command it runs --
    * the bash tool, `sandbox.run()`, authored preparation -- reaches this
    * package as a spawn. The limits therefore bound every spawned process.
    */
