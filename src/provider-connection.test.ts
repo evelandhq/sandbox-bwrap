@@ -397,6 +397,50 @@ describe("start, resume, and session end", () => {
   });
 });
 
+describe("values a later eve minor may add", () => {
+  test("a session kind and an end reason this provider does not know are handled", async () => {
+    const { storagePath } = await makeRelease();
+    const env = environment();
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const ctx = { kind: "a-kind-eve-adds-later", session: { id: "s" }, storagePath };
+
+    const { state } = await env.start(ctx, undefined, artifact);
+    await env.onSessionEnd(ctx, state, { reason: "a-reason-eve-adds-later" });
+
+    await expect(env.resume(ctx, artifact, state)).rejects.toMatchObject({
+      name: "SandboxSessionGoneError",
+    });
+  });
+});
+
+describe("session end signal", () => {
+  test("an already-aborted signal stops session end before it touches the workspace", async () => {
+    const { storagePath } = await makeRelease();
+    const { runner, killed } = createLiveRunner();
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { connection, state } = await env.start(
+      sessionContext(storagePath, "s"),
+      undefined,
+      artifact,
+    );
+    await connection.spawn({ command: "sleep 60", env: {}, workingDirectory: "/workspace" });
+    const workspace = sessionPathIn(path.join(storagePath, "bwrap"), "session:s");
+
+    await expect(
+      env.onSessionEnd(sessionContext(storagePath, "s"), state, {
+        reason: "deleted",
+        signal: AbortSignal.abort(new Error("caller gave up")),
+      }),
+    ).rejects.toThrow("caller gave up");
+
+    expect(killed).toEqual([]);
+    expect(existsSync(workspace)).toBe(true);
+    await env.onSessionEnd(sessionContext(storagePath, "s"), state, { reason: "deleted" });
+    expect(existsSync(workspace)).toBe(false);
+  });
+});
+
 describe("definition", () => {
   test("names the provider bwrap at state protocol 1", () => {
     const definition = createBwrapSandboxProviderDefinition();

@@ -296,6 +296,7 @@ async function boundarySmoke(appRoot: string, hostFilePath: string): Promise<voi
   const env = await runOver(connection, "env");
   assert.ok(!env.stdout.includes(SECRET), "host process env leaked into the sandbox");
   assert.ok(env.stdout.includes("HOME=/workspace"), "sandbox HOME must be /workspace");
+  assert.ok(env.stdout.includes("AI_AGENT=eve"), "eve's SANDBOX_AGENT_ENV must reach commands");
   const cacheLs = await runOver(connection, `ls -A ${path.join(storagePath, "bwrap")}`);
   assert.equal(cacheLs.stdout.trim(), "", "the sandbox cache root must be hidden by tmpfs");
 

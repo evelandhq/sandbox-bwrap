@@ -327,8 +327,11 @@ export function createBwrapSandboxProviderDefinition(
       async function onSessionEnd(
         ctx: BwrapSessionContext,
         recorded: Readonly<BwrapSessionState> | null,
-        _options: BwrapSessionEndOptions,
+        endOptions: BwrapSessionEndOptions,
       ): Promise<void> {
+        // `sandbox.delete()` passes its caller's signal. Removal itself is
+        // quick, so an abort is honored before anything is touched.
+        endOptions.signal?.throwIfAborted();
         const sessionKey =
           recorded === null
             ? `session:${ctx.session.id}`
