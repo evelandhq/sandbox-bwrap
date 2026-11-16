@@ -4,7 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { resolveBwrapSandboxOptions } from "./options.js";
+import type { BwrapSandboxEvent } from "./events.js";
 import type { ProcessRunner, SpawnedProcess } from "./process.js";
+import { readUntilSettled } from "./provider.test-support.js";
 import { createBwrapSession } from "./session.js";
 
 function stringStream(text: string): ReadableStream<Uint8Array> {
@@ -108,127 +110,173 @@ describe("run and spawn", () => {
     expect(argv.indexOf(cacheDir)).toBeLessThan(argv.indexOf("--bind"));
   });
 
-  test("run aborts the process after the configured hard timeout", async () => {
-    vi.useFakeTimers();
-    try {
-      let aborted = 0;
-      const runner: ProcessRunner = {
-        spawn(_argv, spawnOptions): SpawnedProcess {
-          const signal = spawnOptions?.abortSignal;
-          if (!signal) throw new Error("run did not supply an abort signal");
-
-          const stream = () =>
-            new ReadableStream<Uint8Array>({
-              start(controller) {
-                signal.addEventListener(
-                  "abort",
-                  () => {
-                    aborted += 1;
-                    controller.close();
-                  },
-                  { once: true },
-                );
-              },
-            });
-          return {
-            pid: 9,
-            stdout: stream(),
-            stderr: stream(),
-            wait: async () =>
-              await new Promise<never>((_resolve, reject) => {
-                signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-              }),
-            kill: async () => {},
-          };
-        },
-      };
-      const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-timeout-"));
-      const workspaceDir = path.join(appRoot, "ws");
-      await mkdir(workspaceDir, { recursive: true });
-      const session = createBwrapSession({
-        id: "s1",
-        workspaceDir,
-        cacheRoots: [],
-        runner,
-        options: resolveBwrapSandboxOptions({ runTimeoutMs: 1_000 }),
-      });
-
-      const run = session.run({ command: "while true; do :; done" });
-      const rejection = expect(run).rejects.toThrow("timed out after 1000 ms");
-      await vi.advanceTimersByTimeAsync(999);
-      expect(aborted).toBe(0);
-      await vi.advanceTimersByTimeAsync(1);
-      await rejection;
-      expect(aborted).toBe(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  test("spawn remains long-running and does not receive the run timeout", async () => {
-    let receivedSignal: AbortSignal | undefined;
-    const runner: ProcessRunner = {
-      spawn(_argv, spawnOptions): SpawnedProcess {
-        receivedSignal = spawnOptions?.abortSignal;
-        return {
-          pid: 10,
-          stdout: stringStream(""),
-          stderr: stringStream(""),
-          wait: async () => ({ exitCode: 0 }),
-          kill: async () => {},
-        };
-      },
-    };
-    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-spawn-timeout-"));
-    const workspaceDir = path.join(appRoot, "ws");
-    await mkdir(workspaceDir, { recursive: true });
-    const session = createBwrapSession({
-      id: "s1",
-      workspaceDir,
-      cacheRoots: [],
-      runner,
-      options: resolveBwrapSandboxOptions({ runTimeoutMs: 1 }),
-    });
-
-    await session.spawn({ command: "long-lived-server" });
-
-    expect(receivedSignal).toBeUndefined();
-  });
-
-  test("rejects run output that exceeds the combined byte limit and aborts the process", async () => {
-    let aborted = false;
+  /**
+   * A runner whose process never exits on its own: its streams stay open and
+   * `wait()` settles only when the abort signal it was given fires, the way
+   * the real runner behaves after it kills the process group.
+   */
+  function abortableRunner(output: { stdout?: string; stderr?: string } = {}) {
+    const state = { aborted: 0, signals: [] as (AbortSignal | undefined)[] };
     const runner: ProcessRunner = {
       spawn(_argv, spawnOptions): SpawnedProcess {
         const signal = spawnOptions?.abortSignal;
-        if (!signal) throw new Error("run did not supply an abort signal");
-        signal.addEventListener("abort", () => (aborted = true), { once: true });
+        state.signals.push(signal);
+        signal?.addEventListener("abort", () => (state.aborted += 1), { once: true });
+        const stream = (text?: string) =>
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              if (text) controller.enqueue(new TextEncoder().encode(text));
+              signal?.addEventListener("abort", () => controller.close(), { once: true });
+            },
+          });
         return {
-          pid: 11,
-          stdout: stringStream("12345"),
-          stderr: stringStream("6789"),
+          pid: 9,
+          stdout: stream(output.stdout),
+          stderr: stream(output.stderr),
           wait: async () =>
             await new Promise<never>((_resolve, reject) => {
-              signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+              signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
             }),
           kill: async () => {},
         };
       },
     };
-    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-output-limit-"));
-    const workspaceDir = path.join(appRoot, "ws");
-    await mkdir(workspaceDir, { recursive: true });
+    return { runner, state };
+  }
+
+  async function limitedSession(
+    runner: ProcessRunner,
+    limits: { runTimeoutMs?: number | null; maxOutputBytes?: number | null },
+  ) {
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "bwrap-limits-"));
+    const events: BwrapSandboxEvent[] = [];
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
       cacheRoots: [],
       runner,
-      options: resolveBwrapSandboxOptions({ maxOutputBytes: 8 }),
+      options: resolveBwrapSandboxOptions({ ...limits, onEvent: (event) => events.push(event) }),
     });
+    return { session, events };
+  }
+
+  /**
+   * eve 1.0 builds `run()` from `spawn()` itself, so every command it runs --
+   * the bash tool, `sandbox.run()`, authored preparation -- reaches this
+   * package as a spawn. The limits therefore bound every spawned process.
+   */
+  test("spawn kills a command that outlives runTimeoutMs and rejects its wait", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runner, state } = abortableRunner();
+      const { session, events } = await limitedSession(runner, { runTimeoutMs: 1_000 });
+
+      const proc = await session.spawn({ command: "while true; do :; done" });
+      const exit = expect(proc.wait()).rejects.toThrow("command timed out after 1000 ms");
+      await vi.advanceTimersByTimeAsync(999);
+      expect(state.aborted).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      await exit;
+      expect(state.aborted).toBe(1);
+      expect(events.find((event) => event.type === "command.finished")).toMatchObject({
+        reason: "timeout",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a command that exits before runTimeoutMs is not killed later", async () => {
+    vi.useFakeTimers();
+    try {
+      let receivedSignal: AbortSignal | undefined;
+      const runner: ProcessRunner = {
+        spawn(_argv, spawnOptions): SpawnedProcess {
+          receivedSignal = spawnOptions?.abortSignal;
+          return {
+            stdout: stringStream("done"),
+            stderr: stringStream(""),
+            wait: async () => ({ exitCode: 0 }),
+            kill: async () => {},
+          };
+        },
+      };
+      const { session } = await limitedSession(runner, { runTimeoutMs: 1_000 });
+
+      const proc = await session.spawn({ command: "true" });
+      expect(await proc.wait()).toEqual({ exitCode: 0 });
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(receivedSignal?.aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("spawn truncates combined output at maxOutputBytes and kills the process", async () => {
+    const { runner, state } = abortableRunner({ stdout: "12345", stderr: "6789" });
+    const { session, events } = await limitedSession(runner, { maxOutputBytes: 8 });
+
+    const proc = await session.spawn({ command: "lots-of-output" });
+    const [stdout, stderr, exit] = await Promise.all([
+      readUntilSettled(proc.stdout),
+      readUntilSettled(proc.stderr),
+      proc.wait().then(
+        () => "resolved",
+        (error: unknown) => (error as Error).message,
+      ),
+    ]);
+
+    // Both streams together deliver exactly the limit, then fail with the
+    // limit error rather than ending as if the output were complete.
+    const message = "bwrap sandbox: command output exceeded 8 bytes";
+    expect(Buffer.byteLength(stdout.text + stderr.text)).toBe(8);
+    expect([stdout.error, stderr.error]).toEqual([message, message]);
+    expect(exit).toBe(message);
+    expect(state.aborted).toBe(1);
+    expect(events.find((event) => event.type === "command.finished")).toMatchObject({
+      reason: "output-limit",
+    });
+  });
+
+  test("null limits leave a spawned command unbounded", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runner, state } = abortableRunner({ stdout: "x".repeat(64) });
+      const { session } = await limitedSession(runner, {
+        runTimeoutMs: null,
+        maxOutputBytes: null,
+      });
+
+      const proc = await session.spawn({ command: "server" });
+      const reader = proc.stdout.getReader();
+      expect((await reader.read()).value?.byteLength).toBe(64);
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      expect(state.aborted).toBe(0);
+      await proc.kill();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("run surfaces the limit errors of the command it spawns", async () => {
+    const { runner } = abortableRunner({ stdout: "123456789" });
+    const { session } = await limitedSession(runner, { maxOutputBytes: 4 });
 
     await expect(session.run({ command: "lots-of-output" })).rejects.toThrow(
-      "output exceeded 8 bytes",
+      "command output exceeded 4 bytes",
     );
-    expect(aborted).toBe(true);
+  });
+
+  test("the caller's abort signal still kills the command, with the caller's reason", async () => {
+    const { runner, state } = abortableRunner();
+    const { session } = await limitedSession(runner, { runTimeoutMs: 60_000 });
+    const caller = new AbortController();
+
+    const proc = await session.spawn({ command: "sleep 60", signal: caller.signal });
+    const exit = expect(proc.wait()).rejects.toThrow("caller gave up");
+    caller.abort(new Error("caller gave up"));
+    await exit;
+    expect(state.signals[0]?.aborted).toBe(true);
   });
 
   test("rejects a new command when the generation reaches its process limit", async () => {
@@ -310,13 +358,17 @@ describe("eve 0.84 spawn options", () => {
   test("spawn takes eve 0.84's `signal` as well as the older `abortSignal`", async () => {
     const { runner, received } = recordingSession();
     const session = await sessionOver(runner);
-    const older = new AbortController().signal;
-    const newer = new AbortController().signal;
+    const older = new AbortController();
+    const newer = new AbortController();
 
-    await session.spawn({ command: "a", abortSignal: older });
-    await session.spawn({ command: "b", signal: newer });
+    await session.spawn({ command: "a", abortSignal: older.signal });
+    await session.spawn({ command: "b", signal: newer.signal });
+    older.abort(new Error("older"));
+    newer.abort(new Error("newer"));
 
-    expect(received.map((options) => options.abortSignal)).toEqual([older, newer]);
+    // The runner sees the caller's signal combined with the command's limits.
+    const reasons = received.map((options) => options.abortSignal?.reason as Error | undefined);
+    expect(reasons.map((reason) => reason?.message)).toEqual(["older", "newer"]);
   });
 
   test("run aborts on eve 0.84's `signal` as well as the older `abortSignal`", async () => {

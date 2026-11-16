@@ -10,7 +10,13 @@ import type { ProcessRunner } from "./process.js";
 import type { BwrapSandboxConnection } from "./provider-contract.js";
 import type { BwrapSandboxEnvironmentOptions } from "./provider-definition.js";
 import { createBwrapSandboxProviderDefinition } from "./provider-definition.js";
-import { createLiveRunner, empty, exitingRunner, makeRelease } from "./provider.test-support.js";
+import {
+  createLiveRunner,
+  empty,
+  exitingRunner,
+  makeRelease,
+  readUntilSettled,
+} from "./provider.test-support.js";
 
 /**
  * The eve 0.83+ connection contract. eve derives the session from the
@@ -343,23 +349,74 @@ describe("connection", () => {
     const env = environment(undefined, runner);
     const artifact = await env.prepare(prepareContext(storagePath));
     const { connection } = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
-    const older = new AbortController().signal;
-    const newer = new AbortController().signal;
+    const older = new AbortController();
+    const newer = new AbortController();
 
     await connection.spawn({
       command: "a",
       env: {},
       workingDirectory: "/workspace",
-      abortSignal: older,
+      abortSignal: older.signal,
     });
     await connection.spawn({
       command: "b",
       env: {},
       workingDirectory: "/workspace",
-      signal: newer,
+      signal: newer.signal,
     });
+    older.abort(new Error("older"));
+    newer.abort(new Error("newer"));
 
-    expect(signals).toEqual([older, newer]);
+    const reasons = signals.map((signal) => signal?.reason as Error | undefined);
+    expect(reasons.map((reason) => reason?.message)).toEqual(["older", "newer"]);
+  });
+
+  test("bounds every spawned command by runTimeoutMs and maxOutputBytes", async () => {
+    const { storagePath } = await makeRelease();
+    const signals: AbortSignal[] = [];
+    const runner: ProcessRunner = {
+      spawn(_argv, options) {
+        const signal = options!.abortSignal!;
+        signals.push(signal);
+        return {
+          stdout: new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode("0123456789"));
+              signal.addEventListener("abort", () => controller.close(), { once: true });
+            },
+          }),
+          stderr: empty(),
+          wait: async () =>
+            await new Promise<never>((_resolve, reject) =>
+              signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+            ),
+          kill: async () => {},
+        };
+      },
+    };
+    const env = environment({ runTimeoutMs: 50, maxOutputBytes: 4 }, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { connection } = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
+
+    const chatty = await connection.spawn({ command: "yes", env: {}, workingDirectory: "/" });
+    const [stdout, chattyExit] = await Promise.all([
+      readUntilSettled(chatty.stdout),
+      chatty.wait().catch((error: Error) => error.message),
+    ]);
+    expect(stdout).toEqual({
+      text: "0123",
+      error: "bwrap sandbox: command output exceeded 4 bytes",
+    });
+    expect(chattyExit).toBe("bwrap sandbox: command output exceeded 4 bytes");
+
+    const env2 = environment({ runTimeoutMs: 50, maxOutputBytes: null }, runner);
+    const { connection: quiet } = await env2.start(
+      sessionContext(storagePath, "s2"),
+      undefined,
+      artifact,
+    );
+    const sleeper = await quiet.spawn({ command: "sleep 60", env: {}, workingDirectory: "/" });
+    await expect(sleeper.wait()).rejects.toThrow("bwrap sandbox: command timed out after 50 ms");
   });
 
   /**

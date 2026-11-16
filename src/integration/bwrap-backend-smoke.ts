@@ -51,6 +51,21 @@ async function countBwrapZombies(): Promise<number> {
   return zombies;
 }
 
+/** Host pids whose command line contains `marker`, seen from outside every sandbox. */
+async function hostProcessesMatching(marker: string): Promise<number[]> {
+  const pids: number[] = [];
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
+    try {
+      const cmdline = await readFile(`/proc/${entry}/cmdline`, "utf8");
+      if (cmdline.split("\0").includes(marker)) pids.push(Number(entry));
+    } catch {
+      // The process can disappear between readdir and readFile.
+    }
+  }
+  return pids;
+}
+
 const IFACE_COMMAND = `node -e "console.log(Object.keys(require('node:os').networkInterfaces()).join(' '))"`;
 
 function nonLoopbackInterfaces(stdout: string): string[] {
@@ -252,6 +267,8 @@ async function connectionProviderSmoke(appRoot: string): Promise<void> {
   const stillDenied = await runOver(resumed, IFACE_COMMAND);
   assert.equal(nonLoopbackInterfaces(stillDenied.stdout).length, 0);
 
+  await boundedConnectionSmoke(storagePath, cacheDir, artifact);
+
   await restarted.onSessionEnd(ctx, null, { reason: "deleted" });
   await assert.rejects(
     restarted.resume(ctx, artifact, state),
@@ -259,6 +276,82 @@ async function connectionProviderSmoke(appRoot: string): Promise<void> {
   );
   console.log(
     "CONNECTION SMOKE: prepare, start, stdin, close, stop, restart + resume, and end by key held under real bwrap",
+  );
+}
+
+/**
+ * eve 1.0 builds `sandbox.run()` and the bash tool from `connection.spawn`, so
+ * the run limits must hold there: a command past `runTimeoutMs` is killed with
+ * every process it started, and output past `maxOutputBytes` is cut at the
+ * limit and fails the command. `eveRun` reads a command the way eve's `run()`
+ * does.
+ */
+async function boundedConnectionSmoke(
+  storagePath: string,
+  cacheDir: string,
+  artifact: Awaited<
+    ReturnType<
+      ReturnType<ReturnType<typeof createBwrapSandboxProviderDefinition>["environment"]>["prepare"]
+    >
+  >,
+): Promise<void> {
+  const environment = createBwrapSandboxProviderDefinition().environment({
+    cacheDir,
+    runTimeoutMs: 1_000,
+    maxOutputBytes: 1024,
+  });
+  const ctx = { kind: "session" as const, session: { id: "connection-bounded" }, storagePath };
+  const { connection } = await environment.start(ctx, undefined, artifact);
+  const spawn = (command: string) =>
+    connection.spawn({ command, env: {}, workingDirectory: "/workspace" });
+  const eveRun = async (command: string) => {
+    const proc = await spawn(command);
+    const [stdout, stderr, { exitCode }] = await Promise.all([
+      new Response(proc.stdout).arrayBuffer(),
+      new Response(proc.stderr).arrayBuffer(),
+      proc.wait(),
+    ]);
+    return { exitCode, stdout: Buffer.from(stdout).toString(), stderr: Buffer.from(stderr) };
+  };
+
+  const marker = "301.5";
+  const started = Date.now();
+  await assert.rejects(
+    eveRun(`sleep ${marker} & (sleep ${marker} & wait) & wait`),
+    /command timed out after 1000 ms/,
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 5_000, `timeout must fire near 1000 ms, took ${elapsed} ms`);
+  await sleep(200);
+  assert.deepEqual(
+    await hostProcessesMatching(marker),
+    [],
+    "a timed-out command must take its background descendants with it",
+  );
+
+  const chatty = await spawn("head -c 65536 /dev/zero; sleep 300");
+  const delivered: Uint8Array[] = [];
+  const reader = chatty.stdout.getReader();
+  await assert.rejects(
+    (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        delivered.push(value);
+      }
+    })(),
+    /command output exceeded 1024 bytes/,
+  );
+  assert.equal(Buffer.concat(delivered).byteLength, 1024, "output must be cut at the limit");
+  await assert.rejects(chatty.wait(), /command output exceeded 1024 bytes/);
+  await assert.rejects(eveRun("head -c 2048 /dev/zero"), /command output exceeded 1024 bytes/);
+
+  const fine = await eveRun("head -c 1000 /dev/zero | wc -c");
+  assert.equal(fine.stdout.trim(), "1000", "a command within both limits runs normally");
+  await connection.stop();
+  await environment.onSessionEnd(ctx, null, { reason: "deleted" });
+  console.log(
+    "BOUNDED SPAWN SMOKE: timeout and output limit held on connection.spawn under real bwrap",
   );
 }
 
@@ -533,7 +626,7 @@ async function main(): Promise<void> {
         await boundedHandle.session.run({
           command: "sleep 300 & echo $! > timeout-child.pid; (sleep 300 & wait) & wait",
         }),
-      /run timed out after 500 ms/,
+      /command timed out after 500 ms/,
     );
     const timeoutChildPid = Number(
       await boundedHandle.session.readTextFile({ path: "timeout-child.pid" }),
@@ -548,7 +641,7 @@ async function main(): Promise<void> {
     assert.equal(afterTimeout.stdout, "timeout-recovered", "session must recover after timeout");
     await assert.rejects(
       async () => await boundedHandle.session.run({ command: "head -c 2048 /dev/zero" }),
-      /run output exceeded 1024 bytes/,
+      /command output exceeded 1024 bytes/,
     );
     const afterOutputLimit = await boundedHandle.session.run({
       command: "printf output-recovered",
