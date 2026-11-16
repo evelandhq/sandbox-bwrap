@@ -1,44 +1,27 @@
-import { createBwrapSandboxBackend } from "./backend.js";
-import type { BwrapSandboxBackend } from "./backend-contract.js";
-import type { BwrapSandboxCreateOptions } from "./options.js";
-
-export {
-  BWRAP_BACKEND_NAME,
-  createBwrapSandboxBackend,
-  type CreateBwrapSandboxBackendInput,
-} from "./backend.js";
-export type {
-  BwrapBackendBootstrapContext,
-  BwrapBackendCreateInput,
-  BwrapBackendHandle,
-  BwrapBackendPrewarmInput,
-  BwrapBackendRuntimeContext,
-  BwrapBackendSessionState,
-  BwrapSandboxBackend,
-  BwrapSeedFile,
-} from "./backend-contract.js";
+/**
+ * The package root: the provider as a plain definition, its types, the cache
+ * tools, and host checks. Nothing here imports eve at run time; the ready
+ * `BwrapSandbox` is in `@evelandhq/sandbox-bwrap/provider`.
+ */
 export { BwrapSandboxSessionGoneError, BwrapTemplateNotProvisionedError } from "./errors.js";
 export {
   BWRAP_PROVIDER_STATE_PROTOCOL_VERSION,
   createBwrapSandboxProviderDefinition,
   type BwrapPreparedArtifact,
-  type BwrapSandboxEnvironmentOptions,
   type BwrapSandboxOpenOptions,
   type BwrapSandboxProviderDefinition,
   type BwrapSandboxProviderImplementation,
   type BwrapSessionState,
   type CreateBwrapSandboxProviderDefinitionInput,
-  type BwrapProviderHandle,
-  type BwrapSandboxDeleteOptions,
-  type MutableNetworkSandboxSession,
 } from "./provider-definition.js";
-export type { BwrapConnectionExtensions, BwrapSandboxConnection } from "./provider-contract.js";
-export type { BwrapSession } from "./session.js";
 export type {
-  BwrapNetworkPolicy,
-  BwrapSandboxCreateOptions,
-  BwrapSandboxUseOptions,
-} from "./options.js";
+  BwrapConnectionExtensions,
+  BwrapPrepareContext,
+  BwrapSandboxConnection,
+  BwrapSessionContext,
+  BwrapSessionEndOptions,
+} from "./provider-contract.js";
+export type { BwrapNetworkPolicy, BwrapSandboxEnvironmentOptions } from "./options.js";
 export type {
   BwrapCommandFinishReason,
   BwrapSandboxEvent,
@@ -62,23 +45,4 @@ export {
   DEFAULT_RUN_TIMEOUT_MS,
 } from "./options.js";
 export { isBwrapAvailable } from "./process.js";
-export type { ProcessRunner, SpawnedProcess } from "./process.js";
-
-/**
- * Creates the bubblewrap sandbox backend for `defineSandbox({ backend })`, the
- * sandbox API of eve 0.62 and 0.63. On eve 0.64 and later use `BwrapSandbox`
- * from `@evelandhq/sandbox-bwrap/provider` instead.
- *
- * ```ts
- * // agent/sandbox.ts
- * import { defineSandbox, defaultBackend } from "eve/sandbox";
- * import { bwrap, isBwrapAvailable } from "@evelandhq/sandbox-bwrap";
- *
- * export default defineSandbox({
- *   backend: () => (isBwrapAvailable() ? bwrap() : defaultBackend()),
- * });
- * ```
- */
-export function bwrap(options?: BwrapSandboxCreateOptions): BwrapSandboxBackend {
-  return createBwrapSandboxBackend({ createOptions: options });
-}
+export type { ProcessRunner, ProcessRunnerSpawnOptions, SpawnedProcess } from "./process.js";

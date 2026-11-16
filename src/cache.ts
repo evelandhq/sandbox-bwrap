@@ -14,7 +14,6 @@ export interface BwrapCacheMetadata {
   readonly lastUsedAt: string;
   readonly tags?: Readonly<Record<string, string>>;
   readonly cloneStrategy?: BwrapCloneStrategy;
-  readonly templateRevision?: string;
 }
 
 export interface BwrapCacheEntry extends BwrapCacheMetadata {
@@ -356,7 +355,6 @@ export async function touchCacheMetadata(input: {
   id: string;
   tags?: Readonly<Record<string, string>>;
   cloneStrategy?: BwrapCloneStrategy;
-  templateRevision?: string | null;
   now?: Date;
 }): Promise<BwrapCacheMetadata> {
   const target = metadataPath(input.cacheRoot, input.kind, input.id);
@@ -367,7 +365,6 @@ export async function touchCacheMetadata(input: {
     input.cloneStrategy === "existing"
       ? (existing?.cloneStrategy ?? "existing")
       : (input.cloneStrategy ?? existing?.cloneStrategy);
-  const templateRevision = input.templateRevision ?? existing?.templateRevision;
   const metadata: BwrapCacheMetadata = {
     schemaVersion: 1,
     kind: input.kind,
@@ -376,7 +373,6 @@ export async function touchCacheMetadata(input: {
     lastUsedAt: now,
     ...(tags && Object.keys(tags).length > 0 ? { tags } : {}),
     ...(cloneStrategy ? { cloneStrategy } : {}),
-    ...(templateRevision ? { templateRevision } : {}),
   };
   const temporary = `${target}.${randomUUID()}.tmp`;
   await mkdir(dirname(target), { recursive: true });

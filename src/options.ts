@@ -1,14 +1,8 @@
 import { createHash } from "node:crypto";
 import type { BwrapSandboxEventSink } from "./events.js";
 
-/** Coarse egress control, matching what eve's Docker backend supports. */
+/** Coarse egress control, matching what eve's Docker provider supports. */
 export type BwrapNetworkPolicy = "allow-all" | "deny-all";
-
-/** Options lifecycle hooks can apply when they open a template or live Session. */
-export interface BwrapSandboxUseOptions {
-  /** Network policy used by subsequent commands in this lifecycle callback. */
-  readonly networkPolicy?: BwrapNetworkPolicy;
-}
 
 /** Default wall-clock limit for every sandboxed command, `spawn()` included. */
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
@@ -19,9 +13,9 @@ export const DEFAULT_MAX_CONCURRENT_PROCESSES = 64;
 /** Default limit on the combined stdout + stderr bytes one command delivers. */
 export const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
-/** Options accepted by `bwrap(opts)`. */
-export interface BwrapSandboxCreateOptions {
-  /** Environment variables set for every command the backend runs. */
+/** Options for `BwrapSandbox.environment(...)`. */
+export interface BwrapSandboxEnvironmentOptions {
+  /** Environment variables set for every sandboxed command. */
   readonly env?: Readonly<Record<string, string>>;
   /** Initial network policy for sandboxed commands. Defaults to `"allow-all"`. */
   readonly networkPolicy?: BwrapNetworkPolicy;
@@ -30,18 +24,12 @@ export interface BwrapSandboxCreateOptions {
   /** bwrap executable path. Defaults to `"bwrap"` resolved via PATH. */
   readonly bwrapPath?: string;
   /**
-   * Absolute directory holding templates and durable session workspaces.
-   * Defaults to `<appRoot>/.eve/sandbox-cache/bwrap`. Pin it outside the
-   * release directory so a redeploy does not discard durable session state
-   * (eve keys session sandboxes per durable session, not per deployment).
+   * Absolute directory holding durable session workspaces. Defaults to the
+   * storage directory eve gives the provider, which belongs to one build. Pin
+   * it outside the release directory so a redeploy does not discard durable
+   * session state: eve keys sandboxes per durable session, not per deployment.
    */
   readonly cacheDir?: string;
-  /**
-   * Immutable release identity used to refresh workspace templates after a
-   * deploy. It deliberately affects templates only; durable session paths
-   * remain keyed solely by Eve's session key.
-   */
-  readonly templateRevision?: string;
   /**
    * Hard wall-clock limit for every sandboxed command, each `spawn()` and the
    * `run()` built on it. At the limit the command's process group is killed and
@@ -61,14 +49,13 @@ export interface BwrapSandboxCreateOptions {
   readonly onEvent?: BwrapSandboxEventSink;
 }
 
-/** Fully-defaulted options consumed by the backend implementation. */
+/** Fully-defaulted options. */
 export interface ResolvedBwrapSandboxOptions {
   readonly env: Readonly<Record<string, string>>;
   readonly networkPolicy: BwrapNetworkPolicy;
   readonly hidePaths: readonly string[];
   readonly bwrapPath: string;
   readonly cacheDir: string | null;
-  readonly templateRevision: string | null;
   readonly runTimeoutMs: number | null;
   readonly maxConcurrentProcesses: number | null;
   readonly maxOutputBytes: number | null;
@@ -98,7 +85,7 @@ function resolvePositiveLimit(
 }
 
 export function resolveBwrapSandboxOptions(
-  options: BwrapSandboxCreateOptions = {},
+  options: BwrapSandboxEnvironmentOptions = {},
 ): ResolvedBwrapSandboxOptions {
   return {
     env: options.env ?? {},
@@ -106,7 +93,6 @@ export function resolveBwrapSandboxOptions(
     hidePaths: options.hidePaths ?? [],
     bwrapPath: options.bwrapPath ?? "bwrap",
     cacheDir: options.cacheDir ?? null,
-    templateRevision: options.templateRevision ?? null,
     runTimeoutMs: resolveRunTimeoutMs(options.runTimeoutMs),
     maxConcurrentProcesses: resolvePositiveLimit(
       "maxConcurrentProcesses",
@@ -124,8 +110,7 @@ export function resolveBwrapSandboxOptions(
 
 /**
  * Hash of the resolved options. Participates in template path derivation so
- * templates captured under different options never mix (parity with the
- * Docker backend's options hash).
+ * templates captured under different options never mix.
  */
 export function createBwrapOptionsHash(options: ResolvedBwrapSandboxOptions): string {
   const canonical = JSON.stringify({
@@ -137,7 +122,6 @@ export function createBwrapOptionsHash(options: ResolvedBwrapSandboxOptions): st
     maxOutputBytes: options.maxOutputBytes,
     networkPolicy: options.networkPolicy,
     runTimeoutMs: options.runTimeoutMs,
-    templateRevision: options.templateRevision,
   });
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }

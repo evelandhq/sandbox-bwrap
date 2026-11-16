@@ -1,11 +1,8 @@
 import { createReadStream, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-import { createWriteStream } from "node:fs";
-import type { SandboxSession } from "eve/sandbox";
 import { buildBwrapExecArgs, DEFAULT_SANDBOX_PATH } from "./args.js";
 import type { ResolvedBwrapSandboxOptions } from "./options.js";
 import {
@@ -15,7 +12,6 @@ import {
   WORKSPACE_ROOT,
 } from "./paths.js";
 import type { ProcessRunner, SpawnedProcess } from "./process.js";
-import { abortSignalOf, type EveAbortOptions } from "./provider-contract.js";
 import type {
   BwrapCommandFinishReason,
   BwrapSandboxEvent,
@@ -46,80 +42,46 @@ function isMissingFileError(error: unknown): boolean {
   );
 }
 
-async function readText(stream: ReadableStream<Uint8Array>): Promise<string> {
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return Buffer.concat(chunks).toString("utf8");
-}
-
-function decodeText(bytes: Buffer, encoding: string): string {
-  if (encoding === "utf-8" || encoding === "utf8") {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  }
-  return bytes.toString(encoding as BufferEncoding);
-}
-
-function sliceLines(text: string, startLine?: number, endLine?: number): string {
-  if (startLine === undefined && endLine === undefined) return text;
-  const lines = text.split("\n");
-  return lines.slice((startLine ?? 1) - 1, endLine ?? lines.length).join("\n");
-}
-
-/**
- * What `run` accepts from every eve in the peer range. Declared here rather
- * than taken from the installed eve, because eve 0.84 renamed `abortSignal` to
- * `signal` and one session object must answer both: eve 0.62 through 0.82 call
- * it directly with the old name, eve 0.84 and later with the new one.
- */
-export interface BwrapRunOptions extends EveAbortOptions {
+/** What `spawn` accepts: the connection's spawn options. */
+export interface BwrapSpawnOptions {
   readonly command: string;
   readonly workingDirectory?: string;
   readonly env?: Readonly<Record<string, string>>;
-}
-
-/** What `spawn` accepts from every eve in the peer range. */
-export interface BwrapSpawnOptions extends BwrapRunOptions {
+  readonly signal?: AbortSignal;
   /**
-   * eve 0.84.1 and later: pipe the command's stdin and return it as the
-   * process's `stdin`; closing that stream sends EOF. Without it the command
-   * reads EOF at once.
+   * Pipe the command's stdin and return it as the process's `stdin`; closing
+   * that stream sends EOF. Without it the command reads EOF at once.
    */
   readonly stdin?: boolean;
 }
 
-/** What `run` resolves to on every eve line. */
-export interface BwrapCommandResult {
-  readonly exitCode: number;
-  readonly stdout: string;
-  readonly stderr: string;
-}
-
 /**
- * A sandbox session plus the lifecycle hook the backend handle needs.
- * eve's `shutdown()` contract requires that nothing is left running, so the
- * session tracks the processes it spawned and can terminate them on demand.
+ * One durable workspace's live compute generation: the commands it runs and
+ * host-side file access to its workspace. It tracks the processes it spawned
+ * so `killAll()` can leave nothing running.
  */
-export type BwrapSession = Omit<SandboxSession, "run" | "spawn"> & {
-  run(options: BwrapRunOptions): Promise<BwrapCommandResult>;
+export interface BwrapSession {
   spawn(options: BwrapSpawnOptions): Promise<SpawnedProcess>;
+  /** Resolves to a byte stream, or `null` when the path does not exist. */
+  readFile(options: { readonly path: string }): Promise<ReadableStream<Uint8Array> | null>;
+  writeFiles(options: {
+    readonly files: readonly { readonly path: string; readonly content: Uint8Array }[];
+  }): Promise<void>;
+  removePath(options: {
+    readonly path: string;
+    readonly force?: boolean;
+    readonly recursive?: boolean;
+  }): Promise<void>;
   /**
-   * Stable identifier of the durable session this handle wraps. eve 0.64
-   * dropped `id` from `SandboxSession`, but every earlier line requires it.
-   */
-  readonly id: string;
-  /**
-   * Coarse egress switch; always present here, optional on eve 0.64's
-   * `SandboxSession`. Only `"allow-all"` and `"deny-all"` are accepted, checked
-   * at runtime: the parameter is typed wide because every eve line types the
-   * policy differently (the Vercel SDK's, then eve's own from 0.83), and this
-   * one session must satisfy all of them.
+   * Coarse egress switch. Only `"allow-all"` and `"deny-all"` are accepted,
+   * checked at run time because callers can pass any of eve's policies.
    */
   setNetworkPolicy(policy: unknown): Promise<void>;
   /** Kills every process this session spawned that has not yet exited. Idempotent. */
   killAll(): Promise<void>;
-  /** Internal compute-generation state used to coordinate repeated handles. */
+  /** Internal compute-generation state used to coordinate repeated opens. */
   lifecycleState(): "running" | "stopping" | "stopped";
-};
+}
 
 export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession {
   const { id, workspaceDir, cacheRoots, runner, options } = input;
@@ -382,9 +344,6 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
   }
 
   return {
-    id,
-    resolvePath: resolveWorkspacePath,
-
     lifecycleState() {
       return lifecycle;
     },
@@ -452,34 +411,13 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     },
 
     async spawn(spawnOptions) {
-      return await spawnProcess({
-        command: spawnOptions.command,
-        workingDirectory: spawnOptions.workingDirectory,
-        env: spawnOptions.env,
-        signal: abortSignalOf(spawnOptions),
-        stdin: spawnOptions.stdin,
-      });
-    },
-
-    async run(runOptions) {
-      const proc = await spawnProcess({
-        command: runOptions.command,
-        workingDirectory: runOptions.workingDirectory,
-        env: runOptions.env,
-        signal: abortSignalOf(runOptions),
-      });
-      const [stdout, stderr, { exitCode }] = await Promise.all([
-        readText(proc.stdout),
-        readText(proc.stderr),
-        proc.wait(),
-      ]);
-      return { exitCode, stdout, stderr };
+      return await spawnProcess(spawnOptions);
     },
 
     async setNetworkPolicy(policy: unknown) {
       if (policy !== "allow-all" && policy !== "deny-all") {
         throw new Error(
-          'bwrap backend supports only the "allow-all" and "deny-all" network policies',
+          'bwrap sandbox supports only the "allow-all" and "deny-all" network policies',
         );
       }
       networkPolicy = policy;
@@ -498,45 +436,6 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
         throw new Error(`bwrap sandbox: cannot read a directory as a file: ${path}`);
       }
       return Readable.toWeb(createReadStream(hostPath)) as unknown as ReadableStream<Uint8Array>;
-    },
-
-    async readBinaryFile({ path }) {
-      try {
-        const bytes = await readFile(host(path));
-        return new Uint8Array(bytes);
-      } catch (error) {
-        if (isMissingFileError(error)) return null;
-        throw error;
-      }
-    },
-
-    async readTextFile({ path, encoding, startLine, endLine }) {
-      try {
-        const bytes = await readFile(host(path));
-        return sliceLines(decodeText(bytes, encoding ?? "utf-8"), startLine, endLine);
-      } catch (error) {
-        if (isMissingFileError(error)) return null;
-        throw error;
-      }
-    },
-
-    async writeFile({ path, content }) {
-      const hostPath = writableHostPath(path, "write");
-      await mkdir(dirname(hostPath), { recursive: true });
-      await pipeline(Readable.fromWeb(content as never), createWriteStream(hostPath));
-    },
-
-    async writeBinaryFile({ path, content }) {
-      const hostPath = writableHostPath(path, "write");
-      await mkdir(dirname(hostPath), { recursive: true });
-      await writeFile(hostPath, content);
-    },
-
-    async writeTextFile({ path, content, encoding }) {
-      const hostPath = writableHostPath(path, "write");
-      await mkdir(dirname(hostPath), { recursive: true });
-      const enc = encoding === undefined || encoding === "utf-8" ? "utf8" : encoding;
-      await writeFile(hostPath, Buffer.from(content, enc as BufferEncoding));
     },
 
     async writeFiles({ files }) {

@@ -406,7 +406,7 @@ unprivileged systemd path below, where host PID 1 already reaps orphans.
   zombie count returns to baseline. Run this before pushing anything that touches `src/args.ts` or
   `src/process.ts`: CI's smoke job covers the unprivileged-user case but not the systemd
   constraints, and argv that looks right is not the same as a kernel that accepts it.
-- `pnpm tsx src/integration/bwrap-backend-smoke.ts` — the same test, run directly. Needs
+- `pnpm tsx src/integration/bwrap-smoke.ts` — the same test, run directly. Needs
   a Linux host that already has the AppArmor profile loaded and `/workspace` created
   (see [Requirements](#requirements)), and should be run as an unprivileged user: root
   is exempt from the userns sysctl, so a root-only pass proves nothing about a real

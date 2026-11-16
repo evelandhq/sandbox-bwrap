@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, rename, rm } from "node:fs/promises";
 import { basename } from "node:path";
-import type { SandboxNetworkPolicy, SandboxSession } from "eve/sandbox";
 import {
   cloneDirectoryAtomically,
   removeCacheMetadata,
@@ -12,61 +11,25 @@ import {
 } from "./cache.js";
 import { createBwrapConnection, sandboxHome } from "./connection.js";
 import { BwrapSandboxSessionGoneError, BwrapTemplateNotProvisionedError } from "./errors.js";
-import type { BwrapNetworkPolicy, BwrapSandboxCreateOptions } from "./options.js";
+import type { BwrapNetworkPolicy, BwrapSandboxEnvironmentOptions } from "./options.js";
 import { createBwrapOptionsHash, resolveBwrapSandboxOptions } from "./options.js";
 import { resolveProviderCacheRoot, sessionPathIn, templatePathIn } from "./paths.js";
 import type { ProcessRunner } from "./process.js";
-import {
-  isConnectionPrepareContext,
-  isConnectionSessionContext,
-  type BwrapSandboxConnection,
-  type ConnectionProviderPrepareContext,
-  type ConnectionProviderSessionContext,
-  type ConnectionSessionEndOptions,
-  type HandleProviderHandle,
-  type HandleProviderPrepareContext,
-  type HandleProviderResourceTree,
-  type HandleProviderSessionContext,
-  type HandleSandboxDeleteOptions,
-  type HandleSessionEndOptions,
+import type {
+  BwrapPrepareContext,
+  BwrapSandboxConnection,
+  BwrapSessionContext,
+  BwrapSessionEndOptions,
 } from "./provider-contract.js";
-import type { BwrapSeed } from "./runtime.js";
-import { createBwrapRuntime, writeSeedFiles } from "./runtime.js";
+import { createBwrapRuntime } from "./runtime.js";
 import type { BwrapSession } from "./session.js";
 
 /**
- * Version of the session state this provider persists through eve. eve refuses
- * to resume state written under a different version, so bump it only together
- * with a reader for the old shape. Both provider contracts record the same
- * state, so a Deployment rolled back across eve 0.83 still opens it.
+ * Version of the session state this provider persists through eve. eve starts
+ * a fresh sandbox for state recorded under a different version, so bump it
+ * only when the state's shape changes incompatibly.
  */
 export const BWRAP_PROVIDER_STATE_PROTOCOL_VERSION = 1;
-
-/**
- * The session this provider hands eve: a `SandboxSession` whose egress can be
- * changed while it runs. eve exported this type itself until 0.66 removed it,
- * so it is declared here from the parts eve still exports, the same shape eve
- * now uses for its own `DockerSandboxSession`. `prepare` callbacks receive it.
- */
-export type MutableNetworkSandboxSession = SandboxSession & {
-  setNetworkPolicy(policy: SandboxNetworkPolicy): Promise<void>;
-};
-
-/** The handle this provider hands eve 0.64 through 0.82. */
-export type BwrapProviderHandle = HandleProviderHandle<MutableNetworkSandboxSession>;
-
-/** What eve 0.64 through 0.82 pass when they delete a sandbox: at most an abort signal. */
-export type BwrapSandboxDeleteOptions = HandleSandboxDeleteOptions;
-
-/** Options for `BwrapSandbox.environment(...)`. */
-export type BwrapSandboxEnvironmentOptions = Omit<BwrapSandboxCreateOptions, "templateRevision"> & {
-  /**
-   * Setup every new sandbox inherits. eve runs it once, when `eve build`
-   * prepares the template, not for each session. Commands it runs execute in
-   * bwrap, so the build host needs bwrap too.
-   */
-  readonly prepare?: (sandbox: MutableNetworkSandboxSession) => Promise<void>;
-};
 
 /** Options for `environment.open(...)`, applied when a session's sandbox is first started. */
 export interface BwrapSandboxOpenOptions {
@@ -93,45 +56,23 @@ export interface CreateBwrapSandboxProviderDefinitionInput {
   readonly copyDirectory?: BwrapDirectoryCopier;
 }
 
-/**
- * One environment's lifecycle, answering both eve provider contracts. Each
- * method is overloaded once per contract; the context eve passes decides which
- * one runs (`populate` on a prepare context, `kind` on a session context mark
- * eve 0.83 and later), so a single definition serves the whole peer range.
- */
+/** One environment's lifecycle, as eve's sandbox provider contract calls it. */
 export interface BwrapSandboxProviderImplementation {
-  prepare(ctx: ConnectionProviderPrepareContext): Promise<BwrapPreparedArtifact>;
-  prepare(ctx: HandleProviderPrepareContext): Promise<BwrapPreparedArtifact>;
+  prepare(ctx: BwrapPrepareContext): Promise<BwrapPreparedArtifact>;
   start(
-    ctx: ConnectionProviderSessionContext,
+    ctx: BwrapSessionContext,
     options: Readonly<BwrapSandboxOpenOptions> | undefined,
     artifact: Readonly<BwrapPreparedArtifact>,
   ): Promise<{ readonly connection: BwrapSandboxConnection; readonly state: BwrapSessionState }>;
-  start(
-    ctx: HandleProviderSessionContext,
-    options: Readonly<BwrapSandboxOpenOptions> | undefined,
-    artifact: Readonly<BwrapPreparedArtifact>,
-  ): Promise<{ readonly handle: BwrapProviderHandle; readonly state: BwrapSessionState }>;
   resume(
-    ctx: ConnectionProviderSessionContext,
+    ctx: BwrapSessionContext,
     artifact: Readonly<BwrapPreparedArtifact>,
     state: Readonly<BwrapSessionState>,
   ): Promise<BwrapSandboxConnection>;
-  resume(
-    ctx: HandleProviderSessionContext,
-    artifact: Readonly<BwrapPreparedArtifact>,
-    state: Readonly<BwrapSessionState>,
-  ): Promise<BwrapProviderHandle>;
   onSessionEnd(
-    ctx: ConnectionProviderSessionContext,
+    ctx: BwrapSessionContext,
     state: Readonly<BwrapSessionState> | null,
-    options: ConnectionSessionEndOptions,
-  ): Promise<void>;
-  onSessionEnd(
-    ctx: HandleProviderSessionContext,
-    artifact: Readonly<BwrapPreparedArtifact>,
-    state: Readonly<BwrapSessionState>,
-    options: HandleSessionEndOptions,
+    options: BwrapSessionEndOptions,
   ): Promise<void>;
 }
 
@@ -142,10 +83,11 @@ export interface BwrapSandboxProviderDefinition {
 }
 
 /**
- * The bubblewrap sandbox provider for eve 0.64 and later, as a plain
- * definition. Pass it to eve's `defineSandboxProvider`, or import the ready
- * `BwrapSandbox` from `@evelandhq/sandbox-bwrap/provider`. This module imports
- * nothing from eve at runtime, so it loads on every eve in the peer range.
+ * The bubblewrap sandbox provider as a plain definition. Pass it to eve's
+ * `defineSandboxProvider`, or import the ready `BwrapSandbox` from
+ * `@evelandhq/sandbox-bwrap/provider`. It imports nothing from eve at run
+ * time, so a host can also drive it directly, for example to check that bwrap
+ * works before serving traffic.
  */
 export function createBwrapSandboxProviderDefinition(
   input: CreateBwrapSandboxProviderDefinitionInput = {},
@@ -154,10 +96,9 @@ export function createBwrapSandboxProviderDefinition(
     name: "bwrap",
     stateProtocolVersion: BWRAP_PROVIDER_STATE_PROTOCOL_VERSION,
     environment(environmentOptions) {
-      // eve 0.83 and later strip `prepare` before calling this and run it
-      // themselves through `ctx.populate`; earlier lines pass it here.
-      const { prepare: environmentPrepare, ...createOptions } = environmentOptions ?? {};
-      const options = resolveBwrapSandboxOptions(createOptions);
+      // eve strips the authored `prepare` before calling this and runs it
+      // itself through `ctx.populate`.
+      const options = resolveBwrapSandboxOptions(environmentOptions);
       const optionsHash = createBwrapOptionsHash(options);
       const runtime = createBwrapRuntime({ options, runner: input.runner });
 
@@ -198,34 +139,6 @@ export function createBwrapSandboxProviderDefinition(
         });
         await applyNetworkPolicy(session, created);
         return session;
-      }
-
-      function handleFor(
-        storagePath: string,
-        session: BwrapSession,
-        sessionPath: string,
-      ): BwrapProviderHandle {
-        const stop = async () => {
-          await session.killAll();
-        };
-        // The session's own workspace is disposable; the template it was
-        // cloned from is shared by every other session and must survive.
-        const remove = async (deleteOptions?: BwrapSandboxDeleteOptions) => {
-          deleteOptions?.abortSignal?.throwIfAborted();
-          await session.killAll();
-          runtime.forgetRuntimeSession(sessionPath);
-          await removeSessionWorkspace(cacheRoots(storagePath).sessionRoot, sessionPath);
-        };
-        return {
-          sandbox: session,
-          onSandboxStop: stop,
-          onSessionStop: stop,
-          async onRuntimeShutdown() {
-            await session.killAll();
-          },
-          onSandboxDelete: remove,
-          onSessionDelete: remove,
-        };
       }
 
       async function removeSessionWorkspace(sessionRoot: string, sessionPath: string) {
@@ -323,69 +236,32 @@ export function createBwrapSandboxProviderDefinition(
         return createBwrapConnection({ session });
       }
 
-      function prepare(ctx: ConnectionProviderPrepareContext): Promise<BwrapPreparedArtifact>;
-      function prepare(ctx: HandleProviderPrepareContext): Promise<BwrapPreparedArtifact>;
-      async function prepare(
-        ctx: ConnectionProviderPrepareContext | HandleProviderPrepareContext,
-      ): Promise<BwrapPreparedArtifact> {
-        if (isConnectionPrepareContext(ctx)) {
-          // eve hashes the workspace and skill files and the sandbox module's
-          // source revision into the key itself; the identity adds what only
-          // this provider knows. eve runs the authored `prepare` inside
-          // `populate`, so its source is no longer this provider's to hash.
-          const templateKey = ctx.templateKey({ provider: "bwrap", version: 2 });
-          return await captureTemplate(ctx.storagePath, templateKey, ctx.log, async (session) => {
-            await ctx.populate(
-              createBwrapConnection({
-                session,
-                template: {
-                  home: sandboxHome(options.env),
-                  assertBwrapAvailable: () => runtime.assertBwrapAvailable(),
-                },
-              }),
-            );
-          });
-        }
-        const templateKey = JSON.stringify({
-          version: 1,
-          sourceRevision: ctx.sourceRevision,
-          workspace: ctx.resources.workspace?.key ?? null,
-          skills: ctx.resources.skills?.key ?? null,
-          // eve's source revision covers the sandbox module, not helpers it
-          // imports, so the preparation's own source joins the key.
-          prepare: environmentPrepare?.toString() ?? null,
-        });
+      async function prepare(ctx: BwrapPrepareContext): Promise<BwrapPreparedArtifact> {
+        // eve hashes the workspace and skill files and the sandbox module's
+        // source revision into the key itself; the identity adds what only
+        // this provider knows.
+        const templateKey = ctx.templateKey({ provider: "bwrap", version: 2 });
         return await captureTemplate(ctx.storagePath, templateKey, ctx.log, async (session) => {
-          await writeSeedFiles(session, resourceSeeds(ctx.resources));
-          if (environmentPrepare) {
-            runtime.assertBwrapAvailable();
-            ctx.log?.("bwrap: running sandbox preparation");
-            await environmentPrepare(session);
-          }
+          await ctx.populate(
+            createBwrapConnection({
+              session,
+              template: {
+                home: sandboxHome(options.env),
+                assertBwrapAvailable: () => runtime.assertBwrapAvailable(),
+              },
+            }),
+          );
         });
       }
 
-      function start(
-        ctx: ConnectionProviderSessionContext,
+      async function start(
+        ctx: BwrapSessionContext,
         openOptions: Readonly<BwrapSandboxOpenOptions> | undefined,
-        artifact: Readonly<BwrapPreparedArtifact>,
+        preparedArtifact: Readonly<BwrapPreparedArtifact>,
       ): Promise<{
         readonly connection: BwrapSandboxConnection;
         readonly state: BwrapSessionState;
-      }>;
-      function start(
-        ctx: HandleProviderSessionContext,
-        openOptions: Readonly<BwrapSandboxOpenOptions> | undefined,
-        artifact: Readonly<BwrapPreparedArtifact>,
-      ): Promise<{ readonly handle: BwrapProviderHandle; readonly state: BwrapSessionState }>;
-      async function start(
-        ctx: ConnectionProviderSessionContext | HandleProviderSessionContext,
-        openOptions: Readonly<BwrapSandboxOpenOptions> | undefined,
-        preparedArtifact: Readonly<BwrapPreparedArtifact>,
-      ): Promise<
-        | { readonly connection: BwrapSandboxConnection; readonly state: BwrapSessionState }
-        | { readonly handle: BwrapProviderHandle; readonly state: BwrapSessionState }
-      > {
+      }> {
         const workspace = await ensureWorkspace(ctx.storagePath, ctx.session.id, preparedArtifact);
         const networkPolicy = openOptions?.networkPolicy ?? options.networkPolicy;
         const state: BwrapSessionState = {
@@ -393,52 +269,29 @@ export function createBwrapSandboxProviderDefinition(
           sessionKey: workspace.sessionKey,
           networkPolicy,
         };
-        if (isConnectionSessionContext(ctx)) {
-          // eve 0.83 makes `start` an idempotent upsert: open options apply
-          // only to a sandbox this call creates. A live generation another
-          // caller started, such as a subagent sharing the sandbox, keeps the
-          // policy it has.
-          const session = await openGeneration(
-            ctx.storagePath,
-            ctx.session.id,
-            workspace.sessionKey,
-            workspace.cloneStrategy,
-            async (opened, created) => {
-              if (workspace.cloned || created) await opened.setNetworkPolicy(networkPolicy);
-            },
-          );
-          return { connection: connectionFor(session), state };
-        }
+        // `start` is an idempotent upsert: open options apply only to a
+        // sandbox this call creates. A live generation another caller started,
+        // such as a subagent sharing the sandbox, keeps the policy it has.
         const session = await openGeneration(
           ctx.storagePath,
           ctx.session.id,
           workspace.sessionKey,
           workspace.cloneStrategy,
-          async (opened) => {
-            await opened.setNetworkPolicy(networkPolicy);
+          async (opened, created) => {
+            if (workspace.cloned || created) await opened.setNetworkPolicy(networkPolicy);
           },
         );
-        return { handle: handleFor(ctx.storagePath, session, workspace.sessionPath), state };
+        return { connection: connectionFor(session), state };
       }
 
-      function resume(
-        ctx: ConnectionProviderSessionContext,
-        artifact: Readonly<BwrapPreparedArtifact>,
-        state: Readonly<BwrapSessionState>,
-      ): Promise<BwrapSandboxConnection>;
-      function resume(
-        ctx: HandleProviderSessionContext,
-        artifact: Readonly<BwrapPreparedArtifact>,
-        state: Readonly<BwrapSessionState>,
-      ): Promise<BwrapProviderHandle>;
       // eve resumes at every durable step, and after a restart or a move to
       // another deployment. Only the session workspace is needed, never the
       // template, so the artifact passed here may belong to a newer build.
       async function resume(
-        ctx: ConnectionProviderSessionContext | HandleProviderSessionContext,
+        ctx: BwrapSessionContext,
         preparedArtifact: Readonly<BwrapPreparedArtifact>,
         sessionState: Readonly<BwrapSessionState>,
-      ): Promise<BwrapSandboxConnection | BwrapProviderHandle> {
+      ): Promise<BwrapSandboxConnection> {
         runtime.assertBwrapAvailable();
         requireArtifact(preparedArtifact);
         const state = requireSessionState(sessionState);
@@ -462,36 +315,22 @@ export function createBwrapSandboxProviderDefinition(
             if (created) await opened.setNetworkPolicy(state.networkPolicy);
           },
         );
-        return isConnectionSessionContext(ctx)
-          ? connectionFor(session)
-          : handleFor(ctx.storagePath, session, sessionPath);
+        return connectionFor(session);
       }
 
-      function onSessionEnd(
-        ctx: ConnectionProviderSessionContext,
-        state: Readonly<BwrapSessionState> | null,
-        options: ConnectionSessionEndOptions,
-      ): Promise<void>;
-      function onSessionEnd(
-        ctx: HandleProviderSessionContext,
-        artifact: Readonly<BwrapPreparedArtifact>,
-        state: Readonly<BwrapSessionState>,
-        options: HandleSessionEndOptions,
-      ): Promise<void>;
       // eve releases a durable session's sandbox once the session has ended,
-      // from persisted state alone. Only the workspace is touched, never the
-      // template, and nothing is resumed to do it: a live generation in this
-      // process is stopped, a workspace that is already gone is left gone, so
-      // the step may retry. eve 0.83 passes no artifact, may pass no state for
-      // a sandbox the session never recorded, and also routes
-      // `sandbox.delete()` here.
+      // and routes `sandbox.delete()` here too. Only the workspace is touched,
+      // never the template, and nothing is resumed to do it: a live generation
+      // in this process is stopped, and a workspace that is already gone is
+      // left gone, so eve may retry. `state` is null for a sandbox the session
+      // never recorded; its workspace key derives from the session id alone.
       async function onSessionEnd(
-        ctx: ConnectionProviderSessionContext | HandleProviderSessionContext,
-        ...rest: readonly unknown[]
+        ctx: BwrapSessionContext,
+        recorded: Readonly<BwrapSessionState> | null,
+        _options: BwrapSessionEndOptions,
       ): Promise<void> {
-        const recorded = isConnectionSessionContext(ctx) ? rest[0] : rest[1];
         const sessionKey =
-          recorded === null && isConnectionSessionContext(ctx)
+          recorded === null
             ? `session:${ctx.session.id}`
             : requireSessionState(recorded).sessionKey;
         const roots = cacheRoots(ctx.storagePath);
@@ -503,19 +342,6 @@ export function createBwrapSandboxProviderDefinition(
       return { prepare, start, resume, onSessionEnd };
     },
   };
-}
-
-/** eve's workspace and skill trees as seeds at their sandbox target paths. */
-function resourceSeeds(resources: HandleProviderPrepareContext["resources"]): BwrapSeed[] {
-  return [resources.workspace, resources.skills].flatMap(
-    (tree: HandleProviderResourceTree | undefined) =>
-      tree === undefined
-        ? []
-        : tree.files.map((file) => ({
-            path: `${tree.targetPath}/${file.relativePath}`,
-            content: file.content,
-          })),
-  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

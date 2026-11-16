@@ -75,11 +75,11 @@ jobs:
               labels: ["eve-drift"],
               body: [
                 `The scheduled drift check failed against \`eve@${version}\`, which the`,
-                "declared peer range `>=0.62.0 <1.0.0 || >=1.0.0-0 <2.0.0-0` currently accepts.",
+                "declared peer range `>=1.0.0 <2.0.0-0` currently accepts.",
                 "",
                 `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
                 "",
-                "Either adapt the backend to the new eve, or narrow the peer range's",
+                "Either adapt the provider to the new eve, or narrow the peer range's",
                 "ceiling and cut a release so consumers stop resolving a version that",
                 "does not work.",
               ].join("\n"),

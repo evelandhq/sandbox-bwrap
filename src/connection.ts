@@ -1,10 +1,10 @@
 import { WORKSPACE_ROOT } from "./paths.js";
 import type { SpawnedProcess } from "./process.js";
-import { abortSignalOf, type BwrapSandboxConnection } from "./provider-contract.js";
+import type { BwrapSandboxConnection } from "./provider-contract.js";
 import type { BwrapSession } from "./session.js";
 
 /**
- * The exact command eve 0.83 and later run to find the sandbox's `$HOME`
+ * The exact command eve runs to find the sandbox's `$HOME`
  * before seeding skills under `$HOME/.agents/skills`. A test pins it against
  * the installed eve, so a change in eve fails here instead of silently
  * seeding skills where the runtime never looks.
@@ -16,16 +16,13 @@ export interface CreateBwrapConnectionInput {
   /**
    * Set for the throwaway session over a template being captured. Its `$HOME`
    * probe is answered from the session's resolved environment without
-   * launching bwrap, so a build with no authored `prepare` still needs no bwrap
-   * on the build host, as it did before eve 0.83.
+   * launching bwrap, so a build with no authored `prepare` needs no bwrap on
+   * the build host.
    */
   readonly template?: { readonly home: string; readonly assertBwrapAvailable: () => void };
 }
 
-/**
- * Adapts a bwrap session to the byte-level connection eve 0.83 and later
- * derive the full sandbox session from.
- */
+/** Adapts a bwrap session to the byte-level connection eve derives the full sandbox session from. */
 export function createBwrapConnection(input: CreateBwrapConnectionInput): BwrapSandboxConnection {
   const { session, template } = input;
   return {
@@ -40,23 +37,23 @@ export function createBwrapConnection(input: CreateBwrapConnectionInput): BwrapS
         command: options.command,
         env: { ...options.env },
         workingDirectory: options.workingDirectory,
-        signal: abortSignalOf(options),
+        signal: options.signal,
         stdin: options.stdin,
       });
     },
 
     async readFile(options) {
-      abortSignalOf(options)?.throwIfAborted();
+      options.signal?.throwIfAborted();
       return await session.readFile({ path: options.path });
     },
 
     async writeFiles(options) {
-      abortSignalOf(options)?.throwIfAborted();
+      options.signal?.throwIfAborted();
       await session.writeFiles({ files: options.files });
     },
 
     async removePath(options) {
-      abortSignalOf(options)?.throwIfAborted();
+      options.signal?.throwIfAborted();
       await session.removePath({
         path: options.path,
         force: options.force,

@@ -99,7 +99,7 @@ devDependency together; a test asserts they name the same minor line.
 - Unit tests inject the process runner (`ProcessRunner` in `src/process.ts`), so
   they never execute bwrap and run anywhere, including macOS. Keep it that way:
   a unit test that requires a real `bwrap` binary belongs in
-  `src/integration/bwrap-backend-smoke.ts` instead.
+  `src/integration/bwrap-smoke.ts` instead.
 - Anything touching the generated argv (`src/args.ts`) or prerequisite detection
   (`src/process.ts`) should be exercised by the real-binary smoke test, not only
   by unit tests. Argv that looks right and a kernel that accepts it are

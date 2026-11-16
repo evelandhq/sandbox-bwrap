@@ -50,13 +50,7 @@ async function makeSession(result?: { exitCode?: number; stdout?: string; stderr
   return { session, calls, workspaceDir, appRoot };
 }
 
-describe("run and spawn", () => {
-  test("run collects streams and the exit code without throwing on failure", async () => {
-    const { session } = await makeSession({ exitCode: 3, stdout: "so", stderr: "se" });
-    const result = await session.run({ command: "boom" });
-    expect(result).toEqual({ exitCode: 3, stdout: "so", stderr: "se" });
-  });
-
+describe("spawn", () => {
   test("spawn builds a hardened bwrap argv: clearenv, hidden cache root, workspace bind", async () => {
     const { session, calls, workspaceDir, appRoot } = await makeSession();
     await session.spawn({ command: "echo hi", env: { CALL: "1" } });
@@ -258,15 +252,6 @@ describe("run and spawn", () => {
     }
   });
 
-  test("run surfaces the limit errors of the command it spawns", async () => {
-    const { runner } = abortableRunner({ stdout: "123456789" });
-    const { session } = await limitedSession(runner, { maxOutputBytes: 4 });
-
-    await expect(session.run({ command: "lots-of-output" })).rejects.toThrow(
-      "command output exceeded 4 bytes",
-    );
-  });
-
   test("the caller's abort signal still kills the command, with the caller's reason", async () => {
     const { runner, state } = abortableRunner();
     const { session } = await limitedSession(runner, { runTimeoutMs: 60_000 });
@@ -312,7 +297,7 @@ describe("run and spawn", () => {
   });
 });
 
-describe("eve 0.84 spawn options", () => {
+describe("spawn options", () => {
   function recordingSession() {
     const received: { abortSignal?: AbortSignal; stdin?: boolean }[] = [];
     const stdin = new WritableStream<Uint8Array>();
@@ -354,39 +339,6 @@ describe("eve 0.84 spawn options", () => {
     expect(withStdin.stdin).toBe(stdin);
     expect(without.stdin).toBeUndefined();
   });
-
-  test("spawn takes eve 0.84's `signal` as well as the older `abortSignal`", async () => {
-    const { runner, received } = recordingSession();
-    const session = await sessionOver(runner);
-    const older = new AbortController();
-    const newer = new AbortController();
-
-    await session.spawn({ command: "a", abortSignal: older.signal });
-    await session.spawn({ command: "b", signal: newer.signal });
-    older.abort(new Error("older"));
-    newer.abort(new Error("newer"));
-
-    // The runner sees the caller's signal combined with the command's limits.
-    const reasons = received.map((options) => options.abortSignal?.reason as Error | undefined);
-    expect(reasons.map((reason) => reason?.message)).toEqual(["older", "newer"]);
-  });
-
-  test("run aborts on eve 0.84's `signal` as well as the older `abortSignal`", async () => {
-    const { runner, received } = recordingSession();
-    const session = await sessionOver(runner);
-
-    for (const options of [
-      { command: "a", abortSignal: AbortSignal.abort(new Error("older")) },
-      { command: "b", signal: AbortSignal.abort(new Error("newer")) },
-    ]) {
-      await session.run(options);
-    }
-
-    // run combines the caller's signal with its own output and timeout
-    // signals, so the runner sees a derived signal carrying the caller's reason.
-    const reasons = received.map((options) => options.abortSignal?.reason as Error | undefined);
-    expect(reasons.map((reason) => reason?.message)).toEqual(["older", "newer"]);
-  });
 });
 
 describe("network policy", () => {
@@ -411,51 +363,57 @@ describe("network policy", () => {
 });
 
 describe("file I/O", () => {
-  test("text roundtrip with nested directories and line slicing", async () => {
+  const bytes = (text: string) => new TextEncoder().encode(text);
+  async function readText(
+    session: Awaited<ReturnType<typeof makeSession>>["session"],
+    file: string,
+  ) {
+    const stream = await session.readFile({ path: file });
+    return stream === null ? null : await new Response(stream).text();
+  }
+
+  test("a batch write creates nested directories and reads back", async () => {
     const { session } = await makeSession();
-    await session.writeTextFile({ path: "notes/deep/a.txt", content: "l1\nl2\nl3" });
-    expect(await session.readTextFile({ path: "notes/deep/a.txt" })).toBe("l1\nl2\nl3");
-    expect(await session.readTextFile({ path: "notes/deep/a.txt", startLine: 2, endLine: 2 })).toBe(
-      "l2",
-    );
-    expect(
-      await session.readTextFile({ path: "notes/deep/a.txt", startLine: 2, endLine: 99 }),
-    ).toBe("l2\nl3");
+    await session.writeFiles({
+      files: [
+        { path: "/workspace/notes/deep/a.txt", content: bytes("l1\nl2") },
+        { path: "/workspace/b.bin", content: new Uint8Array([1, 2, 3]) },
+      ],
+    });
+    expect(await readText(session, "/workspace/notes/deep/a.txt")).toBe("l1\nl2");
+    const stream = await session.readFile({ path: "/workspace/b.bin" });
+    expect([...new Uint8Array(await new Response(stream).arrayBuffer())]).toEqual([1, 2, 3]);
   });
 
-  test("missing files resolve null across all readers", async () => {
+  test("a missing file reads as null and a directory rejects", async () => {
     const { session } = await makeSession();
-    expect(await session.readTextFile({ path: "nope.txt" })).toBeNull();
-    expect(await session.readBinaryFile({ path: "nope.txt" })).toBeNull();
-    expect(await session.readFile({ path: "nope.txt" })).toBeNull();
-  });
-
-  test("binary and stream writes land in the workspace", async () => {
-    const { session, workspaceDir } = await makeSession();
-    await session.writeBinaryFile({ path: "bin.dat", content: new Uint8Array([1, 2, 3]) });
-    expect([...(await session.readBinaryFile({ path: "bin.dat" }))!]).toEqual([1, 2, 3]);
-    await session.writeFile({ path: "stream.txt", content: stringStream("streamed") });
-    expect(await readFile(path.join(workspaceDir, "stream.txt"), "utf8")).toBe("streamed");
+    expect(await session.readFile({ path: "/workspace/nope.txt" })).toBeNull();
+    await session.writeFiles({ files: [{ path: "/workspace/d/f", content: bytes("x") }] });
+    await expect(session.readFile({ path: "/workspace/d" })).rejects.toThrow(/directory/);
   });
 
   test("writes and removes outside the workspace are refused", async () => {
     const { session } = await makeSession();
-    await expect(session.writeTextFile({ path: "/etc/evil", content: "x" })).rejects.toThrow(
-      /workspace/,
-    );
     await expect(
-      session.writeTextFile({ path: "a/../../escape.txt", content: "x" }),
+      session.writeFiles({ files: [{ path: "/etc/evil", content: bytes("x") }] }),
+    ).rejects.toThrow(/workspace/);
+    await expect(
+      session.writeFiles({
+        files: [{ path: "/workspace/a/../../escape.txt", content: bytes("x") }],
+      }),
     ).rejects.toThrow(/workspace/);
     await expect(session.removePath({ path: "/etc/hosts" })).rejects.toThrow(/workspace/);
   });
 
   test("removePath honors force and recursive", async () => {
     const { session, workspaceDir } = await makeSession();
-    await session.writeTextFile({ path: "dir/inner.txt", content: "x" });
-    await session.removePath({ path: "dir", recursive: true });
+    await session.writeFiles({
+      files: [{ path: "/workspace/dir/inner.txt", content: bytes("x") }],
+    });
+    await session.removePath({ path: "/workspace/dir", recursive: true });
     expect(existsSync(path.join(workspaceDir, "dir"))).toBe(false);
-    await expect(session.removePath({ path: "gone.txt" })).rejects.toThrow();
-    await session.removePath({ path: "gone.txt", force: true });
+    await expect(session.removePath({ path: "/workspace/gone.txt" })).rejects.toThrow();
+    await session.removePath({ path: "/workspace/gone.txt", force: true });
   });
 
   test("writes and removes through a planted symlink are refused", async () => {
@@ -466,25 +424,20 @@ describe("file I/O", () => {
     await symlink(outside, path.join(workspaceDir, "escape"));
 
     await expect(
-      session.writeTextFile({ path: "escape/victim.txt", content: "pwn" }),
+      session.writeFiles({
+        files: [{ path: "/workspace/escape/victim.txt", content: bytes("pwn") }],
+      }),
     ).rejects.toThrow(/workspace/);
-    await expect(session.removePath({ path: "escape/victim.txt" })).rejects.toThrow(/workspace/);
+    await expect(session.removePath({ path: "/workspace/escape/victim.txt" })).rejects.toThrow(
+      /workspace/,
+    );
     expect(await readFile(path.join(outside, "victim.txt"), "utf8")).toBe("precious");
   });
 
   test("reads of host paths outside the workspace pass through", async () => {
     const { session, appRoot } = await makeSession();
     await writeFile(path.join(appRoot, "host.txt"), "host-visible");
-    expect(await session.readTextFile({ path: path.join(appRoot, "host.txt") })).toBe(
-      "host-visible",
-    );
-  });
-
-  test("resolvePath anchors to /workspace and id is stable", async () => {
-    const { session } = await makeSession();
-    expect(session.resolvePath("a.txt")).toBe("/workspace/a.txt");
-    expect(session.resolvePath("/abs")).toBe("/abs");
-    expect(session.id).toBe("s1");
+    expect(await readText(session, path.join(appRoot, "host.txt"))).toBe("host-visible");
   });
 });
 
@@ -528,7 +481,7 @@ describe("killAll", () => {
     expect(killed).toEqual([1, 2]);
   });
 
-  test("run() does not leave the process registered after it exits", async () => {
+  test("a collected process is not registered after it exits", async () => {
     const killed: number[] = [];
     const runner: ProcessRunner = {
       spawn(): SpawnedProcess {
@@ -554,7 +507,12 @@ describe("killAll", () => {
       options: resolveBwrapSandboxOptions(),
     });
 
-    await session.run({ command: "echo out" });
+    const proc = await session.spawn({ command: "echo out" });
+    await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.wait(),
+    ]);
     await session.killAll();
 
     expect(killed).toEqual([]);
