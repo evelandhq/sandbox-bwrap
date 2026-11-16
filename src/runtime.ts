@@ -8,13 +8,6 @@ import { createNodeProcessRunner, describeMissingPrereqs, isBwrapAvailable } fro
 import type { BwrapSession } from "./session.js";
 import { createBwrapSession } from "./session.js";
 
-const EVE_MODEL_SKILL_ROOT = "$HOME/.agents/skills";
-
-export interface BwrapSeed {
-  readonly path: string;
-  readonly content: string | Uint8Array;
-}
-
 export interface BwrapSessionLocation {
   readonly id: string;
   readonly workspaceDir: string;
@@ -24,9 +17,9 @@ export interface BwrapSessionLocation {
 }
 
 /**
- * The session machinery the backend and the provider share: one live compute
- * generation per workspace directory, each holding a cache lease so pruning
- * never removes a workspace in use.
+ * The provider's session machinery: one live compute generation per
+ * workspace directory, each holding a cache lease so pruning never removes a
+ * workspace in use.
  */
 export interface BwrapRuntime {
   /** Throws a setup message when the host cannot run bwrap. Probed once. */
@@ -131,26 +124,4 @@ export function createBwrapRuntime(input: {
       await current?.killAll();
     },
   };
-}
-
-function resolveSeedPath(seedPath: string): string {
-  if (seedPath === EVE_MODEL_SKILL_ROOT || seedPath.startsWith(`${EVE_MODEL_SKILL_ROOT}/`)) {
-    return `${WORKSPACE_ROOT}/.agents/skills${seedPath.slice(EVE_MODEL_SKILL_ROOT.length)}`;
-  }
-  return seedPath;
-}
-
-/** Writes seeds into a session; eve's `$HOME/.agents/skills` lands under the sandbox HOME. */
-export async function writeSeedFiles(
-  session: BwrapSession,
-  seedFiles: ReadonlyArray<BwrapSeed>,
-): Promise<void> {
-  for (const seed of seedFiles) {
-    const seedPath = resolveSeedPath(seed.path);
-    if (typeof seed.content === "string") {
-      await session.writeTextFile({ path: seedPath, content: seed.content });
-    } else {
-      await session.writeBinaryFile({ path: seedPath, content: seed.content });
-    }
-  }
 }

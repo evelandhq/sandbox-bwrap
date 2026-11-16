@@ -5,31 +5,38 @@ import { describe, expect, test } from "vitest";
 import {
   isWithinWorkspace,
   isWithinWorkspaceReal,
-  resolveBwrapCacheRoot,
-  resolveSessionPath,
-  resolveTemplatePath,
+  resolveProviderCacheRoot,
   resolveWorkspacePath,
+  sessionPathIn,
+  templatePathIn,
   toHostPath,
   WORKSPACE_ROOT,
 } from "./paths.js";
 
 describe("cache layout", () => {
-  test("nests under eve's local sandbox cache convention", () => {
-    expect(resolveBwrapCacheRoot("/app")).toBe("/app/.eve/sandbox-cache/bwrap");
+  test("templates live under eve's storage directory", () => {
+    expect(resolveProviderCacheRoot("/app/.eve/sandbox-cache")).toBe(
+      "/app/.eve/sandbox-cache/bwrap",
+    );
   });
 
   test("template paths are hash-keyed and options-scoped", () => {
-    const a = resolveTemplatePath("/app", "tpl-key", "aaaa");
-    const b = resolveTemplatePath("/app", "tpl-key", "bbbb");
-    const c = resolveTemplatePath("/app", "other-key", "aaaa");
-    expect(a).toMatch(/^\/app\/\.eve\/sandbox-cache\/bwrap\/templates\/[0-9a-f]{32}-aaaa$/);
+    const a = templatePathIn("/cache", "tpl-key", "aaaa");
+    const b = templatePathIn("/cache", "tpl-key", "bbbb");
+    const c = templatePathIn("/cache", "other-key", "aaaa");
+    expect(a).toMatch(/^\/cache\/templates\/[0-9a-f]{32}-aaaa$/);
     expect(a).not.toBe(b);
     expect(a).not.toBe(c);
   });
 
-  test("session paths are keyed by session key only", () => {
-    expect(resolveSessionPath("/app", "sess/with:odd chars")).toMatch(
-      /^\/app\/\.eve\/sandbox-cache\/bwrap\/sessions\/[0-9a-f]{32}$/,
+  /**
+   * Durable session workspaces live at this path and recorded session state
+   * names only the key, so the derivation must not change: a different one
+   * would orphan every existing workspace.
+   */
+  test("session paths are the first 32 hex digits of the key's SHA-256", () => {
+    expect(sessionPathIn("/cache", "session:sess-1")).toBe(
+      "/cache/sessions/23251b97fd7a584906713d0d073feee1",
     );
   });
 });
@@ -55,29 +62,6 @@ describe("workspace paths", () => {
     // traversal normalizes out of the workspace
     expect(isWithinWorkspace(toHostPath("a/../../escape", "/data/sess1"), "/data/sess1")).toBe(
       false,
-    );
-  });
-});
-
-describe("cacheDir override", () => {
-  test("an explicit cacheDir replaces the appRoot-derived cache root", () => {
-    expect(resolveBwrapCacheRoot("/app", "/var/lib/eveland-data/sandbox/proj_1")).toBe(
-      "/var/lib/eveland-data/sandbox/proj_1",
-    );
-    expect(resolveBwrapCacheRoot("/app", null)).toBe("/app/.eve/sandbox-cache/bwrap");
-    expect(resolveBwrapCacheRoot("/app")).toBe("/app/.eve/sandbox-cache/bwrap");
-  });
-
-  test("session and template paths follow the override, so a new appRoot reuses the same state", () => {
-    const cacheDir = "/var/lib/eveland-data/sandbox/proj_1";
-    expect(resolveSessionPath("/releases/r1", "sess", cacheDir)).toBe(
-      resolveSessionPath("/releases/r2", "sess", cacheDir),
-    );
-    expect(resolveTemplatePath("/releases/r1", "tpl", "hash", cacheDir)).toBe(
-      resolveTemplatePath("/releases/r2", "tpl", "hash", cacheDir),
-    );
-    expect(resolveSessionPath("/releases/r1", "sess")).not.toBe(
-      resolveSessionPath("/releases/r2", "sess"),
     );
   });
 });

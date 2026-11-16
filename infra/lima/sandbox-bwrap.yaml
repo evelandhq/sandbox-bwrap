@@ -54,7 +54,7 @@ provision:
 
       # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, which
       # blocks an *unconfined* non-root process from creating a user namespace
-      # -- exactly what this backend does. The apt bubblewrap package
+      # -- exactly what this sandbox does. The apt bubblewrap package
       # (0.9.0-1ubuntu0.1) ships no AppArmor profile, so bwrap fails with
       # "setting up uid map: Permission denied" unless one is installed that
       # permits userns creation. `apparmor_parser -r` replaces an already-loaded

@@ -2,45 +2,18 @@ import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 
-/** Sandbox-visible workspace root; parity with eve's built-in local backends. */
+/** Sandbox-visible workspace root, the default eve and its built-in providers use. */
 export const WORKSPACE_ROOT = "/workspace";
-
-/**
- * Templates and durable session workspaces. `cacheDir` pins the location
- * outside the release directory; without it the cache follows eve's local
- * convention under the app root.
- */
-export function resolveBwrapCacheRoot(appRoot: string, cacheDir?: string | null): string {
-  return cacheDir ?? join(appRoot, ".eve", "sandbox-cache", "bwrap");
-}
 
 function keyDigest(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 32);
 }
 
-export function resolveTemplatePath(
-  appRoot: string,
-  templateKey: string,
-  optionsHash: string,
-  cacheDir?: string | null,
-): string {
-  return templatePathIn(resolveBwrapCacheRoot(appRoot, cacheDir), templateKey, optionsHash);
-}
-
-export function resolveSessionPath(
-  appRoot: string,
-  sessionKey: string,
-  cacheDir?: string | null,
-): string {
-  return sessionPathIn(resolveBwrapCacheRoot(appRoot, cacheDir), sessionKey);
-}
-
 /**
- * The provider's cache root inside eve's sandbox storage directory
- * (`<appRoot>/.eve/sandbox-cache`), the same place the backend's default
- * cache root resolves to. eve prepares templates there at build time and
- * records their path, so templates always live here, even when `cacheDir`
- * moves session workspaces elsewhere.
+ * The provider's cache root inside the storage directory eve gives it. eve
+ * prepares templates there at build time and records their path, so
+ * templates always live here, even when `cacheDir` moves session workspaces
+ * elsewhere.
  */
 export function resolveProviderCacheRoot(storagePath: string): string {
   return join(storagePath, "bwrap");

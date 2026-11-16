@@ -1,15 +1,20 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import type { SandboxProviderSessionContext } from "eve-legacy/sandbox/provider";
 import type { SandboxPrepareContext, SandboxSessionContext } from "eve/sandbox/provider";
+import { listBwrapCache } from "./cache.js";
 import { EVE_SANDBOX_HOME_PROBE } from "./connection.js";
+import type { BwrapSandboxEnvironmentOptions } from "./options.js";
 import { sessionPathIn } from "./paths.js";
 import type { ProcessRunner } from "./process.js";
 import type { BwrapSandboxConnection } from "./provider-contract.js";
-import type { BwrapSandboxEnvironmentOptions } from "./provider-definition.js";
-import { createBwrapSandboxProviderDefinition } from "./provider-definition.js";
+import {
+  BWRAP_PROVIDER_STATE_PROTOCOL_VERSION,
+  createBwrapSandboxProviderDefinition,
+} from "./provider-definition.js";
 import {
   createLiveRunner,
   empty,
@@ -19,11 +24,11 @@ import {
 } from "./provider.test-support.js";
 
 /**
- * The eve 0.83+ connection contract. eve derives the session from the
+ * eve's sandbox provider contract. eve derives the session from the
  * connection and seeds templates itself through `ctx.populate`, so these tests
- * stand in for eve with a `populate` that makes the same calls eve 0.83.3
- * makes: the `$HOME` probe when there are skills, one `writeFiles` batch, then
- * the authored preparation over the connection.
+ * stand in for eve with a `populate` that makes the same calls eve's does: the
+ * `$HOME` probe when there are skills, one `writeFiles` batch, then the
+ * authored preparation over the connection.
  */
 
 const encoder = new TextEncoder();
@@ -269,23 +274,145 @@ describe("start, resume, and session end", () => {
     expect(existsSync(workspace)).toBe(false);
   });
 
-  test("records state the handle contract resumes, so a rollback below eve 0.83 still opens it", async () => {
+  test("resume does not need the template, so a session survives a move to another deployment", async () => {
+    const release = await makeRelease();
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "bwrap-provider-shared-"));
+    const first = environment({ cacheDir });
+    const artifact = await first.prepare(prepareContext(release.storagePath));
+    const started = await first.start(
+      sessionContext(release.storagePath, "session-1"),
+      undefined,
+      artifact,
+    );
+    await started.connection.writeFiles({
+      files: [{ path: "/workspace/keep.txt", content: encoder.encode("moved") }],
+    });
+    await started.connection.stop();
+    await rm(release.appRoot, { force: true, recursive: true });
+
+    const next = await makeRelease();
+    const nextEnv = environment({ cacheDir });
+    const nextArtifact = await nextEnv.prepare(
+      prepareContext(next.storagePath, { revision: "r2" }),
+    );
+    const resumed = await nextEnv.resume(
+      sessionContext(next.storagePath, "session-1"),
+      nextArtifact,
+      started.state,
+    );
+
+    expect(await readText(resumed, "/workspace/keep.txt")).toBe("moved");
+  });
+
+  test("keeps templates in eve's storage directory even when cacheDir moves session workspaces", async () => {
+    const { appRoot, storagePath } = await makeRelease();
+    const cacheDir = path.join(appRoot, "..", `${path.basename(appRoot)}-sessions`);
+    const env = environment({ cacheDir });
+    const artifact = await env.prepare(prepareContext(storagePath));
+    await env.start(sessionContext(storagePath, "session-1"), undefined, artifact);
+
+    const templates = await listBwrapCache({ appRoot });
+    const sessions = await listBwrapCache({ appRoot, cacheDir });
+    expect(templates.map((entry) => entry.kind)).toEqual(["template"]);
+    expect(sessions.map((entry) => [entry.kind, entry.tags])).toEqual([
+      ["session", { sessionId: "session-1" }],
+    ]);
+    await rm(cacheDir, { force: true, recursive: true });
+  });
+
+  test("start without a prepared template throws the error eve recognizes", async () => {
     const { storagePath } = await makeRelease();
     const env = environment();
     const artifact = await env.prepare(prepareContext(storagePath));
-    const started = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
-    await started.connection.writeFiles({
-      files: [{ path: "/workspace/note.txt", content: encoder.encode("across lines") }],
+    await rm(artifact.templatePath, { force: true, recursive: true });
+
+    await expect(
+      env.start(sessionContext(storagePath, "s"), undefined, artifact),
+    ).rejects.toMatchObject({
+      name: "SandboxTemplateNotProvisionedError",
+      providerName: "bwrap",
+      templateKey: artifact.templatePath,
+    });
+  });
+
+  test("rejects artifacts and state this provider did not write", async () => {
+    const { storagePath } = await makeRelease();
+    const env = environment();
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { state } = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
+
+    await expect(
+      env.start(sessionContext(storagePath, "t"), undefined, { templatePath: 1 } as never),
+    ).rejects.toThrow(/artifact/);
+    await expect(
+      env.resume(sessionContext(storagePath, "s"), artifact, { ...state, version: 2 } as never),
+    ).rejects.toThrow(/session state/);
+    await expect(
+      env.onSessionEnd(sessionContext(storagePath, "s"), { version: 2 } as never, {
+        reason: "completed",
+      }),
+    ).rejects.toThrow(/invalid session state/);
+  });
+
+  test("session end releases the workspace from recorded state without resuming it", async () => {
+    const { appRoot, storagePath } = await makeRelease();
+    const { runner, calls } = createLiveRunner();
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { state } = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
+    const spawnedBeforeEnd = calls.length;
+
+    // A fresh definition stands in for the process that runs the cleanup step
+    // after a restart: it never opened this session's sandbox.
+    await environment(undefined, runner).onSessionEnd(sessionContext(storagePath, "s"), state, {
+      reason: "completed",
     });
 
-    const legacyContext = {
-      host: {},
-      session: { id: "s" },
-      storagePath,
-    } as unknown as SandboxProviderSessionContext;
-    const handle = await environment().resume(legacyContext, artifact, started.state);
+    expect(calls.length).toBe(spawnedBeforeEnd);
+    expect((await listBwrapCache({ appRoot })).map((entry) => entry.kind)).toEqual(["template"]);
+    await expect(readdir(path.join(storagePath, "bwrap", "sessions"))).resolves.toEqual([]);
+  });
 
-    expect(await handle.sandbox.readTextFile({ path: "note.txt" })).toBe("across lines");
+  test("session end stops the live generation in this process, and a later start is fresh", async () => {
+    const { storagePath } = await makeRelease();
+    const { runner, killed } = createLiveRunner();
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { connection, state } = await env.start(
+      sessionContext(storagePath, "s"),
+      undefined,
+      artifact,
+    );
+    await connection.spawn({ command: "sleep 60", env: {}, workingDirectory: "/workspace" });
+    await connection.writeFiles({
+      files: [{ path: "/workspace/keep.txt", content: encoder.encode("old") }],
+    });
+
+    await env.onSessionEnd(sessionContext(storagePath, "s"), state, { reason: "expired" });
+    await env.onSessionEnd(sessionContext(storagePath, "s"), state, { reason: "failed" });
+
+    expect(killed).toEqual([1]);
+    const fresh = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
+    expect(await readText(fresh.connection, "/workspace/keep.txt")).toBeNull();
+  });
+});
+
+describe("definition", () => {
+  test("names the provider bwrap at state protocol 1", () => {
+    const definition = createBwrapSandboxProviderDefinition();
+
+    expect(definition.name).toBe("bwrap");
+    expect(definition.stateProtocolVersion).toBe(BWRAP_PROVIDER_STATE_PROTOCOL_VERSION);
+    expect(BWRAP_PROVIDER_STATE_PROTOCOL_VERSION).toBe(1);
+  });
+
+  test("the prepared template is readable from the artifact path eve records", async () => {
+    const { storagePath } = await makeRelease();
+    const artifact = await environment().prepare(
+      prepareContext(storagePath, { workspace: { "a.txt": "a" } }),
+    );
+
+    expect(await readFile(path.join(artifact.templatePath, "a.txt"), "utf8")).toBe("a");
   });
 });
 
@@ -332,7 +459,7 @@ describe("connection", () => {
     expect(await readText(connection, "/workspace/f")).toBe("x");
   });
 
-  test("forwards eve 0.84's `signal` as well as 0.83's `abortSignal` to the process", async () => {
+  test("forwards eve's abort signal to the process", async () => {
     const { storagePath } = await makeRelease();
     const signals: (AbortSignal | undefined)[] = [];
     const runner: ProcessRunner = {
@@ -349,26 +476,18 @@ describe("connection", () => {
     const env = environment(undefined, runner);
     const artifact = await env.prepare(prepareContext(storagePath));
     const { connection } = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
-    const older = new AbortController();
-    const newer = new AbortController();
+    const caller = new AbortController();
 
     await connection.spawn({
       command: "a",
       env: {},
       workingDirectory: "/workspace",
-      abortSignal: older.signal,
+      signal: caller.signal,
     });
-    await connection.spawn({
-      command: "b",
-      env: {},
-      workingDirectory: "/workspace",
-      signal: newer.signal,
-    });
-    older.abort(new Error("older"));
-    newer.abort(new Error("newer"));
+    caller.abort(new Error("caller gave up"));
 
-    const reasons = signals.map((signal) => signal?.reason as Error | undefined);
-    expect(reasons.map((reason) => reason?.message)).toEqual(["older", "newer"]);
+    // The runner sees the caller's signal combined with the command's limits.
+    expect((signals[0]?.reason as Error | undefined)?.message).toBe("caller gave up");
   });
 
   test("bounds every spawned command by runTimeoutMs and maxOutputBytes", async () => {
@@ -420,11 +539,11 @@ describe("connection", () => {
   });
 
   /**
-   * eve 0.84.1 checks for `stdin` only after the provider returned the process,
+   * eve checks for `stdin` only after the provider returned the process,
    * then kills it and fails the call -- so a provider that ignored the request
    * would already have started the command once.
    */
-  test("honors eve 0.84.1's stdin request with the process's writable stdin", async () => {
+  test("honors eve's stdin request with the process's writable stdin", async () => {
     const { storagePath } = await makeRelease();
     const requested: (boolean | undefined)[] = [];
     const stdin = new WritableStream<Uint8Array>();

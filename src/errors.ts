@@ -1,15 +1,12 @@
 /**
  * Thrown when a session needs a template that was never prepared.
  *
- * eve recognizes this error structurally rather than by class, so this package
- * can throw it without importing eve at runtime. `name` and `templateKey` are
- * checked by every eve line; `backendName` is what eve 0.62 and 0.63 look for,
- * and `providerName` is what 0.64 and later look for. It carries both, so
- * the same error works for the backend and the provider.
+ * eve recognizes this error structurally, by `name`, `providerName`, and
+ * `templateKey`, so this package can throw it without importing eve at run
+ * time.
  */
 export class BwrapTemplateNotProvisionedError extends Error {
   override readonly name = "SandboxTemplateNotProvisionedError";
-  readonly backendName = "bwrap";
   readonly providerName = "bwrap";
   readonly templateKey: string;
 
@@ -23,10 +20,9 @@ export class BwrapTemplateNotProvisionedError extends Error {
 }
 
 /**
- * Thrown by `resume` when the session's workspace no longer exists. eve 0.83
- * and later recognize it by `name` and start a fresh sandbox for the session
- * instead of failing every later sandbox call; earlier eve lines treat it like
- * any other resume failure.
+ * Thrown by `resume` when the session's workspace no longer exists. eve
+ * recognizes it by `name` and starts a fresh sandbox for the session instead
+ * of failing every later sandbox call.
  */
 export class BwrapSandboxSessionGoneError extends Error {
   override readonly name = "SandboxSessionGoneError";

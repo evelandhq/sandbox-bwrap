@@ -9,7 +9,6 @@ describe("resolveBwrapSandboxOptions", () => {
       hidePaths: [],
       bwrapPath: "bwrap",
       cacheDir: null,
-      templateRevision: null,
       runTimeoutMs: 600_000,
       maxConcurrentProcesses: 64,
       maxOutputBytes: 16 * 1024 * 1024,
@@ -86,16 +85,6 @@ describe("cacheDir option", () => {
     const a = createBwrapOptionsHash(resolveBwrapSandboxOptions({ cacheDir: "/a" }));
     const b = createBwrapOptionsHash(resolveBwrapSandboxOptions({ cacheDir: "/b" }));
     expect(a).not.toBe(b);
-  });
-});
-
-describe("templateRevision option", () => {
-  test("changes the template options hash without changing other defaults", () => {
-    const first = resolveBwrapSandboxOptions({ templateRevision: "release-1" });
-    const second = resolveBwrapSandboxOptions({ templateRevision: "release-2" });
-
-    expect(first.templateRevision).toBe("release-1");
-    expect(createBwrapOptionsHash(first)).not.toBe(createBwrapOptionsHash(second));
   });
 });
 

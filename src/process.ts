@@ -6,8 +6,8 @@ import { WORKSPACE_ROOT } from "./paths.js";
 export interface SpawnedProcess {
   readonly pid?: number;
   /**
-   * The command's stdin, present only when the spawn asked for it (eve 0.84.1
-   * and later, `spawn({ stdin: true })`). Closing it sends EOF.
+   * The command's stdin, present only when the spawn asked for it
+   * (`spawn({ stdin: true })`). Closing it sends EOF.
    */
   readonly stdin?: WritableStream<Uint8Array>;
   readonly stdout: ReadableStream<Uint8Array>;
@@ -16,7 +16,7 @@ export interface SpawnedProcess {
   kill(): Promise<void>;
 }
 
-/** Injectable process launcher so backend logic is unit-testable without bwrap. */
+/** Injectable process launcher so sandbox logic is unit-testable without bwrap. */
 export interface ProcessRunner {
   spawn(argv: readonly string[], options?: ProcessRunnerSpawnOptions): SpawnedProcess;
 }
@@ -47,8 +47,7 @@ export function describeMissingPrereqs(probes: {
     problems.push(
       `bubblewrap is not available (tried "${probes.bwrapPath} --version"). ` +
         "Install it with your distro package manager (Ubuntu/Debian: apt-get install bubblewrap), " +
-        "or select a different backend outside Linux, e.g. " +
-        "backend: () => (isBwrapAvailable() ? bwrap() : defaultBackend()).",
+        "or use a different sandbox provider outside Linux.",
     );
   }
   if (!probes.workspaceMountpointPresent) {

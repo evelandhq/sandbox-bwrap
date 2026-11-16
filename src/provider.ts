@@ -1,9 +1,14 @@
-import { defineSandboxProvider } from "eve/sandbox/provider";
+import type { SandboxSession } from "eve/sandbox";
+import {
+  defineSandboxProvider,
+  type SandboxProvider,
+  type WithPrepareOption,
+} from "eve/sandbox/provider";
+import type { BwrapSandboxEnvironmentOptions } from "./options.js";
 import type { BwrapConnectionExtensions } from "./provider-contract.js";
 import {
   createBwrapSandboxProviderDefinition,
   type BwrapPreparedArtifact,
-  type BwrapSandboxEnvironmentOptions,
   type BwrapSandboxOpenOptions,
   type BwrapSessionState,
 } from "./provider-definition.js";
@@ -12,21 +17,21 @@ export {
   BWRAP_PROVIDER_STATE_PROTOCOL_VERSION,
   createBwrapSandboxProviderDefinition,
   type BwrapPreparedArtifact,
-  type BwrapSandboxEnvironmentOptions,
   type BwrapSandboxOpenOptions,
   type BwrapSandboxProviderDefinition,
   type BwrapSandboxProviderImplementation,
   type BwrapSessionState,
   type CreateBwrapSandboxProviderDefinitionInput,
-  type BwrapProviderHandle,
-  type BwrapSandboxDeleteOptions,
-  type MutableNetworkSandboxSession,
 } from "./provider-definition.js";
 export type { BwrapConnectionExtensions, BwrapSandboxConnection } from "./provider-contract.js";
+export type { BwrapNetworkPolicy, BwrapSandboxEnvironmentOptions } from "./options.js";
 export { isBwrapAvailable } from "./process.js";
 
+/** The sandbox eve hands an agent from a bwrap environment: eve's session plus `setNetworkPolicy`. */
+export type BwrapSandboxSession = SandboxSession & BwrapConnectionExtensions;
+
 /**
- * The bubblewrap sandbox provider for eve 0.64 and later.
+ * The bubblewrap sandbox provider.
  *
  * ```ts
  * // agent/sandbox.ts
@@ -36,13 +41,12 @@ export { isBwrapAvailable } from "./process.js";
  * export const environment = BwrapSandbox.environment();
  * export default defineSandbox(() => environment.open());
  * ```
- *
- * This entry point imports `eve/sandbox/provider`, which exists only from eve
- * 0.64 on. On eve 0.62 and 0.63 use `bwrap()` from the package root. Its
- * published types follow the eve line this package was built against (0.83's
- * connection contract); the definition behind it answers every line from 0.64.
  */
-export const BwrapSandbox = defineSandboxProvider<
+export const BwrapSandbox: SandboxProvider<
+  WithPrepareOption<BwrapSandboxEnvironmentOptions, BwrapSandboxSession>,
+  BwrapSandboxOpenOptions,
+  BwrapSandboxSession
+> = defineSandboxProvider<
   BwrapSandboxEnvironmentOptions,
   BwrapSandboxOpenOptions,
   BwrapPreparedArtifact,

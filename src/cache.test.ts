@@ -5,14 +5,34 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 import * as cacheModule from "./cache.js";
 import * as publicApi from "./index.js";
-import { createBwrapSandboxBackend } from "./backend.js";
 import type { ProcessRunner } from "./process.js";
+import { createBwrapSandboxProviderDefinition } from "./provider-definition.js";
 
 const noProcessRunner: ProcessRunner = {
   spawn() {
     throw new Error("not used");
   },
 };
+
+/** Starts a session's sandbox through a fresh provider environment, as one agent process would. */
+async function startSession(appRoot: string, cacheDir: string, sessionId: string) {
+  const environment = createBwrapSandboxProviderDefinition({ runner: noProcessRunner }).environment(
+    { cacheDir },
+  );
+  const storagePath = path.join(appRoot, ".eve", "sandbox-cache");
+  const artifact = await environment.prepare({
+    storagePath,
+    log: () => {},
+    populate: async () => {},
+    templateKey: () => "cache-test",
+  });
+  const { connection } = await environment.start(
+    { kind: "session", session: { id: sessionId }, storagePath },
+    undefined,
+    artifact,
+  );
+  return connection;
+}
 
 describe("operator cache management", () => {
   test("exposes explicit list and prune operations", () => {
@@ -143,15 +163,7 @@ describe("operator cache management", () => {
   test("refuses to prune a workspace owned by a live compute generation", async () => {
     const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-cache-active-"));
     const cacheDir = path.join(appRoot, "cache");
-    const backend = createBwrapSandboxBackend({
-      runner: noProcessRunner,
-      createOptions: { cacheDir },
-    });
-    const handle = await backend.create({
-      templateKey: null,
-      sessionKey: "active-session",
-      runtimeContext: { appRoot },
-    });
+    const connection = await startSession(appRoot, cacheDir, "active-session");
 
     const protectedResult = await cacheModule.pruneBwrapCache({
       appRoot,
@@ -166,7 +178,7 @@ describe("operator cache management", () => {
     ]);
     expect(existsSync(protectedResult.skippedActive[0]!.path)).toBe(true);
 
-    await handle.stop();
+    await connection.stop();
     const afterStop = await cacheModule.pruneBwrapCache({
       appRoot,
       cacheDir,
@@ -176,18 +188,10 @@ describe("operator cache management", () => {
     expect(afterStop.removed).toHaveLength(1);
   });
 
-  test("keeps an active reference count across backend instances", async () => {
+  test("keeps an active reference count across provider instances", async () => {
     const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-cache-active-refcount-"));
     const cacheDir = path.join(appRoot, "cache");
-    const create = async () =>
-      await createBwrapSandboxBackend({
-        runner: noProcessRunner,
-        createOptions: { cacheDir },
-      }).create({
-        templateKey: null,
-        sessionKey: "shared-active-session",
-        runtimeContext: { appRoot },
-      });
+    const create = async () => await startSession(appRoot, cacheDir, "shared-active-session");
     const first = await create();
     const second = await create();
 
@@ -214,22 +218,14 @@ describe("operator cache management", () => {
   test("persists active leases outside workspaces for cross-process prune safety", async () => {
     const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-cache-lease-"));
     const cacheDir = path.join(appRoot, "cache");
-    const backend = createBwrapSandboxBackend({
-      runner: noProcessRunner,
-      createOptions: { cacheDir },
-    });
-    const handle = await backend.create({
-      templateKey: null,
-      sessionKey: "leased-session",
-      runtimeContext: { appRoot },
-    });
+    const connection = await startSession(appRoot, cacheDir, "leased-session");
 
     const leases = await cacheModule.listBwrapCacheLeases({ appRoot, cacheDir });
     expect(leases).toHaveLength(1);
     expect(leases[0]).toMatchObject({ sessionId: expect.stringMatching(/^[0-9a-f]{32}$/) });
     expect(leases[0]!.path).toContain(path.join(cacheDir, "metadata", "active", "sessions"));
 
-    await handle.stop();
+    await connection.stop();
     await expect(cacheModule.listBwrapCacheLeases({ appRoot, cacheDir })).resolves.toEqual([]);
   });
 });

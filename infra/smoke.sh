@@ -5,7 +5,7 @@
 # covers the AppArmor/userns interaction. This script goes further and runs it
 # under the systemd hardening a deployed eve agent actually gets
 # (NoNewPrivileges, ProtectSystem=strict, PrivateTmp) -- the configuration this
-# backend is designed for. Run it before pushing anything that touches
+# sandbox is designed for. Run it before pushing anything that touches
 # src/args.ts or src/process.ts; waiting for CI does not cover that dimension.
 #
 # Prereq: brew install lima
@@ -58,5 +58,5 @@ limactl shell "$VM" -- sudo bash -c "
     --property=PrivateTmp=yes \
     --property=ReadWritePaths=/var/lib/sandbox-test \
     --setenv=TMPDIR=/var/lib/sandbox-test \
-    bash -lc 'cd $GUEST_DIR && ./node_modules/.bin/tsx src/integration/bwrap-backend-smoke.ts'
+    bash -lc 'cd $GUEST_DIR && ./node_modules/.bin/tsx src/integration/bwrap-smoke.ts'
 "
