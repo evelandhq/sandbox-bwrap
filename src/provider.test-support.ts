@@ -46,3 +46,14 @@ export async function makeRelease() {
   const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-provider-"));
   return { appRoot, storagePath: path.join(appRoot, ".eve", "sandbox-cache") };
 }
+
+/** Reads a stream until it ends or fails, keeping what arrived before a failure. */
+export async function readUntilSettled(stream: ReadableStream<Uint8Array>) {
+  const chunks: Uint8Array[] = [];
+  try {
+    for await (const chunk of stream) chunks.push(chunk);
+    return { text: Buffer.concat(chunks).toString("utf8"), error: undefined };
+  } catch (error) {
+    return { text: Buffer.concat(chunks).toString("utf8"), error: (error as Error).message };
+  }
+}

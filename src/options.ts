@@ -10,13 +10,13 @@ export interface BwrapSandboxUseOptions {
   readonly networkPolicy?: BwrapNetworkPolicy;
 }
 
-/** Commands executed through `run()` are bounded by default; use `spawn()` for daemons. */
+/** Default wall-clock limit for every sandboxed command, `spawn()` included. */
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
 
 /** Per-generation admission ceiling for transient bwrap commands. */
 export const DEFAULT_MAX_CONCURRENT_PROCESSES = 64;
 
-/** Combined stdout + stderr retained by one `run()` call. */
+/** Default limit on the combined stdout + stderr bytes one command delivers. */
 export const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 /** Options accepted by `bwrap(opts)`. */
@@ -43,14 +43,19 @@ export interface BwrapSandboxCreateOptions {
    */
   readonly templateRevision?: string;
   /**
-   * Hard wall-clock limit for one `run()` command. Defaults to 10 minutes.
-   * Set to `null` to disable. This does not apply to the deliberately
-   * long-running `spawn()` API.
+   * Hard wall-clock limit for every sandboxed command, each `spawn()` and the
+   * `run()` built on it. At the limit the command's process group is killed and
+   * `wait()` rejects. Defaults to 10 minutes. Set to `null` to disable, which a
+   * long-running spawned process such as a dev server needs.
    */
   readonly runTimeoutMs?: number | null;
-  /** Maximum live `run()`/`spawn()` processes in one compute generation. */
+  /** Maximum live commands in one compute generation. */
   readonly maxConcurrentProcesses?: number | null;
-  /** Maximum combined stdout/stderr bytes retained by one `run()` call. */
+  /**
+   * Maximum combined stdout/stderr bytes one command delivers to its caller.
+   * At the limit its streams fail after the bytes that fit, the process group
+   * is killed, and `wait()` rejects. Set to `null` to disable.
+   */
   readonly maxOutputBytes?: number | null;
   /** Best-effort structured lifecycle events. Sink errors never affect commands. */
   readonly onEvent?: BwrapSandboxEventSink;
