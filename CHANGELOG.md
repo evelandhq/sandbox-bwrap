@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.0.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.7.0...v1.0.0) (2026-11-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* eve below 1.0.0 is no longer supported. The bwrap and createBwrapSandboxBackend exports and every backend type are removed, as are BwrapProviderHandle, BwrapSandboxDeleteOptions, MutableNetworkSandboxSession, BwrapSession, BwrapSandboxUseOptions, BwrapSandboxCreateOptions and the templateRevision option. Session state, the provider name, and the session and template keys are unchanged, so existing session workspaces still resume.
+
+### Features
+
+* support only eve 1.x and its connection provider contract ([#52](https://github.com/evelandhq/sandbox-bwrap/issues/52)) ([4b4ad69](https://github.com/evelandhq/sandbox-bwrap/commit/4b4ad69af2b60a4827f6e504c2b64eb18f155cae))
+
+
+### Fixes
+
+* enforce runTimeoutMs and maxOutputBytes on every sandboxed command ([#50](https://github.com/evelandhq/sandbox-bwrap/issues/50)) ([b59bb83](https://github.com/evelandhq/sandbox-bwrap/commit/b59bb83ed8c3f74361144c4c77d0e1c0ed7f2e5e))
+* set AI_AGENT=eve in sandboxed commands and honor the session-end signal ([#53](https://github.com/evelandhq/sandbox-bwrap/issues/53)) ([f5b5f37](https://github.com/evelandhq/sandbox-bwrap/commit/f5b5f37960dea67a0b03a881706d57e7ebd9aa83))
+
+
+### Documentation
+
+* rewrite README and AGENTS.md for the eve 1.x provider ([#54](https://github.com/evelandhq/sandbox-bwrap/issues/54)) ([6b1dc2c](https://github.com/evelandhq/sandbox-bwrap/commit/6b1dc2c7c127de5465515c5663aea7a665317046))
+
 ## [0.7.0](https://github.com/evelandhq/sandbox-bwrap/compare/v0.6.0...v0.7.0) (2026-11-02)
 
 
