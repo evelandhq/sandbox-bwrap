@@ -48,10 +48,16 @@ non-obvious behaviors are deliberate and documented there:
   command left running in its own process group: eve's bash tool depends on
   such a process surviving, and the holder's lifetime is its bound. See
   **Background processes**.
-- Commands share one holder per network policy. Do not go back to a bwrap per
-  command, and do not let a policy change keep the old holder: `/tmp`, the
-  process table, and the guarantee that `deny-all` ends what ran with the
-  network all depend on it.
+- Commands share one holder per kind of network: one that shares the host's,
+  for `allow-all`, or one that has none, for everything else. Do not go back
+  to a bwrap per command, and do not let a move away from `allow-all` keep
+  the old holder: `/tmp`, the process table, and the guarantee that a
+  restricted policy ends what ran with the network all depend on it.
+- An allow-list is enforced in the host process, by the proxy in
+  `src/egress-proxy.ts`; the forwarder inside the sandbox only relays. A
+  policy is applied as written or refused (`src/network-policy.ts`): never
+  accept a part of one, such as a rule on a domain, that the proxy would
+  then ignore.
 - A joined command gets its environment from `env -i` and its working
   directory from a `cd` in the join script, because bwrap's `--clearenv` and
   `--chdir` belong to the holder. Nothing may reach a command through the
@@ -87,7 +93,8 @@ mechanisms keep the range honest — do not remove one without replacing it:
    into a provider — the session context's `kind`, `onSessionEnd`'s `reason`,
    and network policy variants. Never branch exhaustively on those: the local
    contract types keep `kind` and `reason` open, and `setNetworkPolicy`
-   accepts `"allow-all"`/`"deny-all"` and rejects everything else.
+   accepts `"allow-all"`, `"deny-all"`, and allow-lists of domains and
+   subnets, and rejects everything else.
 
 The CI `pack` job installs the real tarball with npm against `eve@1.0.0` and
 `eve@latest` and imports both entry points, which is a separate claim from

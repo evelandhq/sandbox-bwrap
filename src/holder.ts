@@ -1,4 +1,4 @@
-import { HOLDER_READY_MARKER } from "./args.js";
+import { EGRESS_READY_MARKER, HOLDER_READY_MARKER } from "./args.js";
 import type { ProcessRunner } from "./process.js";
 
 /** How long a holder may take to report its pid and readiness before it is given up on. */
@@ -27,6 +27,12 @@ export interface BwrapHolder {
   readonly mountNamespace?: number;
   /** False once the holder process has exited, however it ended. */
   alive(): boolean;
+  /**
+   * Starts the egress forwarder inside the sandbox and resolves once it
+   * accepts connections. Only a holder started with an egress socket has one.
+   * It is started once; later calls wait for, or return, the same start.
+   */
+  startEgress(): Promise<void>;
   /** Kills the holder and, through its PID namespace, everything running in the sandbox. Idempotent. */
   stop(): Promise<void>;
 }
@@ -36,11 +42,20 @@ export interface StartBwrapHolderInput {
   /** From `buildBwrapHolderArgs`. */
   readonly argv: readonly string[];
   readonly shareNetwork: boolean;
+  /** Whether the argv gave the holder an egress socket, so it can start a forwarder. */
+  readonly egress?: boolean;
   readonly startTimeoutMs?: number;
 }
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function chain(first: (() => void) | undefined, second: () => void): () => void {
+  return () => {
+    first?.();
+    second();
+  };
 }
 
 /**
@@ -84,34 +99,50 @@ export async function startBwrapHolder(input: StartBwrapHolderInput): Promise<Bw
     };
   }
 
-  async function readReady(): Promise<void> {
+  // The holder's stderr carries two markers over its life: ready, once, and
+  // the egress forwarder's, if that is ever started. One reader serves both
+  // and keeps draining afterwards, since a pipe nobody reads would block
+  // whoever wrote to it next.
+  let egressSeen = false;
+  let stderrClosed = false;
+  let onStderr: (() => void) | undefined;
+  const stderrChanged = () => {
+    const notify = onStderr;
+    onStderr = undefined;
+    notify?.();
+  };
+  void (async () => {
     const reader = proc.stderr.getReader();
     const errors = new TextDecoder();
-    let ready = false;
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        diagnostics = (diagnostics + errors.decode(value, { stream: true })).slice(
-          -MAX_DIAGNOSTIC_CHARS,
-        );
-        if (diagnostics.includes(HOLDER_READY_MARKER)) {
-          ready = true;
-          break;
-        }
+        const text = errors.decode(value, { stream: true });
+        if ((diagnostics + text).includes(EGRESS_READY_MARKER)) egressSeen = true;
+        diagnostics = (diagnostics + text).slice(-MAX_DIAGNOSTIC_CHARS);
+        stderrChanged();
       }
-    } finally {
-      // The holder writes nothing after the marker, but a pipe nobody reads
-      // would block it if it ever did: keep draining until it closes.
-      void (async () => {
-        try {
-          while (!(await reader.read()).done);
-        } catch {
-          // The stream fails when the holder is killed; nothing to report.
-        }
-      })();
+    } catch {
+      // The stream fails when the holder is killed; nothing to report.
     }
-    if (!ready) throw new Error("the sandbox exited before it was ready");
+    stderrClosed = true;
+    stderrChanged();
+  })();
+
+  /** Resolves true once `seen()` holds, or false if stderr closed first. */
+  async function stderrShows(seen: () => boolean): Promise<boolean> {
+    while (!seen()) {
+      if (stderrClosed) return false;
+      await new Promise<void>((resolve) => (onStderr = chain(onStderr, resolve)));
+    }
+    return true;
+  }
+
+  async function readReady(): Promise<void> {
+    if (!(await stderrShows(() => diagnostics.includes(HOLDER_READY_MARKER)))) {
+      throw new Error("the sandbox exited before it was ready");
+    }
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -164,10 +195,56 @@ export async function startBwrapHolder(input: StartBwrapHolderInput): Promise<Bw
   // or a short-lived host could exit while the holder was still starting.
   proc.unref?.();
 
+  let egress: Promise<void> | undefined;
+  async function startEgress(): Promise<void> {
+    if (input.egress !== true) {
+      throw new Error("bwrap sandbox: this sandbox was started without an egress proxy");
+    }
+    if (proc.stdin === undefined) {
+      throw new Error("bwrap sandbox: the sandbox has no control pipe to start egress through");
+    }
+    // Any line starts the forwarder. The writer is released, not closed:
+    // closing the pipe is what tells the holder to exit.
+    const writer = proc.stdin.getWriter();
+    try {
+      await writer.write(new TextEncoder().encode("egress\n"));
+    } finally {
+      writer.releaseLock();
+    }
+    let giveUp: ReturnType<typeof setTimeout> | undefined;
+    const started = await Promise.race([
+      stderrShows(() => egressSeen),
+      new Promise<false>((resolve) => {
+        giveUp = setTimeout(() => {
+          resolve(false);
+          stderrChanged();
+        }, startTimeoutMs);
+        giveUp.unref?.();
+      }),
+    ]);
+    clearTimeout(giveUp);
+    if (!started) {
+      const detail = diagnostics.replace(HOLDER_READY_MARKER, "").trim();
+      throw new Error(
+        "bwrap sandbox: the egress forwarder did not start, so the sandbox has no network" +
+          (detail === "" ? "" : `: ${detail}`),
+      );
+    }
+  }
+
   return {
     shareNetwork: input.shareNetwork,
     ...info,
     alive: () => !exited,
+    async startEgress() {
+      egress ??= startEgress();
+      try {
+        await egress;
+      } catch (error) {
+        egress = undefined;
+        throw error;
+      }
+    },
     async stop() {
       if (exited) return;
       await proc.kill();

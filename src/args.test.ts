@@ -3,6 +3,9 @@ import {
   buildBwrapHolderArgs,
   buildSandboxJoinArgs,
   DEFAULT_SANDBOX_PATH,
+  EGRESS_PROXY_PORT,
+  EGRESS_SOCKET_DIR,
+  egressEnvironment,
   HOLDER_READY_MARKER,
   SANDBOX_JOIN_FAILED_EXIT_CODE,
 } from "./args.js";
@@ -88,6 +91,52 @@ describe("buildBwrapHolderArgs", () => {
       shareNetwork: true,
     });
     expect(args.filter((arg) => arg === "--setenv")).toHaveLength(1);
+  });
+});
+
+describe("buildBwrapHolderArgs with an egress socket", () => {
+  const args = buildBwrapHolderArgs({
+    bwrapPath: "bwrap",
+    workspaceDir: "/w",
+    hidePaths: [],
+    shareNetwork: false,
+    egress: { socketDir: "/tmp/bwrap-egress-abc", socketName: "proxy.sock", pythonPath: "python3" },
+  });
+
+  /** Read-only, so a sandboxed program can connect to the socket but not replace it. */
+  test("binds the proxy's socket directory read-only, after the workspace", () => {
+    const bind = args.indexOf("--ro-bind", args.indexOf("--bind"));
+    expect(args.slice(bind, bind + 3)).toEqual([
+      "--ro-bind",
+      "/tmp/bwrap-egress-abc",
+      EGRESS_SOCKET_DIR,
+    ]);
+    expect(args).toContain("--unshare-net");
+  });
+
+  test("the holder starts the forwarder on demand, against the bound socket", () => {
+    const script = args.indexOf("-c", args.indexOf("bash"));
+    expect(args[script + 1]).toBe(
+      `echo ${HOLDER_READY_MARKER} >&2; while read -r _; do "$1" -I -S -c "$2" ${EGRESS_PROXY_PORT} "$3" & done`,
+    );
+    expect(args.slice(script + 2, script + 4)).toEqual(["bash", "python3"]);
+    expect(args[script + 4]).toContain('listener.bind(("127.0.0.1", port))');
+    expect(args[script + 5]).toBe(`${EGRESS_SOCKET_DIR}/proxy.sock`);
+  });
+});
+
+describe("egressEnvironment", () => {
+  test("points both spellings of the proxy variables at the forwarder", () => {
+    const proxy = `http://127.0.0.1:${EGRESS_PROXY_PORT}`;
+    expect(egressEnvironment()).toEqual({
+      HTTP_PROXY: proxy,
+      HTTPS_PROXY: proxy,
+      NO_PROXY: "localhost,127.0.0.1,::1",
+      http_proxy: proxy,
+      https_proxy: proxy,
+      no_proxy: "localhost,127.0.0.1,::1",
+      NODE_USE_ENV_PROXY: "1",
+    });
   });
 });
 

@@ -37,6 +37,12 @@ export type BwrapSandboxEvent =
       readonly error?: string;
     })
   | (BwrapEventBase & {
+      /** A destination the network policy turned away. Never a path, a header, or a body. */
+      readonly type: "network.denied";
+      readonly host: string;
+      readonly port: number;
+    })
+  | (BwrapEventBase & {
       readonly type: "cleanup.started";
       readonly requestedProcesses: number;
     })

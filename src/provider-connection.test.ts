@@ -259,6 +259,50 @@ describe("start, resume, and session end", () => {
     expect(fakeHolders(runner)[0]?.argv).toContain("--unshare-net");
   });
 
+  test("an allow-list is recorded in its canonical form and applied again on resume", async () => {
+    const { storagePath } = await makeRelease();
+    const artifact = await environment().prepare(prepareContext(storagePath));
+    const before = await environment().start(
+      sessionContext(storagePath, "s"),
+      { networkPolicy: { allow: { "API.example.com": [] }, subnets: { deny: ["10.0.0.1"] } } },
+      artifact,
+    );
+    expect(before.state.networkPolicy).toEqual({
+      allow: ["api.example.com"],
+      subnets: { deny: ["10.0.0.1/32"] },
+    });
+    expect(JSON.parse(JSON.stringify(before.state))).toEqual(before.state);
+    await before.connection.stop();
+
+    const { runner } = createLiveRunner();
+    const resumed = await environment(undefined, runner).resume(
+      sessionContext(storagePath, "s"),
+      artifact,
+      before.state,
+    );
+    await resumed.spawn({ command: "true", env: {}, workingDirectory: "/workspace" });
+
+    const holder = fakeHolders(runner)[0]!;
+    expect(holder.argv).toContain("--unshare-net");
+    expect(holder.egressStarts).toBe(1);
+    await resumed.stop();
+  });
+
+  test("a policy that cannot be enforced fails the open before a workspace is created", async () => {
+    const { storagePath } = await makeRelease();
+    const env = environment();
+    const artifact = await env.prepare(prepareContext(storagePath));
+
+    await expect(
+      env.start(
+        sessionContext(storagePath, "s"),
+        { networkPolicy: { allow: { "github.com": [{ forwardURL: "https://x.test" }] } } as never },
+        artifact,
+      ),
+    ).rejects.toThrow(/rules on a domain/);
+    expect(existsSync(sessionPathIn(path.join(storagePath, "bwrap"), "session:s"))).toBe(false);
+  });
+
   test("resume of a workspace that is gone throws the error eve starts fresh on", async () => {
     const { storagePath } = await makeRelease();
     const env = environment();

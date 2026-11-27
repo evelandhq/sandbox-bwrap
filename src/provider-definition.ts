@@ -10,8 +10,14 @@ import {
   type BwrapDirectoryCopier,
 } from "./cache.js";
 import { createBwrapConnection, sandboxHome } from "./connection.js";
+import type { EgressLookup } from "./egress-proxy.js";
 import { BwrapSandboxSessionGoneError, BwrapTemplateNotProvisionedError } from "./errors.js";
-import type { BwrapNetworkPolicy, BwrapSandboxEnvironmentOptions } from "./options.js";
+import {
+  resolveNetworkPolicy,
+  type BwrapNetworkPolicy,
+  type RecordedNetworkPolicy,
+} from "./network-policy.js";
+import type { BwrapSandboxEnvironmentOptions } from "./options.js";
 import { createBwrapOptionsHash, resolveBwrapSandboxOptions } from "./options.js";
 import { resolveProviderCacheRoot, sessionPathIn, templatePathIn } from "./paths.js";
 import type { ProcessRunner } from "./process.js";
@@ -47,7 +53,8 @@ export type BwrapPreparedArtifact = {
 export type BwrapSessionState = {
   readonly version: 1;
   readonly sessionKey: string;
-  readonly networkPolicy: BwrapNetworkPolicy;
+  /** The open-time policy in its recorded form: a string, or an allow-list. */
+  readonly networkPolicy: RecordedNetworkPolicy;
 };
 
 export interface CreateBwrapSandboxProviderDefinitionInput {
@@ -55,6 +62,8 @@ export interface CreateBwrapSandboxProviderDefinitionInput {
   readonly runner?: ProcessRunner;
   /** Injectable clone primitive for filesystem-capability tests. */
   readonly copyDirectory?: BwrapDirectoryCopier;
+  /** Injectable resolver for the egress proxy, so tests need no DNS. */
+  readonly egressLookup?: EgressLookup;
 }
 
 /** One environment's lifecycle, as eve's sandbox provider contract calls it. */
@@ -106,7 +115,11 @@ export function createBwrapSandboxProviderDefinition(
       // itself through `ctx.populate`.
       const options = resolveBwrapSandboxOptions(environmentOptions);
       const optionsHash = createBwrapOptionsHash(options);
-      const runtime = createBwrapRuntime({ options, runner: input.runner });
+      const runtime = createBwrapRuntime({
+        options,
+        runner: input.runner,
+        egressLookup: input.egressLookup,
+      });
 
       // Templates live beside eve's own prepared artifacts; sessions follow
       // `cacheDir` when it is set, so they outlive the release that made them.
@@ -268,8 +281,12 @@ export function createBwrapSandboxProviderDefinition(
         readonly connection: BwrapSandboxConnection;
         readonly state: BwrapSessionState;
       }> {
+        // Resolved before anything is created, so a policy this provider
+        // cannot enforce fails the open instead of the first command.
+        const networkPolicy = resolveNetworkPolicy(
+          openOptions?.networkPolicy ?? options.networkPolicy,
+        ).recorded;
         const workspace = await ensureWorkspace(ctx.storagePath, ctx.session.id, preparedArtifact);
-        const networkPolicy = openOptions?.networkPolicy ?? options.networkPolicy;
         const state: BwrapSessionState = {
           version: 1,
           sessionKey: workspace.sessionKey,
@@ -385,18 +402,15 @@ function requireArtifact(value: unknown): BwrapPreparedArtifact {
   return { version: 1, templatePath: value.templatePath };
 }
 
-function isNetworkPolicy(value: unknown): value is BwrapNetworkPolicy {
-  return value === "allow-all" || value === "deny-all";
-}
-
 function requireSessionState(value: unknown): BwrapSessionState {
-  if (
-    !isRecord(value) ||
-    value.version !== 1 ||
-    typeof value.sessionKey !== "string" ||
-    !isNetworkPolicy(value.networkPolicy)
-  ) {
+  if (!isRecord(value) || value.version !== 1 || typeof value.sessionKey !== "string") {
     throw new Error("bwrap sandbox: invalid session state");
   }
-  return { version: 1, sessionKey: value.sessionKey, networkPolicy: value.networkPolicy };
+  let networkPolicy: RecordedNetworkPolicy;
+  try {
+    networkPolicy = resolveNetworkPolicy(value.networkPolicy).recorded;
+  } catch {
+    throw new Error("bwrap sandbox: invalid session state");
+  }
+  return { version: 1, sessionKey: value.sessionKey, networkPolicy };
 }

@@ -26,6 +26,95 @@ export const HOLDER_READY_MARKER = "bwrap-sandbox-ready";
  */
 const HOLDER_SCRIPT = `echo ${HOLDER_READY_MARKER} >&2; read -r _ || true`;
 
+/** Where a sandbox without a network finds the egress proxy's socket directory. */
+export const EGRESS_SOCKET_DIR = "/tmp/.bwrap-egress";
+
+/**
+ * The loopback port the egress forwarder listens on inside the sandbox. The
+ * sandbox has a network namespace of its own, so the port cannot collide
+ * with anything on the host or in another sandbox.
+ */
+export const EGRESS_PROXY_PORT = 3128;
+
+/** The line the egress forwarder writes to stderr once it accepts connections. */
+export const EGRESS_READY_MARKER = "bwrap-egress-ready";
+
+/**
+ * The egress forwarder, run inside a sandbox that has no network as
+ * `python3 -I -S -c <this> <port> <socket>`. Proxy-aware programs take a
+ * `host:port`, not a Unix socket, so this accepts on loopback and relays each
+ * connection, byte for byte, to the proxy's socket. It decides nothing: the
+ * proxy in the host process is what enforces the policy.
+ */
+const EGRESS_FORWARDER = `
+import socket, sys, threading
+port, upstream = int(sys.argv[1]), sys.argv[2]
+def pump(source, sink):
+    try:
+        while True:
+            data = source.recv(65536)
+            if not data:
+                break
+            sink.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            sink.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+def serve(client):
+    proxy = socket.socket(socket.AF_UNIX)
+    try:
+        proxy.connect(upstream)
+        back = threading.Thread(target=pump, args=(proxy, client), daemon=True)
+        back.start()
+        pump(client, proxy)
+        back.join()
+    except OSError:
+        pass
+    finally:
+        client.close()
+        proxy.close()
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen(128)
+sys.stderr.write("${EGRESS_READY_MARKER}\\n")
+sys.stderr.flush()
+while True:
+    threading.Thread(target=serve, args=(listener.accept()[0],), daemon=True).start()
+`.trim();
+
+/**
+ * The holder of a sandbox that can be given an allow-list. It idles like any
+ * holder until the provider writes a line to its stdin, then starts the
+ * egress forwarder beside itself and goes back to waiting, so the forwarder
+ * exists only in a sandbox whose policy needs it and ends with the holder.
+ */
+const HOLDER_WITH_EGRESS_SCRIPT =
+  `echo ${HOLDER_READY_MARKER} >&2; ` +
+  `while read -r _; do "$1" -I -S -c "$2" ${EGRESS_PROXY_PORT} "$3" & done`;
+
+/**
+ * What points a command's HTTP clients at the egress forwarder. Both
+ * spellings are set because programs disagree on which they read, and
+ * `NODE_USE_ENV_PROXY` because Node reads neither without it.
+ */
+export function egressEnvironment(): Record<string, string> {
+  const proxy = `http://127.0.0.1:${EGRESS_PROXY_PORT}`;
+  const direct = "localhost,127.0.0.1,::1";
+  return {
+    HTTP_PROXY: proxy,
+    HTTPS_PROXY: proxy,
+    NO_PROXY: direct,
+    http_proxy: proxy,
+    https_proxy: proxy,
+    no_proxy: direct,
+    NODE_USE_ENV_PROXY: "1",
+  };
+}
+
 /**
  * What a joined command runs first. bwrap's `--chdir` belongs to the holder,
  * so each command changes directory itself, then becomes the login shell eve's
@@ -39,6 +128,17 @@ export interface BwrapHolderInput {
   /** Host paths mounted over with an empty tmpfs. Caller filters to existing paths. */
   readonly hidePaths: readonly string[];
   readonly shareNetwork: boolean;
+  /**
+   * For a holder without a network: the host directory of the egress proxy's
+   * socket, bound read-only into the sandbox, and the Python that runs the
+   * forwarder on demand. A sandboxed program can connect to the socket, which
+   * is what the forwarder does for it, but cannot replace it.
+   */
+  readonly egress?: {
+    readonly socketDir: string;
+    readonly socketName: string;
+    readonly pythonPath: string;
+  };
 }
 
 /**
@@ -72,6 +172,9 @@ export function buildBwrapHolderArgs(input: BwrapHolderInput): string[] {
     args.push("--tmpfs", path);
   }
   args.push("--bind", input.workspaceDir, WORKSPACE_ROOT);
+  if (input.egress) {
+    args.push("--ro-bind", input.egress.socketDir, EGRESS_SOCKET_DIR);
+  }
   if (!input.shareNetwork) {
     args.push("--unshare-net");
   }
@@ -90,8 +193,18 @@ export function buildBwrapHolderArgs(input: BwrapHolderInput): string[] {
     "/",
     "bash",
     "-c",
-    HOLDER_SCRIPT,
   );
+  if (input.egress) {
+    args.push(
+      HOLDER_WITH_EGRESS_SCRIPT,
+      "bash",
+      input.egress.pythonPath,
+      EGRESS_FORWARDER,
+      `${EGRESS_SOCKET_DIR}/${input.egress.socketName}`,
+    );
+  } else {
+    args.push(HOLDER_SCRIPT);
+  }
   return args;
 }
 

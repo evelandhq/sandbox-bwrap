@@ -1,3 +1,4 @@
+import type { BwrapNetworkPolicy } from "./network-policy.js";
 import type { SpawnedProcess } from "./process.js";
 
 /**
@@ -10,7 +11,7 @@ import type { SpawnedProcess } from "./process.js";
 
 /** Capabilities merged onto the session eve derives from a connection. */
 export interface BwrapConnectionExtensions {
-  setNetworkPolicy(policy: "allow-all" | "deny-all"): Promise<void>;
+  setNetworkPolicy(policy: BwrapNetworkPolicy): Promise<void>;
 }
 
 /** The byte-level connection eve derives a sandbox session from. */

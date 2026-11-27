@@ -4,11 +4,15 @@
 // unprivileged user under systemd hardening (NoNewPrivileges,
 // ProtectSystem=strict) to mirror a deployed eve agent.
 import assert from "node:assert/strict";
+import { lookup } from "node:dns/promises";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { EVE_SANDBOX_HOME_PROBE } from "../connection.js";
+import type { BwrapSandboxEvent } from "../events.js";
 import { isBwrapAvailable, isPythonAvailable } from "../process.js";
 import type { BwrapSandboxConnection } from "../provider-contract.js";
 import {
@@ -407,6 +411,137 @@ async function sharedSandboxSmoke(appRoot: string): Promise<void> {
 }
 
 /**
+ * An allow-list over the real binaries: the sandbox has no network of its
+ * own, and what a command reaches goes through the forwarder inside it to
+ * the proxy in this process, which decides by name and by address. The
+ * destination is a server in this process, reached by this host's own name so
+ * no test depends on the internet.
+ */
+async function egressSmoke(appRoot: string): Promise<void> {
+  const server = createServer((req, res) => res.end(`reached ${req.url}`));
+  // IPv4 only, on purpose: this host's name may resolve to an IPv6 address
+  // first, which the proxy must get past to the one that is listening.
+  await new Promise<void>((resolve) => server.listen(0, "0.0.0.0", resolve));
+  const port = (server.address() as AddressInfo).port;
+  const hostName = os.hostname().toLowerCase();
+  const { address } = await lookup(hostName, { family: 4 });
+  const byName = `http://${hostName}:${port}`;
+  const byAddress = `http://${address}:${port}`;
+
+  const storagePath = path.join(appRoot, "egress-release", ".eve", "sandbox-cache");
+  const events: BwrapSandboxEvent[] = [];
+  const environment = createBwrapSandboxProviderDefinition().environment({
+    onEvent: (event) => void events.push(event),
+  });
+  const artifact = await environment.prepare({
+    storagePath,
+    log: () => {},
+    templateKey: () => "egress-smoke",
+    async populate() {},
+  });
+  const ctx = { kind: "session" as const, session: { id: "egress-1" }, storagePath };
+  const { connection } = await environment.start(
+    ctx,
+    { networkPolicy: { allow: [hostName] } },
+    artifact,
+  );
+  const status = async (command: string) =>
+    (await runOver(connection, `${command} -s -o /dev/null -w '%{http_code}'`)).stdout;
+
+  // The sandbox has no route of its own: only loopback is up.
+  const interfaces = await runOver(connection, IFACE_COMMAND);
+  assert.equal(nonLoopbackInterfaces(interfaces.stdout).length, 0, "an allow-list has no network");
+
+  // An allowed name is reached through the proxy, by plain HTTP and by a tunnel.
+  const allowed = await runOver(connection, `curl -sS ${byName}/plain`);
+  assert.equal(allowed.stdout, "reached /plain", "an allowed domain must be reachable");
+  const tunnelled = await runOver(connection, `curl -sS --proxytunnel ${byName}/tunnel`);
+  assert.equal(
+    tunnelled.stdout,
+    "reached /tunnel",
+    "a CONNECT tunnel must reach an allowed domain",
+  );
+  const fromNode = await runOver(
+    connection,
+    `node -e "fetch('${byName}/node').then((r) => r.text()).then((t) => process.stdout.write(t))"`,
+  );
+  assert.equal(fromNode.stdout, "reached /node", "Node's fetch must go through the proxy");
+
+  // The proxy's socket is bound read-only: a sandboxed program can use it but
+  // cannot remove it or put its own in its place.
+  const tamper = await runOver(
+    connection,
+    "rm -f /tmp/.bwrap-egress/proxy.sock; touch /tmp/.bwrap-egress/other; echo rc=$?",
+  );
+  assert.equal(tamper.stdout.trim(), "rc=1", "the egress socket directory must be read-only");
+  assert.equal((await runOver(connection, `curl -sS ${byName}/still`)).stdout, "reached /still");
+
+  // Anything else is refused by the proxy, and a program that ignores the
+  // proxy reaches nothing at all.
+  assert.equal(await status("curl http://example.com/"), "403", "an unlisted domain is refused");
+  assert.equal(await status(`curl ${byAddress}/`), "403", "an address needs an allowed range");
+  const direct = await runOver(connection, `curl -sS --noproxy '*' --max-time 5 ${byName}/direct`);
+  assert.notEqual(direct.exitCode, 0, "bypassing the proxy must reach nothing");
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === "network.denied" ? [event.host] : [])),
+    ["example.com", address],
+    "refused destinations must be reported",
+  );
+
+  // Address ranges: an allowed one admits the address, a denied one overrides
+  // both it and the allowed domain. Both take effect without a new sandbox.
+  await runOver(connection, "echo kept > /tmp/egress-note");
+  await connection.extensions.setNetworkPolicy({
+    allow: [hostName],
+    subnets: { allow: [`${address}/32`] },
+  });
+  assert.equal(await status(`curl ${byAddress}/`), "200", "an allowed range admits its addresses");
+  await connection.extensions.setNetworkPolicy({
+    allow: [hostName],
+    subnets: { allow: [`${address}/32`], deny: [`${address}/32`] },
+  });
+  assert.equal(
+    await status(`curl ${byAddress}/`),
+    "403",
+    "a denied range overrides an allowed one",
+  );
+  // The name may resolve to other addresses too, which the proxy then tries
+  // and finds nothing listening on, so the refusal is a 403 or a 502.
+  assert.notEqual(
+    await status(`curl ${byName}/`),
+    "200",
+    "a denied range overrides an allowed domain",
+  );
+
+  // deny-all withdraws access from the same sandbox, at once.
+  await connection.extensions.setNetworkPolicy({ allow: ["*"] });
+  assert.equal(await status(`curl ${byName}/`), "200", "a wildcard allows any domain");
+  await connection.extensions.setNetworkPolicy("deny-all");
+  const afterDeny = await runOver(connection, `curl -sS --max-time 5 ${byName}/`);
+  assert.notEqual(afterDeny.stdout, "reached /", "deny-all must withdraw access");
+  assert.equal(
+    (await runOver(connection, "cat /tmp/egress-note")).stdout,
+    "kept\n",
+    "moving among restricted policies must not restart the sandbox",
+  );
+
+  await assert.rejects(
+    connection.extensions.setNetworkPolicy({
+      allow: { [hostName]: [{ transform: [{ headers: { authorization: "x" } }] }] },
+    } as never),
+    /rules on a domain/,
+  );
+
+  await connection.stop();
+  await environment.onSessionEnd(ctx, null, { reason: "deleted" });
+  server.closeAllConnections();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  console.log(
+    "EGRESS SMOKE: allow-list by domain and range, tunnel, refusal, live policy change, and deny-all held under real bwrap",
+  );
+}
+
+/**
  * What the sandbox itself guarantees, probed from inside a command: the
  * workspace and cwd, a read-only host root, no host environment, hidden cache
  * roots, a private PID table, the network switch, executable bits across the
@@ -597,6 +732,7 @@ async function main(): Promise<void> {
     await boundarySmoke(appRoot, hostFilePath);
     await connectionProviderSmoke(appRoot);
     await sharedSandboxSmoke(appRoot);
+    await egressSmoke(appRoot);
 
     console.log("BWRAP SMOKE OK");
   } finally {
