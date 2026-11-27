@@ -102,14 +102,13 @@ eve calls the provider through its connection contract and builds the sandbox se
   read-write at `/workspace`, a tmpfs `/tmp`, PID/IPC/UTS namespaces unshared,
   `--die-with-parent`, `--clearenv` — that then idles. Every command joins the holder's
   namespaces through a short Python helper and runs under `env -i`, so commands share `/tmp`
-  and one process table. The helper joins with one `setns(2)` on a pidfd rather than
-  `nsenter`: bwrap nests the sandbox's user namespace, and joining namespace by namespace, as
-  the `nsenter` of util-linux 2.39 does, is refused there. Each command is bounded by
-  `runTimeoutMs` and `maxOutputBytes` and counts against `maxConcurrentProcesses`; its
-  process group is killed when a limit or the caller's abort signal fires. A holder that has
-  died — a sandboxed command can kill it, and so can the host under memory pressure — is
-  replaced by the next command; the workspace is untouched and only the sandbox's processes
-  and `/tmp` are lost.
+  and one process table. The helper joins every namespace with one `setns(2)` on a pidfd:
+  bwrap nests the sandbox's user namespace inside the one that owns the others, and only a
+  single call may join both. Each command is bounded by `runTimeoutMs` and `maxOutputBytes`
+  and counts against `maxConcurrentProcesses`; its process group is killed when a limit or
+  the caller's abort signal fires. A holder that has died — a sandboxed command can kill it,
+  and so can the host under memory pressure — is replaced by the next command; the workspace
+  is untouched and only the sandbox's processes and `/tmp` are lost.
 - **connection.readFile / writeFiles / removePath**: host-side operations on the session
   directory; no subprocess. Writes and removals outside `/workspace` are refused.
 - **connection.stop**: kills the session's commands and its holder, which ends every other

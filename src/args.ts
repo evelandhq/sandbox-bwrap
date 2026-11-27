@@ -118,10 +118,10 @@ export const SANDBOX_JOIN_FAILED_EXIT_CODE = 125;
  * It moves into the holder's namespaces with one `setns(pidfd, flags)`, which
  * is the only way an unprivileged process can: bwrap's `--dev` leaves the
  * sandbox's processes in a second, nested user namespace, while the mount,
- * PID, and IPC namespaces belong to the first. Joining them one at a time, as
- * the `nsenter` of util-linux 2.39 does, enters the inner user namespace and
- * is then refused the rest. The single call is checked against the caller's
- * original credentials, which own the outer namespace. It needs Linux 5.8.
+ * PID, and IPC namespaces belong to the first. One `setns` per namespace
+ * would enter the inner user namespace and then be refused the rest. The
+ * single call is checked against the caller's original credentials, which
+ * own the outer namespace. It needs Linux 5.8.
  *
  * A pid can be reused, so before joining the helper checks that the process
  * it opened is in the mount namespace bwrap reported; anything else is not

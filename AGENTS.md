@@ -56,12 +56,12 @@ non-obvious behaviors are deliberate and documented there:
   directory from a `cd` in the join script, because bwrap's `--clearenv` and
   `--chdir` belong to the holder. Nothing may reach a command through the
   host process's environment.
-- The join is one `setns(pidfd, flags)`, not `nsenter` and not one `setns` per
-  namespace. bwrap's `--dev` puts the sandbox's processes in a nested user
-  namespace while the mount, PID, and IPC namespaces belong to the outer one;
-  only the single call, checked against the caller's original credentials,
-  is allowed to join both. The `nsenter` of util-linux 2.41 joins this way and
-  the one in 2.39, which Ubuntu 24.04 ships, does not, so a join that passes
+- The join is one `setns(pidfd, flags)`, never one `setns` per namespace.
+  bwrap's `--dev` puts the sandbox's processes in a nested user namespace
+  while the mount, PID, and IPC namespaces belong to the outer one; only the
+  single call, checked against the caller's original credentials, may join
+  both. The `nsenter` of util-linux 2.39, which Ubuntu 24.04 ships, joins
+  namespace by namespace, so it is not a substitute, and a join that passes
   on a newer host can still fail there: run `infra/smoke.sh`.
 
 ## The eve peer range
