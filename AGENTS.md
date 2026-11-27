@@ -8,9 +8,12 @@ agents; user-facing behavior belongs in `README.md`.
 One published package, `@evelandhq/sandbox-bwrap`: a bubblewrap-backed sandbox
 provider for eve 1.x. It implements eve's connection provider contract
 (`eve/sandbox/provider`): `src/provider-definition.ts` is the lifecycle
-(`prepare`, `start`, `resume`, `onSessionEnd`), `src/connection.ts` the
-connection eve derives the sandbox session from, and `src/session.ts` /
-`src/runtime.ts` the per-workspace compute generations underneath. The ready
+(`prepare`, `start`, `resume`, `onSessionEnd`, `onSessionIdle`),
+`src/connection.ts` the connection eve derives the sandbox session from, and
+`src/session.ts` / `src/runtime.ts` the per-workspace compute generations
+underneath. A generation's sandbox is a holder (`src/holder.ts`): one
+long-lived bwrap that every command joins through a Python helper, with the
+holder's argv, the join's argv, and the helper's source in `src/args.ts`. The ready
 `BwrapSandbox` is exported from `/provider`; the root exports the plain
 definition and imports nothing from eve at run time. It was extracted from the
 eveland monorepo (`packages/sandbox-bwrap`) with its full history; commits
@@ -41,8 +44,25 @@ non-obvious behaviors are deliberate and documented there:
   workspace directory on disk. It is durable state.
 - The cache is never pruned on its own. See **Disk usage**.
 - `runTimeoutMs` and `maxOutputBytes` apply to every spawned command, because
-  eve builds `run()` from `spawn()` and bwrap's PID namespace ends everything a
-  command started when it exits. See **How it works**.
+  eve builds `run()` from `spawn()`. They deliberately do not reach a process a
+  command left running in its own process group: eve's bash tool depends on
+  such a process surviving, and the holder's lifetime is its bound. See
+  **Background processes**.
+- Commands share one holder per network policy. Do not go back to a bwrap per
+  command, and do not let a policy change keep the old holder: `/tmp`, the
+  process table, and the guarantee that `deny-all` ends what ran with the
+  network all depend on it.
+- A joined command gets its environment from `env -i` and its working
+  directory from a `cd` in the join script, because bwrap's `--clearenv` and
+  `--chdir` belong to the holder. Nothing may reach a command through the
+  host process's environment.
+- The join is one `setns(pidfd, flags)`, not `nsenter` and not one `setns` per
+  namespace. bwrap's `--dev` puts the sandbox's processes in a nested user
+  namespace while the mount, PID, and IPC namespaces belong to the outer one;
+  only the single call, checked against the caller's original credentials,
+  is allowed to join both. The `nsenter` of util-linux 2.41 joins this way and
+  the one in 2.39, which Ubuntu 24.04 ships, does not, so a join that passes
+  on a newer host can still fail there: run `infra/smoke.sh`.
 
 ## The eve peer range
 
@@ -80,10 +100,14 @@ typechecking.
 - Unit tests inject the process runner (`ProcessRunner` in `src/process.ts`), so
   they never execute bwrap and run anywhere, including macOS. Keep it that way:
   a unit test that requires a real `bwrap` binary belongs in
-  `src/integration/bwrap-smoke.ts` instead.
-- Anything touching the generated argv (`src/args.ts`) or prerequisite detection
-  (`src/process.ts`) should be exercised by the real-binary smoke test, not only
-  by unit tests. Argv that looks right and a kernel that accepts it are
+  `src/integration/bwrap-smoke.ts` instead. A fake runner answers a holder
+  spawn through `withFakeHolder` in `src/provider.test-support.ts`, which
+  keeps holder spawns out of the fake's own call records.
+- Anything touching the generated argv (`src/args.ts`), the holder
+  (`src/holder.ts`), or prerequisite detection (`src/process.ts`) should be
+  exercised by the real-binary smoke test, not only by unit tests. What
+  commands share across a holder is a property of kernel namespaces that no
+  runner test double can show. Argv that looks right and a kernel that accepts it are
   different things.
 - Ground changes in the real files and real runtime behavior. Do not guess at
   eve's contract when the installed `eve/sandbox/provider` types and
@@ -99,8 +123,8 @@ That is exactly what CI runs, minus the two jobs that need Linux or a registry:
 
 - `bash infra/smoke.sh` — real bwrap in a Lima VM, run as an unprivileged user
   under `NoNewPrivileges` / `ProtectSystem=strict` / `PrivateTmp`. Prints
-  `BWRAP SMOKE OK`. **Run this before pushing changes to `src/args.ts` or
-  `src/process.ts`.** CI's smoke job covers the unprivileged-user case, which is
+  `BWRAP SMOKE OK`. **Run this before pushing changes to `src/args.ts`,
+  `src/holder.ts`, or `src/process.ts`.** CI's smoke job covers the unprivileged-user case, which is
   the AppArmor/userns failure mode, but deliberately does not reproduce the
   systemd hardening — this script is the only thing that does.
 - The `pack` job — packs the tarball and imports it from a clean project.

@@ -2,8 +2,9 @@
 
 A [bubblewrap](https://github.com/containers/bubblewrap) sandbox provider for
 [eve](https://www.npmjs.com/package/eve) agents. It gives agent-executed code a real Linux
-sandbox — actual binaries, an isolated writable workspace, coarse network control — with
-nothing but the `bwrap` binary and unprivileged user namespaces: no Docker daemon, no KVM.
+sandbox — actual binaries, an isolated writable workspace, background processes, coarse
+network control — with nothing but the `bwrap` binary, Python 3, and unprivileged user
+namespaces: no Docker daemon, no KVM.
 
 ## Why
 
@@ -46,6 +47,10 @@ export default defineSandbox(() => environment.open());
 - `environment.open({ networkPolicy: "deny-all" })` sets a session's initial network policy.
   It is recorded in the session state and applied again after a restart. The session also
   has `setNetworkPolicy("allow-all" | "deny-all")`.
+- `idleTimeoutMs`, eve's standard environment option from eve 1.1 on, stops a session's
+  sandbox once the session has been idle that long (5 minutes when omitted). The sandbox's
+  processes end and its workspace stays; the next turn that uses it starts a new sandbox
+  over the same files. This is what bounds a process left running in the background.
 - eve resumes a session from its recorded state alone. The template is not needed, so with a
   shared `cacheDir` a session keeps its workspace when it moves to a newer deployment.
 - The package root imports nothing from eve at run time. It exports the plain definition,
@@ -56,17 +61,18 @@ export default defineSandbox(() => environment.open());
 
 ### Options
 
-| Option                   | Default                   | Meaning                                                                                                                                                                                                                                                                                                                   |
-| ------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `env`                    | `{}`                      | Environment variables set for every sandboxed command, above `AI_AGENT=eve` and below each call's own `env`.                                                                                                                                                                                                              |
-| `networkPolicy`          | `"allow-all"`             | `"allow-all"` shares the host network; `"deny-all"` runs each command with no network (`--unshare-net`). Domain-level and header-rewriting policies are rejected, not weakened.                                                                                                                                           |
-| `hidePaths`              | `[]`                      | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                |
-| `bwrapPath`              | `"bwrap"`                 | bwrap executable to invoke.                                                                                                                                                                                                                                                                                               |
-| `cacheDir`               | eve's sandbox storage dir | Absolute directory holding durable session workspaces. Templates always stay in eve's storage directory, where eve records them. Pin this outside the release directory: eve keys sandboxes per durable session, not per deployment, so a build-relative default loses every session's `/workspace` on the next redeploy. |
-| `runTimeoutMs`           | `600000`                  | Hard wall-clock limit for every sandboxed command. At the limit the command's whole bwrap process group is killed and `wait()` rejects with `command timed out after <n> ms`. A long-running process started with `spawn()` (a dev server, a watcher) is bounded too; raise the limit or set `null` to disable it.        |
-| `maxConcurrentProcesses` | `64`                      | Maximum live commands in one session's compute generation. A spawned process counts until it actually exits, even when its caller never waits. Set `null` to disable.                                                                                                                                                     |
-| `maxOutputBytes`         | `16777216`                | Maximum combined stdout and stderr bytes one command delivers to its caller, counted as the caller reads them. At the limit both streams fail with `command output exceeded <n> bytes` after the bytes that fit, the process group is killed, and `wait()` rejects with the same error. Set `null` to disable.            |
-| `onEvent`                | `undefined`               | Best-effort structured lifecycle sink for generation, command, and cleanup events. Sink failures are ignored so telemetry cannot change command behavior.                                                                                                                                                                 |
+| Option                   | Default                   | Meaning                                                                                                                                                                                                                                                                                                                                                                               |
+| ------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `env`                    | `{}`                      | Environment variables set for every sandboxed command, above `AI_AGENT=eve` and below each call's own `env`.                                                                                                                                                                                                                                                                          |
+| `networkPolicy`          | `"allow-all"`             | `"allow-all"` shares the host network; `"deny-all"` gives the sandbox no network (`--unshare-net`). Domain-level and header-rewriting policies are rejected, not weakened.                                                                                                                                                                                                            |
+| `hidePaths`              | `[]`                      | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                                                                            |
+| `bwrapPath`              | `"bwrap"`                 | bwrap executable to invoke.                                                                                                                                                                                                                                                                                                                                                           |
+| `pythonPath`             | `"python3"`               | Python 3 executable. Every command joins its sandbox through a short helper it runs.                                                                                                                                                                                                                                                                                                  |
+| `cacheDir`               | eve's sandbox storage dir | Absolute directory holding durable session workspaces. Templates always stay in eve's storage directory, where eve records them. Pin this outside the release directory: eve keys sandboxes per durable session, not per deployment, so a build-relative default loses every session's `/workspace` on the next redeploy.                                                             |
+| `runTimeoutMs`           | `600000`                  | Hard wall-clock limit for every command a caller starts. At the limit the command's process group is killed and `wait()` rejects with `command timed out after <n> ms`. A long-running process started with `spawn()` (a dev server, a watcher) is bounded too. A process a command leaves behind in its own process group is not; see [Background processes](#background-processes). |
+| `maxConcurrentProcesses` | `64`                      | Maximum commands running at once in one session's sandbox. A spawned process counts until it actually exits, even when its caller never waits. Processes left running in the background are not counted. Set `null` to disable.                                                                                                                                                       |
+| `maxOutputBytes`         | `16777216`                | Maximum combined stdout and stderr bytes one command delivers to its caller, counted as the caller reads them. At the limit both streams fail with `command output exceeded <n> bytes` after the bytes that fit, the process group is killed, and `wait()` rejects with the same error. Set `null` to disable.                                                                        |
+| `onEvent`                | `undefined`               | Best-effort structured lifecycle sink for generation, command, and cleanup events. Sink failures are ignored so telemetry cannot change command behavior.                                                                                                                                                                                                                             |
 
 `prepare` is eve's standard environment option; eve runs it itself while it prepares the
 template.
@@ -91,20 +97,34 @@ eve calls the provider through its connection contract and builds the sandbox se
 - **resume** (later steps, and after restarts): reopens the recorded workspace and applies the
   recorded network policy to a new compute generation. A workspace that is gone throws
   `SandboxSessionGoneError`, on which eve starts a fresh sandbox.
-- **connection.spawn**: every command is one transient bwrap invocation — read-only host
-  root, the session directory bound read-write at `/workspace`, a fresh tmpfs `/tmp`,
-  PID/IPC/UTS namespaces unshared, `--die-with-parent`, `--clearenv`. Each command is bounded
-  by `runTimeoutMs` and `maxOutputBytes` and counts against `maxConcurrentProcesses`; its
-  whole process group is killed when a limit or the caller's abort signal fires. eve builds
-  `run()` from `spawn()`, so the provider cannot tell a short command from a long-running
-  one, and it does not need to: bwrap's PID namespace ends every process a command started
-  when that command exits, so bounding each command bounds all work in the sandbox.
+- **connection.spawn**: the first command of a compute generation starts the sandbox's
+  **holder**, one long-lived bwrap — read-only host root, the session directory bound
+  read-write at `/workspace`, a tmpfs `/tmp`, PID/IPC/UTS namespaces unshared,
+  `--die-with-parent`, `--clearenv` — that then idles. Every command joins the holder's
+  namespaces through a short Python helper and runs under `env -i`, so commands share `/tmp`
+  and one process table. The helper joins with one `setns(2)` on a pidfd rather than
+  `nsenter`: bwrap nests the sandbox's user namespace, and joining namespace by namespace, as
+  the `nsenter` of util-linux 2.39 does, is refused there. Each command is bounded by
+  `runTimeoutMs` and `maxOutputBytes` and counts against `maxConcurrentProcesses`; its
+  process group is killed when a limit or the caller's abort signal fires. A holder that has
+  died — a sandboxed command can kill it, and so can the host under memory pressure — is
+  replaced by the next command; the workspace is untouched and only the sandbox's processes
+  and `/tmp` are lost.
 - **connection.readFile / writeFiles / removePath**: host-side operations on the session
   directory; no subprocess. Writes and removals outside `/workspace` are refused.
-- **connection.stop**: kills the session's processes and keeps the workspace. The next
-  `start` or `resume` opens a fresh compute generation over the same files.
+- **connection.stop**: kills the session's commands and its holder, which ends every other
+  process in the sandbox, and keeps the workspace. The next `start` or `resume` opens a
+  fresh compute generation over the same files.
 - **connection.close** (end of every step): releases nothing. The compute generation outlives
-  the step; `stop`, server exit, and bwrap's `--die-with-parent` end it.
+  the step; `stop`, the idle stop, server exit, and bwrap's `--die-with-parent` end it.
+- **setNetworkPolicy**: a holder's network namespace is fixed when it starts, so a different
+  policy ends the holder and the next command starts one under the new policy. Whatever was
+  left running under the old policy ends with it — a process started with the network cannot
+  keep it after `"deny-all"` — and `/tmp` starts empty again. Commands still running when the
+  policy changes finish first.
+- **onSessionIdle** (the session has been idle for `idleTimeoutMs`, eve 1.1 and later): stops
+  the live generation if this process holds one, as `connection.stop` does, and starts
+  nothing otherwise.
 - **onSessionEnd** (a durable session completed, expired or failed, or `sandbox.delete()`):
   stops the live generation if this process holds one and removes the workspace and its
   metadata, from the recorded state alone or, when eve has none, from the session id. The
@@ -118,14 +138,37 @@ What this means for commands in the sandbox:
   root is read-only and commands run as the agent's unprivileged user, so `apt-get`, `sudo`,
   and eve's `installCodeTooling` fail. Install user-level tools into the workspace (for
   example with `pip install --user` or `npm install --prefix`), or onto the host.
-- Each command gets its own empty `/tmp`, and no process outlives the command that started
-  it. Keep files that must persist between commands under `/workspace`. For eve's bash tool
-  this means a command still running after the tool's yield window is not handed off as a
-  background job: the tool waits for it to finish, within `runTimeoutMs`.
+- `/tmp` and the process table belong to the sandbox, not to one command: a later command
+  sees the files an earlier one left in `/tmp` and can signal the processes it left running.
+  Both last until the sandbox's compute stops; only `/workspace` survives that.
 - `AI_AGENT=eve` (eve's `SANDBOX_AGENT_ENV`) is set in every command, beneath `env` and each
   call's own `env`, so agent-aware CLIs skip interactive prompts.
 - Keyed `invokeTool` calls cannot keep a sandbox (`toolSessions` is not set): eve never ends
   such sandboxes, and this provider has no retention bound for them.
+
+### Background processes
+
+A process a command puts in the background (`server &`) keeps running after the command
+returns. Redirect its output: a background process that still holds the command's stdout or
+stderr keeps those streams open, and a caller reading them to the end waits with it. eve's
+bash tool relies on background processes: a command still running after the tool's yield
+window is handed off as a background job, and later commands check on it through the files
+it writes under `/tmp/.eve/jobs` or stop it with `kill`.
+
+Such a process is not a command the provider is waiting on, so `runTimeoutMs`,
+`maxOutputBytes`, and `maxConcurrentProcesses` do not apply to it. It ends when the
+sandbox's compute does:
+
+- the session goes idle for `idleTimeoutMs` (eve 1.1 and later; on eve 1.0 nothing stops an
+  idle sandbox, so a background process there runs until one of the following);
+- `sandbox.stop()`, the session's end, or `sandbox.delete()`;
+- `setNetworkPolicy()` moves to a different policy;
+- the agent process exits.
+
+A command that runs past `runTimeoutMs` is killed together with its process group, which is
+everything it started that did not move to a process group of its own, as `setsid` or a job
+under `set -m` does. `/tmp` is a tmpfs, so what is written there counts against the memory
+of the cgroup the agent runs in until the sandbox stops.
 
 ## Disk usage and cache management
 
@@ -183,12 +226,24 @@ telemetry, not part of the sandbox boundary.
 
 ## Security boundary
 
-- The host process environment is **never** forwarded: every command runs under
-  `--clearenv` with `PATH`, `HOME=/workspace`, `LANG`, `AI_AGENT=eve`, your configured
-  `env`, and the call's own `env`. Secrets in the agent's `process.env` stay out of
-  sandboxed code.
+- The host process environment is **never** forwarded: the holder runs under `--clearenv`,
+  and every command under `env -i` with `PATH`, `HOME=/workspace`, `LANG`, `AI_AGENT=eve`,
+  your configured `env`, and the call's own `env`. Secrets in the agent's `process.env` stay
+  out of sandboxed code. A call's own `env` is set for that command only; it is not in the
+  holder's environment.
+- Commands of one session share a sandbox: they can read each other's `/tmp`, signal each
+  other's processes, and kill the holder, which ends the sandbox's processes and nothing
+  else. That is one trust domain, the session's.
+- A command joins the sandbox through the helper, not through a bwrap of its own. Like a
+  bwrap child it runs as the agent's own uid, with no capabilities and with `no_new_privs`
+  set, and the user namespace maps that one uid, so a setuid or file-capability binary owned
+  by anyone else, root included, gains nothing. Before joining, the helper checks that the
+  process it is about to join is in the mount namespace bwrap reported for the holder, so a
+  reused pid is refused instead of joined.
 - The cache roots — every session workspace and template of the app — are hidden from
-  sandboxed commands behind a tmpfs, as are `hidePaths`. The rest of the host filesystem is
+  sandboxed commands behind a tmpfs, as are `hidePaths`. Which paths exist is decided when
+  the holder starts: a path created on the host afterwards is hidden from the next holder
+  on. The rest of the host filesystem is
   _visible read-only_. To keep other applications' files out of view, run the agent itself
   in a boundary that hides them (a systemd unit with `TemporaryFileSystem=`/`BindPaths=`,
   or a container); bwrap only re-exposes what the agent process can already see.
@@ -204,9 +259,10 @@ telemetry, not part of the sandbox boundary.
   injection, not multi-tenant isolation. If untrusted tenants, or code that routinely
   handles customer credentials, must run here, use VM-level isolation instead.
 - CPU, memory, and PID limits are inherited from the cgroup the agent runs in, which covers
-  sandbox children too. `maxConcurrentProcesses` is an admission bound, not a kernel PID or
-  thread quota; `runTimeoutMs` and `maxOutputBytes` bound each command's wall-clock time and
-  delivered output. No per-command cgroup or CPU/memory quota is created.
+  sandbox children too, background processes and `/tmp` included. `maxConcurrentProcesses`
+  is an admission bound, not a kernel PID or thread quota; `runTimeoutMs` and
+  `maxOutputBytes` bound each command's wall-clock time and delivered output. No per-command
+  cgroup or CPU/memory quota is created.
 - `writeFiles` and `removePath` verify containment with a realpath-aware check
   (`isWithinWorkspaceReal`): they resolve symlinks along the path and re-check that the real
   target lands inside the real session directory, closing the escape where sandboxed code
@@ -251,10 +307,17 @@ telemetry, not part of the sandbox boundary.
   directory onto it but cannot create the mount point itself, because the host root is
   bound read-only first. If it is missing, the provider fails with an actionable message
   before invoking bwrap.
+- Linux 5.8 or newer, and Python 3 with `ctypes` on the agent's `PATH` (or at
+  `pythonPath`), plus `/usr/bin/env`. Every command joins its sandbox through them: the
+  join is one `setns(2)` on a pidfd, which is what the kernel version is for. It needs no
+  privilege beyond what bwrap already needs, because the agent's user owns the holder's
+  user namespace. A missing Python fails with an actionable message before anything runs;
+  an older kernel fails each command with exit code 125 and the reason on its stderr.
 - `bash`, plus whatever tools the agent needs (`node`, `git`, …), on the host `PATH`.
 - Works under systemd hardening (`NoNewPrivileges=yes`, `ProtectSystem=strict`): the
   packaged `bwrap` is not setuid, so it needs no privilege escalation, only the AppArmor
-  grant above. systemd's PID 1 reaps orphaned bwrap descendants.
+  grant above. A unit that sets `RestrictNamespaces=` or filters `setns` or `pidfd_open`
+  breaks bwrap, the join, or both. systemd's PID 1 reaps orphaned bwrap descendants.
 - Inside a container, run with an init process (`docker run --init`) so orphaned bwrap
   descendants are reaped instead of accumulating as zombies, and grant what nested bwrap
   needs to create namespaces (for example `--cap-add SYS_ADMIN --cap-add NET_ADMIN
@@ -270,7 +333,7 @@ telemetry, not part of the sandbox boundary.
   provisions a Lima VM (`brew install lima`), streams this worktree in, and runs the test as
   an unprivileged user under the systemd hardening a deployed agent gets
   (`NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`). Prints
-  `BWRAP SMOKE OK`. Run it before pushing anything that touches `src/args.ts` or
+  `BWRAP SMOKE OK`. Run it before pushing anything that touches `src/args.ts`, `src/holder.ts`, or
   `src/process.ts`: CI's smoke job covers the unprivileged-user case but not the systemd
   constraints, and argv that looks right is not the same as a kernel that accepts it.
 - `pnpm tsx src/integration/bwrap-smoke.ts` — the same test, run directly. Needs a Linux

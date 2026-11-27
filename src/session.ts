@@ -3,7 +3,13 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
-import { buildBwrapExecArgs, DEFAULT_SANDBOX_PATH, SANDBOX_AGENT_ENV } from "./args.js";
+import {
+  buildBwrapHolderArgs,
+  buildSandboxJoinArgs,
+  DEFAULT_SANDBOX_PATH,
+  SANDBOX_AGENT_ENV,
+} from "./args.js";
+import { startBwrapHolder, type BwrapHolder } from "./holder.js";
 import type { ResolvedBwrapSandboxOptions } from "./options.js";
 import {
   isWithinWorkspaceReal,
@@ -56,9 +62,13 @@ export interface BwrapSpawnOptions {
 }
 
 /**
- * One durable workspace's live compute generation: the commands it runs and
- * host-side file access to its workspace. It tracks the processes it spawned
- * so `killAll()` can leave nothing running.
+ * One durable workspace's live compute generation: the sandbox its commands
+ * share and host-side file access to its workspace.
+ *
+ * The sandbox is a holder, one long-lived bwrap that the first command
+ * starts, and every command joins it. Commands therefore share `/tmp` and a
+ * process table, and a process may outlive the command that started it: it
+ * runs until the holder ends, which `killAll()` does.
  */
 export interface BwrapSession {
   spawn(options: BwrapSpawnOptions): Promise<SpawnedProcess>;
@@ -74,10 +84,16 @@ export interface BwrapSession {
   }): Promise<void>;
   /**
    * Coarse egress switch. Only `"allow-all"` and `"deny-all"` are accepted,
-   * checked at run time because callers can pass any of eve's policies.
+   * checked at run time because callers can pass any of eve's policies. A
+   * holder's network namespace cannot change, so a different policy ends the
+   * holder and with it whatever was left running under the old one; commands
+   * still in flight finish first.
    */
   setNetworkPolicy(policy: unknown): Promise<void>;
-  /** Kills every process this session spawned that has not yet exited. Idempotent. */
+  /**
+   * Ends the sandbox: kills every command still running and the holder, which
+   * takes every other process in the sandbox with it. Idempotent.
+   */
   killAll(): Promise<void>;
   /** Internal compute-generation state used to coordinate repeated opens. */
   lifecycleState(): "running" | "stopping" | "stopped";
@@ -125,9 +141,119 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     terminate(reason: "killed" | "cleanup"): Promise<void>;
   };
   const live = new Set<TrackedProcess>();
+  /** Commands waiting for their holder: admitted, not yet a process. */
+  let admitting = 0;
   let lifecycle: "running" | "stopping" | "stopped" = "running";
   let cleanupPromise: Promise<void> | undefined;
   let stoppedNotified = false;
+
+  /**
+   * A holder and the commands running in it. A slot is retired when the
+   * network policy moves away from the one it was started under: it takes no
+   * new commands and is stopped once the commands it has have exited.
+   */
+  interface HolderSlot {
+    readonly shareNetwork: boolean;
+    readonly ready: Promise<BwrapHolder>;
+    commands: number;
+    retired: boolean;
+    stopping?: Promise<void>;
+  }
+  /** Every holder not yet stopped: the current one and any still draining. */
+  const slots = new Set<HolderSlot>();
+  let current: HolderSlot | undefined;
+
+  function startSlot(shareNetwork: boolean): HolderSlot {
+    // Evaluated when the sandbox starts, not per command: a path that appears
+    // on the host afterwards is not hidden until the next holder.
+    const hidePaths = [...new Set([...cacheRoots, ...options.hidePaths])].filter((path) =>
+      existsSync(path),
+    );
+    const slot: HolderSlot = {
+      shareNetwork,
+      ready: startBwrapHolder({
+        runner,
+        shareNetwork,
+        argv: buildBwrapHolderArgs({
+          bwrapPath: options.bwrapPath,
+          workspaceDir,
+          hidePaths,
+          shareNetwork,
+        }),
+      }),
+      commands: 0,
+      retired: false,
+    };
+    slot.ready.catch(() => {});
+    slots.add(slot);
+    return slot;
+  }
+
+  async function stopSlot(slot: HolderSlot): Promise<void> {
+    slot.stopping ??= (async () => {
+      // A holder that never started has nothing to stop.
+      const holder = await slot.ready.catch(() => undefined);
+      await holder?.stop();
+      slots.delete(slot);
+    })();
+    try {
+      await slot.stopping;
+    } catch (error) {
+      slot.stopping = undefined;
+      throw error;
+    }
+  }
+
+  /**
+   * Takes a slot out of service. With no command running in it the holder is
+   * stopped now, and the returned promise settles with that stop; otherwise
+   * the last of its commands to exit stops it. A failed stop leaves the slot
+   * for `killAll()` to retry.
+   */
+  async function retireSlot(slot: HolderSlot): Promise<void> {
+    slot.retired = true;
+    if (current === slot) current = undefined;
+    if (slot.commands === 0) await stopSlot(slot);
+  }
+
+  function releaseSlot(slot: HolderSlot) {
+    slot.commands -= 1;
+    if (slot.retired && slot.commands === 0) void stopSlot(slot).catch(() => {});
+  }
+
+  /**
+   * The holder for the current network policy, started on first use, with one
+   * command counted against it. A holder that has died -- a sandboxed command
+   * can kill it, and so can the host under memory pressure -- is replaced
+   * once, since its workspace is intact and only its processes are gone.
+   */
+  async function acquireHolder(): Promise<{ slot: HolderSlot; holder: BwrapHolder }> {
+    for (let attempt = 0; ; attempt += 1) {
+      const shareNetwork = networkPolicy === "allow-all";
+      if (current && current.shareNetwork !== shareNetwork) {
+        void retireSlot(current).catch(() => {});
+      }
+      current ??= startSlot(shareNetwork);
+      const slot = current;
+      slot.commands += 1;
+      let holder: BwrapHolder;
+      try {
+        holder = await slot.ready;
+      } catch (error) {
+        slot.commands -= 1;
+        slots.delete(slot);
+        if (current === slot) current = undefined;
+        throw error;
+      }
+      if (holder.alive()) return { slot, holder };
+      slot.commands -= 1;
+      slots.delete(slot);
+      if (current === slot) current = undefined;
+      if (attempt > 0) {
+        throw new Error("bwrap sandbox: the sandbox exited as soon as it started");
+      }
+    }
+  }
 
   emit({ type: "generation.started" });
 
@@ -135,9 +261,10 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
    * Applies `runTimeoutMs` and `maxOutputBytes` to one spawned process.
    *
    * Every command reaches this package as a spawn -- eve builds `run()`
-   * from `spawn()` itself -- and bwrap's PID namespace ends every process a
-   * command started when that command exits, so bounding each spawn bounds all
-   * sandboxed work. A timeout kills the process group and rejects `wait()`.
+   * from `spawn()` itself -- so these limits bound every command a caller is
+   * waiting on. They do not bound a process a command left running in its own
+   * process group: that one runs until the holder ends. A timeout kills the
+   * command's process group and rejects `wait()`.
    * Output is counted as the caller reads it: both streams together deliver at
    * most `maxOutputBytes`, after which they fail with the limit error, the
    * process group is killed, and `wait()` rejects with the same error. The
@@ -219,7 +346,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     };
   }
 
-  function track(proc: SpawnedProcess, limit: AbortController): SpawnedProcess {
+  function track(proc: SpawnedProcess, limit: AbortController, onExit: () => void): SpawnedProcess {
     const commandId = randomUUID();
     const startedAt = Date.now();
     let stdoutBytes = 0;
@@ -263,6 +390,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
         (result) => {
           limits.settle();
           live.delete(wrapped);
+          onExit();
           emit({
             type: "command.finished",
             commandId,
@@ -278,6 +406,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
         (error: unknown) => {
           limits.settle();
           live.delete(wrapped);
+          onExit();
           emit({
             type: "command.finished",
             commandId,
@@ -305,7 +434,10 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     if (lifecycle !== "running") {
       throw new Error(`bwrap sandbox: compute generation is ${lifecycle}; refusing to spawn`);
     }
-    if (options.maxConcurrentProcesses !== null && live.size >= options.maxConcurrentProcesses) {
+    if (
+      options.maxConcurrentProcesses !== null &&
+      live.size + admitting >= options.maxConcurrentProcesses
+    ) {
       throw new Error(
         `bwrap sandbox: concurrent process limit of ${options.maxConcurrentProcesses} reached`,
       );
@@ -318,16 +450,28 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       ...options.env,
       ...spawnOptions.env,
     };
-    const hidePaths = [...new Set([...cacheRoots, ...options.hidePaths])].filter((path) =>
-      existsSync(path),
-    );
-    const argv = buildBwrapExecArgs({
-      bwrapPath: options.bwrapPath,
-      workspaceDir,
-      hidePaths,
-      shareNetwork: networkPolicy === "allow-all",
+    const chdir = resolveWorkspacePath(spawnOptions.workingDirectory ?? WORKSPACE_ROOT);
+    // Counted from here, before the holder is ready, so commands issued
+    // together are admitted against the limit together.
+    admitting += 1;
+    let acquired: { slot: HolderSlot; holder: BwrapHolder };
+    try {
+      acquired = await acquireHolder();
+    } finally {
+      admitting -= 1;
+    }
+    const { slot, holder } = acquired;
+    if (lifecycle !== "running") {
+      releaseSlot(slot);
+      throw new Error(`bwrap sandbox: compute generation is ${lifecycle}; refusing to spawn`);
+    }
+    const argv = buildSandboxJoinArgs({
+      pythonPath: options.pythonPath,
+      targetPid: holder.targetPid,
+      ...(holder.mountNamespace === undefined ? {} : { mountNamespace: holder.mountNamespace }),
+      joinNetwork: !holder.shareNetwork,
       env,
-      chdir: resolveWorkspacePath(spawnOptions.workingDirectory ?? WORKSPACE_ROOT),
+      chdir,
       command: spawnOptions.command,
     });
     const limit = new AbortController();
@@ -335,13 +479,17 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       spawnOptions.signal === undefined
         ? limit.signal
         : AbortSignal.any([spawnOptions.signal, limit.signal]);
-    return track(
-      runner.spawn(argv, {
+    let proc: SpawnedProcess;
+    try {
+      proc = runner.spawn(argv, {
         abortSignal,
         ...(spawnOptions.stdin === true ? { stdin: true } : {}),
-      }),
-      limit,
-    );
+      });
+    } catch (error) {
+      releaseSlot(slot);
+      throw error;
+    }
+    return track(proc, limit, () => releaseSlot(slot));
   }
 
   return {
@@ -359,6 +507,12 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
         emit({ type: "cleanup.started", requestedProcesses: pending.length });
         const results = await Promise.allSettled(
           pending.map(async (proc) => await proc.terminate("cleanup")),
+        );
+        // The holders go last and take with them every process no handle
+        // tracks: whatever a command left running in the sandbox.
+        current = undefined;
+        results.push(
+          ...(await Promise.allSettled([...slots].map(async (slot) => await stopSlot(slot)))),
         );
         const failures = results.flatMap((result) =>
           result.status === "rejected" ? [result.reason] : [],
@@ -422,6 +576,9 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
         );
       }
       networkPolicy = policy;
+      // Awaited, so that once `deny-all` has resolved nothing an earlier
+      // command left running still has the network.
+      if (current && current.shareNetwork !== (policy === "allow-all")) await retireSlot(current);
     },
 
     async readFile({ path }) {

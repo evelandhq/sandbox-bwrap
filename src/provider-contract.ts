@@ -67,6 +67,14 @@ export interface BwrapSessionContext {
 }
 
 /**
+ * What eve passes to `onSessionIdle`, from eve 1.1 on: it aborts `signal`
+ * when it stops waiting for the call.
+ */
+export interface BwrapSessionIdleOptions {
+  readonly signal?: AbortSignal;
+}
+
+/**
  * What eve passes to `onSessionEnd`. Every reason releases the session the
  * same way, so an end reason a later eve minor adds is handled already.
  */

@@ -8,6 +8,7 @@ describe("resolveBwrapSandboxOptions", () => {
       networkPolicy: "allow-all",
       hidePaths: [],
       bwrapPath: "bwrap",
+      pythonPath: "python3",
       cacheDir: null,
       runTimeoutMs: 600_000,
       maxConcurrentProcesses: 64,

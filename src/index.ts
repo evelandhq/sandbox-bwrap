@@ -20,6 +20,7 @@ export type {
   BwrapSandboxConnection,
   BwrapSessionContext,
   BwrapSessionEndOptions,
+  BwrapSessionIdleOptions,
 } from "./provider-contract.js";
 export type { BwrapNetworkPolicy, BwrapSandboxEnvironmentOptions } from "./options.js";
 export type {
@@ -44,5 +45,5 @@ export {
   DEFAULT_MAX_OUTPUT_BYTES,
   DEFAULT_RUN_TIMEOUT_MS,
 } from "./options.js";
-export { isBwrapAvailable } from "./process.js";
+export { isBwrapAvailable, isPythonAvailable } from "./process.js";
 export type { ProcessRunner, ProcessRunnerSpawnOptions, SpawnedProcess } from "./process.js";

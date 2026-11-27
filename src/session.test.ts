@@ -6,7 +6,12 @@ import { describe, expect, test, vi } from "vitest";
 import { resolveBwrapSandboxOptions } from "./options.js";
 import type { BwrapSandboxEvent } from "./events.js";
 import type { ProcessRunner, SpawnedProcess } from "./process.js";
-import { readUntilSettled } from "./provider.test-support.js";
+import {
+  fakeHolders,
+  parseJoin,
+  readUntilSettled,
+  withFakeHolder,
+} from "./provider.test-support.js";
 import { createBwrapSession } from "./session.js";
 
 function stringStream(text: string): ReadableStream<Uint8Array> {
@@ -39,7 +44,8 @@ async function makeSession(result?: { exitCode?: number; stdout?: string; stderr
   const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-session-"));
   const workspaceDir = path.join(appRoot, ".eve", "sandbox-cache", "bwrap", "sessions", "s1");
   await mkdir(workspaceDir, { recursive: true });
-  const { runner, calls } = createFakeRunner(result);
+  const { runner: commands, calls } = createFakeRunner(result);
+  const runner = withFakeHolder(commands);
   const session = createBwrapSession({
     id: "s1",
     workspaceDir,
@@ -47,14 +53,15 @@ async function makeSession(result?: { exitCode?: number; stdout?: string; stderr
     runner,
     options: resolveBwrapSandboxOptions({ env: { FACTORY: "yes" } }),
   });
-  return { session, calls, workspaceDir, appRoot };
+  return { session, calls, workspaceDir, appRoot, holders: () => fakeHolders(runner) };
 }
 
 describe("spawn", () => {
-  test("spawn builds a hardened bwrap argv: clearenv, hidden cache root, workspace bind", async () => {
-    const { session, calls, workspaceDir, appRoot } = await makeSession();
-    await session.spawn({ command: "echo hi", env: { CALL: "1" } });
-    const argv = calls[0]!;
+  test("the first command starts one hardened holder: clearenv, hidden cache root, workspace bind", async () => {
+    const { session, workspaceDir, appRoot, holders } = await makeSession();
+    await session.spawn({ command: "echo hi" });
+    expect(holders()).toHaveLength(1);
+    const argv = holders()[0]!.argv;
     expect(argv[0]).toBe("bwrap");
     expect(argv).toContain("--clearenv");
     const cacheRoot = path.join(appRoot, ".eve", "sandbox-cache", "bwrap");
@@ -62,14 +69,115 @@ describe("spawn", () => {
     const secondTmpfs = argv.indexOf("--tmpfs", argv.indexOf("--tmpfs") + 1);
     expect(argv.slice(secondTmpfs, secondTmpfs + 2)).toEqual(["--tmpfs", cacheRoot]);
     expect(argv).toContain(workspaceDir);
-    expect(argv.slice(-3)).toEqual(["bash", "-lc", "echo hi"]);
-    // env precedence: defaults < factory < call
-    const setenv = argv.join(" ");
-    expect(setenv).toContain("--setenv FACTORY yes");
-    expect(setenv).toContain("--setenv CALL 1");
-    expect(setenv).toContain("--setenv HOME /workspace");
     // the host process env must never be forwarded
-    expect(setenv).not.toContain("OPENAI");
+    expect(argv.join(" ")).not.toContain("OPENAI");
+  });
+
+  test("a command joins the holder with exactly its own environment", async () => {
+    const { session, calls, holders } = await makeSession();
+    await session.spawn({ command: "echo hi", env: { CALL: "1" } });
+    const join = parseJoin(calls[0]!);
+    expect(join).toEqual({
+      python: "python3",
+      targetPid: holders()[0]!.targetPid,
+      // The helper refuses a process outside the holder's mount namespace.
+      mountNamespace: `mnt:[${holders()[0]!.mountNamespace}]`,
+      joinsNetwork: false,
+      chdir: "/workspace",
+      command: "echo hi",
+      // env precedence: defaults < factory < call
+      env: {
+        PATH: expect.any(String),
+        HOME: "/workspace",
+        LANG: "C.UTF-8",
+        AI_AGENT: "eve",
+        FACTORY: "yes",
+        CALL: "1",
+      },
+    });
+  });
+
+  /**
+   * Commands share one sandbox, so `/tmp` and the process table carry over
+   * from one to the next: that is what lets a later command check on, or
+   * stop, a process an earlier one left running.
+   */
+  test("later commands join the same holder instead of starting another", async () => {
+    const { session, calls, holders } = await makeSession();
+    await session.spawn({ command: "one" });
+    await session.spawn({ command: "two" });
+    await Promise.all([session.spawn({ command: "three" }), session.spawn({ command: "four" })]);
+    expect(holders()).toHaveLength(1);
+    expect(calls).toHaveLength(4);
+    expect(new Set(calls.map((argv) => parseJoin(argv).targetPid))).toEqual(
+      new Set([holders()[0]!.targetPid]),
+    );
+  });
+
+  test("commands issued before the holder is ready wait for the same one", async () => {
+    const { session, calls, holders } = await makeSession();
+    await Promise.all([session.spawn({ command: "one" }), session.spawn({ command: "two" })]);
+    expect(holders()).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+  });
+
+  test("file access alone starts no holder", async () => {
+    const { session, holders } = await makeSession();
+    await session.writeFiles({
+      files: [{ path: "/workspace/a.txt", content: new TextEncoder().encode("a") }],
+    });
+    await session.readFile({ path: "/workspace/a.txt" });
+    expect(holders()).toHaveLength(0);
+  });
+
+  /**
+   * A sandboxed command can end the holder (it runs as the same user), and
+   * the host can lose it to memory pressure. Either way the sandbox's
+   * processes are gone but its files are not, so the next command gets a
+   * fresh holder over the same workspace.
+   */
+  test("a holder that died is replaced by the next command", async () => {
+    const { session, calls, holders } = await makeSession();
+    await session.spawn({ command: "one" });
+    holders()[0]!.exit(137);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await session.spawn({ command: "two" });
+    expect(holders()).toHaveLength(2);
+    expect(parseJoin(calls[1]!).targetPid).toBe(holders()[1]!.targetPid);
+  });
+
+  test("a holder that fails to start rejects the command, and the next command tries again", async () => {
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-holder-fail-"));
+    let attempts = 0;
+    const { runner: commands, calls } = createFakeRunner();
+    const working = withFakeHolder(commands);
+    const runner: ProcessRunner = {
+      spawn(argv, options): SpawnedProcess {
+        if (argv.includes("--info-fd") && ++attempts === 1) {
+          return {
+            stdout: stringStream(""),
+            stderr: stringStream("bwrap: setting up uid map: Permission denied\n"),
+            wait: async () => ({ exitCode: 1 }),
+            kill: async () => {},
+          };
+        }
+        return working.spawn(argv, options);
+      },
+    };
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir: appRoot,
+      cacheRoots: [],
+      runner,
+      options: resolveBwrapSandboxOptions(),
+    });
+
+    await expect(session.spawn({ command: "one" })).rejects.toThrow(
+      /failed to start the sandbox.*setting up uid map: Permission denied/,
+    );
+    expect(calls).toHaveLength(0);
+    await session.spawn({ command: "two" });
+    expect(calls).toHaveLength(1);
   });
 
   /**
@@ -78,17 +186,11 @@ describe("spawn", () => {
    * add it to the per-call env itself.
    */
   test("sets AI_AGENT=eve beneath the configured and per-call env", async () => {
-    const setenvs = (argv: readonly string[]) =>
-      Object.fromEntries(
-        argv.flatMap((arg, index) =>
-          arg === "--setenv" ? [[argv[index + 1], argv[index + 2]]] : [],
-        ),
-      );
     const { session, calls } = await makeSession();
     await session.spawn({ command: "true" });
     await session.spawn({ command: "true", env: { AI_AGENT: "per-call" } });
-    expect(setenvs(calls[0]!).AI_AGENT).toBe("eve");
-    expect(setenvs(calls[1]!).AI_AGENT).toBe("per-call");
+    expect(parseJoin(calls[0]!).env.AI_AGENT).toBe("eve");
+    expect(parseJoin(calls[1]!).env.AI_AGENT).toBe("per-call");
 
     const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "bwrap-agent-env-"));
     const { runner, calls: configuredCalls } = createFakeRunner();
@@ -96,21 +198,17 @@ describe("spawn", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions({ env: { AI_AGENT: "configured" } }),
     });
     await configured.spawn({ command: "true" });
-    expect(setenvs(configuredCalls[0]!).AI_AGENT).toBe("configured");
+    expect(parseJoin(configuredCalls[0]!).env.AI_AGENT).toBe("configured");
   });
 
   test("workingDirectory resolves against /workspace", async () => {
     const { session, calls } = await makeSession();
     await session.spawn({ command: "true", workingDirectory: "sub/dir" });
-    const argv = calls[0]!;
-    expect(argv.slice(argv.indexOf("--chdir"), argv.indexOf("--chdir") + 2)).toEqual([
-      "--chdir",
-      "/workspace/sub/dir",
-    ]);
+    expect(parseJoin(calls[0]!).chdir).toBe("/workspace/sub/dir");
   });
 
   test("every cache root it is given is hidden by tmpfs, before the workspace bind", async () => {
@@ -120,7 +218,7 @@ describe("spawn", () => {
     const workspaceDir = path.join(cacheDir, "sessions", "s1");
     await mkdir(workspaceDir, { recursive: true });
     await mkdir(templateRoot, { recursive: true });
-    const { runner, calls } = createFakeRunner();
+    const runner = withFakeHolder(createFakeRunner().runner);
     const session = createBwrapSession({
       id: "s1",
       workspaceDir,
@@ -129,7 +227,7 @@ describe("spawn", () => {
       options: resolveBwrapSandboxOptions({ cacheDir }),
     });
     await session.spawn({ command: "true" });
-    const argv = calls[0]!;
+    const argv = fakeHolders(runner)[0]!.argv;
     const tmpfs = argv.flatMap((arg, index) => (arg === "--tmpfs" ? [argv[index + 1]] : []));
     expect(tmpfs).toEqual(["/tmp", templateRoot, cacheDir]);
     expect(argv.indexOf(cacheDir)).toBeLessThan(argv.indexOf("--bind"));
@@ -179,7 +277,7 @@ describe("spawn", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions({ ...limits, onEvent: (event) => events.push(event) }),
     });
     return { session, events };
@@ -316,7 +414,7 @@ describe("spawn", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions({ maxConcurrentProcesses: 1 }),
     });
 
@@ -354,7 +452,7 @@ describe("spawn options", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions({ runTimeoutMs: null }),
     });
   }
@@ -373,16 +471,84 @@ describe("spawn options", () => {
 });
 
 describe("network policy", () => {
-  test("deny-all option and setNetworkPolicy toggle --unshare-net per call", async () => {
-    const { session, calls } = await makeSession();
+  /**
+   * A holder's network namespace is fixed when it starts, so each policy has
+   * its own holder and a command joins the network namespace only of one that
+   * unshared it.
+   */
+  test("deny-all runs commands in a holder without network, and allow-all in one that shares it", async () => {
+    const { session, calls, holders } = await makeSession();
     await session.spawn({ command: "true" });
-    expect(calls[0]).not.toContain("--unshare-net");
+    expect(holders()[0]!.argv).not.toContain("--unshare-net");
+    expect(parseJoin(calls[0]!).joinsNetwork).toBe(false);
+
     await session.setNetworkPolicy("deny-all");
     await session.spawn({ command: "true" });
-    expect(calls[1]).toContain("--unshare-net");
+    expect(holders()[1]!.argv).toContain("--unshare-net");
+    expect(parseJoin(calls[1]!)).toMatchObject({
+      joinsNetwork: true,
+      targetPid: holders()[1]!.targetPid,
+    });
+
     await session.setNetworkPolicy("allow-all");
     await session.spawn({ command: "true" });
-    expect(calls[2]).not.toContain("--unshare-net");
+    expect(holders()[2]!.argv).not.toContain("--unshare-net");
+    expect(parseJoin(calls[2]!).joinsNetwork).toBe(false);
+  });
+
+  /**
+   * A process left running under the old policy could otherwise keep the
+   * network after `deny-all`, and relay it to later commands through the
+   * shared workspace.
+   */
+  test("changing the policy ends the previous holder and everything left running in it", async () => {
+    const { session, holders } = await makeSession();
+    await session.spawn({ command: "true" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await session.setNetworkPolicy("deny-all");
+    expect(holders()[0]!.killed).toBe(true);
+  });
+
+  test("setting the policy it already has keeps the holder", async () => {
+    const { session, holders } = await makeSession();
+    await session.spawn({ command: "true" });
+    await session.setNetworkPolicy("allow-all");
+    await session.spawn({ command: "true" });
+    expect(holders()).toHaveLength(1);
+    expect(holders()[0]!.killed).toBe(false);
+  });
+
+  test("a command still running under the old policy finishes before its holder ends", async () => {
+    let finish!: (value: { exitCode: number }) => void;
+    const exit = new Promise<{ exitCode: number }>((resolve) => (finish = resolve));
+    const runner = withFakeHolder({
+      spawn(): SpawnedProcess {
+        return {
+          pid: 31,
+          stdout: stringStream(""),
+          stderr: stringStream(""),
+          wait: async () => await exit,
+          kill: async () => finish({ exitCode: 137 }),
+        };
+      },
+    });
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "bwrap-policy-drain-"));
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir,
+      cacheRoots: [],
+      runner,
+      options: resolveBwrapSandboxOptions({ runTimeoutMs: null }),
+    });
+
+    const running = await session.spawn({ command: "long" });
+    await session.setNetworkPolicy("deny-all");
+    expect(fakeHolders(runner)[0]!.killed).toBe(false);
+
+    finish({ exitCode: 0 });
+    await running.wait();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fakeHolders(runner)[0]!.killed).toBe(true);
   });
 
   test("granular policies are rejected", async () => {
@@ -473,6 +639,26 @@ describe("file I/O", () => {
 });
 
 describe("killAll", () => {
+  /**
+   * The holder is the sandbox's compute: ending it is what ends a process a
+   * command left running in the background, which no host-side handle tracks.
+   */
+  test("stops the holder, and the next generation would start a new one", async () => {
+    const { session, holders } = await makeSession();
+    await session.spawn({ command: "true" });
+    await session.killAll();
+    expect(holders().map((holder) => holder.killed)).toEqual([true]);
+    await expect(session.spawn({ command: "true" })).rejects.toThrow(/refusing to spawn/);
+  });
+
+  test("stops a holder that was still starting when cleanup began", async () => {
+    const { session, holders } = await makeSession();
+    const spawning = session.spawn({ command: "true" }).catch((error: unknown) => error);
+    await session.killAll();
+    await spawning;
+    expect(holders().map((holder) => holder.killed)).toEqual([true]);
+  });
+
   test("kills every process spawned by this session and is idempotent", async () => {
     const killed: number[] = [];
     const exits = new Map<number, (value: { exitCode: number }) => void>();
@@ -500,7 +686,7 @@ describe("killAll", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions(),
     });
 
@@ -534,7 +720,7 @@ describe("killAll", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions(),
     });
 
@@ -573,7 +759,7 @@ describe("killAll", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions(),
     });
 
@@ -607,7 +793,7 @@ describe("killAll", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions(),
     });
     await session.spawn({ command: "first" });
@@ -642,7 +828,7 @@ describe("killAll", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions(),
     });
     await session.spawn({ command: "unkillable" });
@@ -666,7 +852,7 @@ describe("killAll", () => {
       id: "s1",
       workspaceDir,
       cacheRoots: [],
-      runner,
+      runner: withFakeHolder(runner),
       options: resolveBwrapSandboxOptions(),
       onStopped: async () => {
         notifications += 1;
