@@ -20,6 +20,7 @@ import type {
   BwrapSandboxConnection,
   BwrapSessionContext,
   BwrapSessionEndOptions,
+  BwrapSessionIdleOptions,
 } from "./provider-contract.js";
 import { createBwrapRuntime } from "./runtime.js";
 import type { BwrapSession } from "./session.js";
@@ -73,6 +74,11 @@ export interface BwrapSandboxProviderImplementation {
     ctx: BwrapSessionContext,
     state: Readonly<BwrapSessionState> | null,
     options: BwrapSessionEndOptions,
+  ): Promise<void>;
+  onSessionIdle(
+    ctx: BwrapSessionContext,
+    state: Readonly<BwrapSessionState> | null,
+    options: BwrapSessionIdleOptions,
   ): Promise<void>;
 }
 
@@ -342,7 +348,28 @@ export function createBwrapSandboxProviderDefinition(
         await removeSessionWorkspace(roots.sessionRoot, sessionPath);
       }
 
-      return { prepare, start, resume, onSessionEnd };
+      // eve calls this once the session that owns the sandbox has been idle
+      // for the environment's `idleTimeoutMs`. The sandbox's compute is its
+      // holder: stopping it ends every process left running in the sandbox,
+      // which is the only bound a background process has, and keeps the
+      // workspace. Nothing is started to do it, so a sandbox that is already
+      // stopped, was never resumed in this process, or never existed is left
+      // as it is. `state` is null for a sandbox the session never recorded.
+      async function onSessionIdle(
+        ctx: BwrapSessionContext,
+        recorded: Readonly<BwrapSessionState> | null,
+        idleOptions: BwrapSessionIdleOptions,
+      ): Promise<void> {
+        idleOptions.signal?.throwIfAborted();
+        const sessionKey =
+          recorded === null
+            ? `session:${ctx.session.id}`
+            : requireSessionState(recorded).sessionKey;
+        const sessionPath = sessionPathIn(cacheRoots(ctx.storagePath).sessionRoot, sessionKey);
+        await runtime.closeRuntimeSession(sessionPath);
+      }
+
+      return { prepare, start, resume, onSessionEnd, onSessionIdle };
     },
   };
 }

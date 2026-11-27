@@ -4,7 +4,12 @@ import { createBwrapCacheLease, registerActiveCachePath } from "./cache.js";
 import type { ResolvedBwrapSandboxOptions } from "./options.js";
 import { WORKSPACE_ROOT } from "./paths.js";
 import type { ProcessRunner } from "./process.js";
-import { createNodeProcessRunner, describeMissingPrereqs, isBwrapAvailable } from "./process.js";
+import {
+  createNodeProcessRunner,
+  describeMissingPrereqs,
+  isBwrapAvailable,
+  isPythonAvailable,
+} from "./process.js";
 import type { BwrapSession } from "./session.js";
 import { createBwrapSession } from "./session.js";
 
@@ -22,7 +27,7 @@ export interface BwrapSessionLocation {
  * workspace in use.
  */
 export interface BwrapRuntime {
-  /** Throws a setup message when the host cannot run bwrap. Probed once. */
+  /** Throws a setup message when the host cannot run bwrap or join its sandboxes. Probed once. */
   assertBwrapAvailable(): void;
   /** A throwaway session over a template being captured; it holds no lease. */
   openTemplateSession(location: BwrapSessionLocation): BwrapSession;
@@ -78,8 +83,10 @@ export function createBwrapRuntime(input: {
       if (!shouldProbe || probed) return;
       const missing = describeMissingPrereqs({
         bwrapPresent: isBwrapAvailable(options.bwrapPath),
+        pythonPresent: isPythonAvailable(options.pythonPath),
         workspaceMountpointPresent: existsSync(WORKSPACE_ROOT),
         bwrapPath: options.bwrapPath,
+        pythonPath: options.pythonPath,
       });
       if (missing) throw new Error(missing);
       probed = true;

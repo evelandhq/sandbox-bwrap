@@ -19,8 +19,10 @@ import {
   createLiveRunner,
   empty,
   exitingRunner,
+  fakeHolders,
   makeRelease,
   readUntilSettled,
+  withFakeHolder,
 } from "./provider.test-support.js";
 
 /**
@@ -37,7 +39,9 @@ function environment(
   options?: BwrapSandboxEnvironmentOptions,
   runner: ProcessRunner = exitingRunner,
 ) {
-  return createBwrapSandboxProviderDefinition({ runner }).environment(options);
+  return createBwrapSandboxProviderDefinition({ runner: withFakeHolder(runner) }).environment(
+    options,
+  );
 }
 
 async function readText(connection: BwrapSandboxConnection, file: string) {
@@ -155,8 +159,13 @@ describe("prepare", () => {
     );
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.[0]).toContain("bwrap");
+    expect(calls[0]?.[0]).toBe("python3");
     expect(killed).toEqual([1]);
+    // The template's sandbox ends with the capture, and with it anything the
+    // authored preparation left running in the background.
+    expect(fakeHolders(runner).map((holder) => [holder.argv[0], holder.killed])).toEqual([
+      ["bwrap", true],
+    ]);
   });
 
   test("reuses a template for the same key and captures a new one when the key changes", async () => {
@@ -183,7 +192,7 @@ describe("prepare", () => {
 describe("start, resume, and session end", () => {
   test("start returns a connection and JSON state, and applies the open-time policy", async () => {
     const { storagePath } = await makeRelease();
-    const { runner, calls } = createLiveRunner();
+    const { runner } = createLiveRunner();
     const env = environment(undefined, runner);
     const artifact = await env.prepare(prepareContext(storagePath));
 
@@ -197,12 +206,12 @@ describe("start, resume, and session end", () => {
     expect(connection.workspaceRoot).toBe("/workspace");
     expect(JSON.parse(JSON.stringify(state))).toEqual(state);
     expect(state).toMatchObject({ version: 1, networkPolicy: "deny-all" });
-    expect(calls[0]).toContain("--unshare-net");
+    expect(fakeHolders(runner)[0]?.argv).toContain("--unshare-net");
   });
 
   test("start is an upsert: a live sandbox keeps its workspace and current policy", async () => {
     const { storagePath } = await makeRelease();
-    const { runner, calls } = createLiveRunner();
+    const { runner } = createLiveRunner();
     const env = environment(undefined, runner);
     const artifact = await env.prepare(prepareContext(storagePath));
     const first = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
@@ -220,7 +229,9 @@ describe("start, resume, and session end", () => {
     await second.connection.spawn({ command: "true", env: {}, workingDirectory: "/workspace" });
 
     expect(await readText(second.connection, "/workspace/kept.txt")).toBe("kept");
-    expect(calls[0]).toContain("--unshare-net");
+    expect(fakeHolders(runner).map((holder) => holder.argv.includes("--unshare-net"))).toEqual([
+      true,
+    ]);
   });
 
   test("resume after a restart reopens the workspace under the recorded policy", async () => {
@@ -236,7 +247,7 @@ describe("start, resume, and session end", () => {
     });
     await before.connection.stop();
 
-    const { runner, calls } = createLiveRunner();
+    const { runner } = createLiveRunner();
     const resumed = await environment(undefined, runner).resume(
       sessionContext(storagePath, "s"),
       artifact,
@@ -245,7 +256,7 @@ describe("start, resume, and session end", () => {
     await resumed.spawn({ command: "true", env: {}, workingDirectory: "/workspace" });
 
     expect(await readText(resumed, "/workspace/keep.txt")).toBe("durable");
-    expect(calls[0]).toContain("--unshare-net");
+    expect(fakeHolders(runner)[0]?.argv).toContain("--unshare-net");
   });
 
   test("resume of a workspace that is gone throws the error eve starts fresh on", async () => {
@@ -394,6 +405,83 @@ describe("start, resume, and session end", () => {
     expect(killed).toEqual([1]);
     const fresh = await env.start(sessionContext(storagePath, "s"), undefined, artifact);
     expect(await readText(fresh.connection, "/workspace/keep.txt")).toBeNull();
+  });
+});
+
+describe("session idle", () => {
+  /**
+   * eve calls `onSessionIdle` once a session has been idle for the
+   * environment's `idleTimeoutMs`. The sandbox's compute is its holder, so
+   * this is what ends a process a command left running in the background.
+   */
+  test("stops the sandbox's processes and keeps its files; the next resume starts a new holder", async () => {
+    const { appRoot, storagePath } = await makeRelease();
+    const { runner, killed } = createLiveRunner();
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath, { workspace: { f: "x" } }));
+    const { connection, state } = await env.start(
+      sessionContext(storagePath, "s"),
+      undefined,
+      artifact,
+    );
+    await connection.spawn({ command: "sleep 60", env: {}, workingDirectory: "/workspace" });
+
+    await env.onSessionIdle(sessionContext(storagePath, "s"), state, {});
+
+    expect(killed).toEqual([1]);
+    expect(fakeHolders(runner).map((holder) => holder.killed)).toEqual([true]);
+    expect(await listBwrapCache({ appRoot })).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: "session", active: false })]),
+    );
+
+    const resumed = await env.resume(sessionContext(storagePath, "s"), artifact, state);
+    expect(await readText(resumed, "/workspace/f")).toBe("x");
+    await resumed.spawn({ command: "true", env: {}, workingDirectory: "/workspace" });
+    expect(fakeHolders(runner)).toHaveLength(2);
+  });
+
+  test("starts nothing for a sandbox that is not running, with or without recorded state", async () => {
+    const { storagePath } = await makeRelease();
+    const { runner, calls } = createLiveRunner();
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { connection, state } = await env.start(
+      sessionContext(storagePath, "s"),
+      undefined,
+      artifact,
+    );
+    await connection.stop();
+
+    await env.onSessionIdle(sessionContext(storagePath, "s"), state, {});
+    await env.onSessionIdle(sessionContext(storagePath, "s"), null, {});
+    await env.onSessionIdle(sessionContext(storagePath, "never-started"), null, {});
+
+    expect(calls).toHaveLength(0);
+    expect(fakeHolders(runner)).toHaveLength(0);
+    const workspace = sessionPathIn(path.join(storagePath, "bwrap"), "session:s");
+    expect(existsSync(workspace)).toBe(true);
+  });
+
+  test("an already-aborted signal leaves the sandbox running", async () => {
+    const { storagePath } = await makeRelease();
+    const { runner, killed } = createLiveRunner();
+    const env = environment(undefined, runner);
+    const artifact = await env.prepare(prepareContext(storagePath));
+    const { connection, state } = await env.start(
+      sessionContext(storagePath, "s"),
+      undefined,
+      artifact,
+    );
+    await connection.spawn({ command: "sleep 60", env: {}, workingDirectory: "/workspace" });
+
+    await expect(
+      env.onSessionIdle(sessionContext(storagePath, "s"), state, {
+        signal: AbortSignal.abort(new Error("eve moved on")),
+      }),
+    ).rejects.toThrow("eve moved on");
+
+    expect(killed).toEqual([]);
+    expect(fakeHolders(runner).map((holder) => holder.killed)).toEqual([false]);
   });
 });
 

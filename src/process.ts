@@ -14,6 +14,12 @@ export interface SpawnedProcess {
   readonly stderr: ReadableStream<Uint8Array>;
   wait(): Promise<{ exitCode: number }>;
   kill(): Promise<void>;
+  /**
+   * Stops this process from keeping the host process alive. A sandbox's
+   * holder outlives every command, and an agent that has finished its work
+   * must still be able to exit. `kill()` still waits for the process to end.
+   */
+  unref?(): void;
 }
 
 /** Injectable process launcher so sandbox logic is unit-testable without bwrap. */
@@ -36,11 +42,24 @@ export function isBwrapAvailable(bwrapPath = "bwrap"): boolean {
   return spawnSync(bwrapPath, ["--version"], { stdio: "ignore" }).status === 0;
 }
 
+/** What the join helper needs from Python: `ctypes`, which a minimal install can lack. */
+const PYTHON_PROBE = "import ctypes, os, sys";
+
+/**
+ * Whether the Python every command joins its sandbox through is on the host
+ * and can load what the join helper imports.
+ */
+export function isPythonAvailable(pythonPath = "python3"): boolean {
+  return spawnSync(pythonPath, ["-I", "-S", "-c", PYTHON_PROBE], { stdio: "ignore" }).status === 0;
+}
+
 /** Explains missing host prerequisites, or null when the host is ready. */
 export function describeMissingPrereqs(probes: {
   readonly bwrapPresent: boolean;
+  readonly pythonPresent: boolean;
   readonly workspaceMountpointPresent: boolean;
   readonly bwrapPath: string;
+  readonly pythonPath: string;
 }): string | null {
   const problems: string[] = [];
   if (!probes.bwrapPresent) {
@@ -48,6 +67,13 @@ export function describeMissingPrereqs(probes: {
       `bubblewrap is not available (tried "${probes.bwrapPath} --version"). ` +
         "Install it with your distro package manager (Ubuntu/Debian: apt-get install bubblewrap), " +
         "or use a different sandbox provider outside Linux.",
+    );
+  }
+  if (!probes.pythonPresent) {
+    problems.push(
+      `Python 3 with ctypes is not available (tried "${probes.pythonPath} -c 'import ctypes'"). ` +
+        "Every sandboxed command joins its sandbox through a helper it runs. Install it with " +
+        "your distro package manager (Ubuntu/Debian: apt-get install python3; Alpine: apk add python3).",
     );
   }
   if (!probes.workspaceMountpointPresent) {
@@ -143,9 +169,19 @@ export function createNodeProcessRunner(): ProcessRunner {
           return result;
         },
         async kill() {
+          // An unreferenced process no longer holds the event loop, so a host
+          // with nothing else to do would exit before the kill had landed.
+          child.ref();
           const killError = killTree();
           await exit.catch(() => {});
           if (killError !== undefined) throw killError;
+        },
+        unref() {
+          child.unref();
+          // The pipes are handles of their own and hold the event loop too.
+          for (const stream of [child.stdin, child.stdout, child.stderr]) {
+            (stream as { unref?: () => void } | null)?.unref?.();
+          }
         },
       };
     },

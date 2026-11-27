@@ -24,6 +24,11 @@ export interface BwrapSandboxEnvironmentOptions {
   /** bwrap executable path. Defaults to `"bwrap"` resolved via PATH. */
   readonly bwrapPath?: string;
   /**
+   * Python 3 executable path. Every command joins its sandbox through a
+   * short helper it runs. Defaults to `"python3"` resolved via PATH.
+   */
+  readonly pythonPath?: string;
+  /**
    * Absolute directory holding durable session workspaces. Defaults to the
    * storage directory eve gives the provider, which belongs to one build. Pin
    * it outside the release directory so a redeploy does not discard durable
@@ -55,6 +60,7 @@ export interface ResolvedBwrapSandboxOptions {
   readonly networkPolicy: BwrapNetworkPolicy;
   readonly hidePaths: readonly string[];
   readonly bwrapPath: string;
+  readonly pythonPath: string;
   readonly cacheDir: string | null;
   readonly runTimeoutMs: number | null;
   readonly maxConcurrentProcesses: number | null;
@@ -92,6 +98,7 @@ export function resolveBwrapSandboxOptions(
     networkPolicy: options.networkPolicy ?? "allow-all",
     hidePaths: options.hidePaths ?? [],
     bwrapPath: options.bwrapPath ?? "bwrap",
+    pythonPath: options.pythonPath ?? "python3",
     cacheDir: options.cacheDir ?? null,
     runTimeoutMs: resolveRunTimeoutMs(options.runTimeoutMs),
     maxConcurrentProcesses: resolvePositiveLimit(
@@ -121,6 +128,7 @@ export function createBwrapOptionsHash(options: ResolvedBwrapSandboxOptions): st
     maxConcurrentProcesses: options.maxConcurrentProcesses,
     maxOutputBytes: options.maxOutputBytes,
     networkPolicy: options.networkPolicy,
+    pythonPath: options.pythonPath,
     runTimeoutMs: options.runTimeoutMs,
   });
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);

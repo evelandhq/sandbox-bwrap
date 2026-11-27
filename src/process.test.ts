@@ -1,7 +1,14 @@
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { WORKSPACE_ROOT } from "./paths.js";
-import { createNodeProcessRunner, describeMissingPrereqs, isBwrapAvailable } from "./process.js";
+import {
+  createNodeProcessRunner,
+  describeMissingPrereqs,
+  isBwrapAvailable,
+  isPythonAvailable,
+} from "./process.js";
 
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
   const chunks: Uint8Array[] = [];
@@ -124,6 +131,44 @@ describe("createNodeProcessRunner", () => {
     }
   });
 
+  test("an unreferenced process keeps running and can still be waited on and killed", async () => {
+    const proc = runner.spawn(["sh", "-c", "sleep 30"], { stdin: true });
+    proc.unref?.();
+    expect(typeof proc.unref).toBe("function");
+    await proc.kill();
+    await expect(proc.wait()).resolves.toEqual({ exitCode: 137 });
+  });
+
+  /**
+   * The holder is unreferenced once it is ready. A host whose only remaining
+   * work is to stop it must see the stop through, not exit halfway, and a host
+   * that leaves it running must still exit.
+   */
+  test("a host waits for the kill of an unreferenced process, but not for the process", async () => {
+    const script = (afterUnref: string) => `
+      import { createNodeProcessRunner } from ${JSON.stringify(path.resolve(import.meta.dirname, "process.ts"))};
+      const proc = createNodeProcessRunner().spawn(["sh", "-c", "sleep 30"], { stdin: true });
+      proc.unref();
+      ${afterUnref}
+    `;
+    const tsx = path.resolve(import.meta.dirname, "../node_modules/.bin/tsx");
+    const run = (source: string) =>
+      spawnSync(tsx, ["--input-type=module", "-e", source], { encoding: "utf8", timeout: 20_000 });
+
+    // The pause lets everything the spawn itself scheduled settle, so the
+    // kill is the only thing left for the host to wait on.
+    const killed = run(
+      script(
+        'await new Promise((resolve) => setTimeout(resolve, 200)); await proc.kill(); console.log("killed");',
+      ),
+    );
+    expect(killed.stdout).toBe("killed\n");
+
+    const left = run(script('console.log("left running");'));
+    expect(left.stdout).toBe("left running\n");
+    expect(left.status).toBe(0);
+  });
+
   test("spawning a missing executable rejects wait()", async () => {
     const proc = runner.spawn(["definitely-not-a-real-binary-xyz"]);
     await expect(proc.wait()).rejects.toThrow();
@@ -181,22 +226,45 @@ describe("isBwrapAvailable", () => {
   });
 });
 
+describe("isPythonAvailable", () => {
+  test("returns false for a missing binary", () => {
+    expect(isPythonAvailable("definitely-not-a-real-binary-xyz")).toBe(false);
+  });
+});
+
 describe("describeMissingPrereqs", () => {
   test("returns null when bwrap is present and the workspace mountpoint exists", () => {
     expect(
       describeMissingPrereqs({
         bwrapPresent: true,
+        pythonPresent: true,
         workspaceMountpointPresent: true,
         bwrapPath: "bwrap",
+        pythonPath: "python3",
       }),
     ).toBeNull();
+  });
+
+  test("reports a missing Python with the probed path and an install hint", () => {
+    const message = describeMissingPrereqs({
+      bwrapPresent: true,
+      pythonPresent: false,
+      workspaceMountpointPresent: true,
+      bwrapPath: "bwrap",
+      pythonPath: "/custom/python3",
+    });
+    expect(message).toContain("/custom/python3");
+    expect(message).toContain("apt-get install python3");
+    expect(message).not.toContain("apt-get install bubblewrap");
   });
 
   test("reports a missing bwrap binary with the probed path and an install hint", () => {
     const message = describeMissingPrereqs({
       bwrapPresent: false,
+      pythonPresent: true,
       workspaceMountpointPresent: true,
       bwrapPath: "/custom/bwrap",
+      pythonPath: "python3",
     });
     expect(message).toContain("/custom/bwrap");
     expect(message).toContain("apt-get install bubblewrap");
@@ -206,8 +274,10 @@ describe("describeMissingPrereqs", () => {
   test("reports a missing workspace mountpoint naming WORKSPACE_ROOT with the fix command", () => {
     const message = describeMissingPrereqs({
       bwrapPresent: true,
+      pythonPresent: true,
       workspaceMountpointPresent: false,
       bwrapPath: "bwrap",
+      pythonPath: "python3",
     });
     expect(message).toContain(WORKSPACE_ROOT);
     expect(message).toContain(`sudo install -d -m 0755 ${WORKSPACE_ROOT}`);
@@ -217,8 +287,10 @@ describe("describeMissingPrereqs", () => {
   test("reports both, bwrap first, when both are missing", () => {
     const message = describeMissingPrereqs({
       bwrapPresent: false,
+      pythonPresent: true,
       workspaceMountpointPresent: false,
       bwrapPath: "bwrap",
+      pythonPath: "python3",
     });
     expect(message).toContain("apt-get install bubblewrap");
     expect(message).toContain(WORKSPACE_ROOT);

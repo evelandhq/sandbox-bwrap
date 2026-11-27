@@ -1,5 +1,5 @@
 // Real-bwrap contract test for the provider and its connection. Requires
-// Linux + bubblewrap + bash: run it inside the Lima VM via infra/smoke.sh, or
+// Linux 5.8+ + bubblewrap + python3 + bash: run it inside the Lima VM via infra/smoke.sh, or
 // in CI's smoke job, not on a dev laptop. infra/smoke.sh runs it as an
 // unprivileged user under systemd hardening (NoNewPrivileges,
 // ProtectSystem=strict) to mirror a deployed eve agent.
@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { EVE_SANDBOX_HOME_PROBE } from "../connection.js";
-import { isBwrapAvailable } from "../process.js";
+import { isBwrapAvailable, isPythonAvailable } from "../process.js";
 import type { BwrapSandboxConnection } from "../provider-contract.js";
 import {
   createBwrapSandboxProviderDefinition,
@@ -27,7 +27,8 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-async function countBwrapZombies(): Promise<number> {
+/** Zombies of the two binaries the provider launches: the holder and each command's join helper. */
+async function countSandboxZombies(): Promise<number> {
   if (process.platform !== "linux") return 0;
   const procEntries = await readdir("/proc");
   let zombies = 0;
@@ -38,7 +39,8 @@ async function countBwrapZombies(): Promise<number> {
         readFile(`/proc/${entry}/comm`, "utf8"),
         readFile(`/proc/${entry}/stat`, "utf8"),
       ]);
-      if (comm.trim() === "bwrap" && stat.at(stat.lastIndexOf(")") + 2) === "Z") zombies += 1;
+      const launched = comm.trim() === "bwrap" || comm.trim().startsWith("python3");
+      if (launched && stat.at(stat.lastIndexOf(")") + 2) === "Z") zombies += 1;
     } catch {
       // The process can disappear between readdir and readFile.
     }
@@ -253,6 +255,158 @@ async function boundedConnectionSmoke(
 }
 
 /**
+ * What commands share once they join one holder, which no runner test double
+ * can show: `/tmp` and the process table carry from one command to the next,
+ * a process may outlive the command that started it, and it ends when the
+ * sandbox does -- on stop, on idle, on a network policy change, or when the
+ * holder itself is killed.
+ */
+async function sharedSandboxSmoke(appRoot: string): Promise<void> {
+  const storagePath = path.join(appRoot, "shared-release", ".eve", "sandbox-cache");
+  const environment = createBwrapSandboxProviderDefinition().environment({ runTimeoutMs: 20_000 });
+  const artifact = await environment.prepare({
+    storagePath,
+    log: () => {},
+    templateKey: () => "shared-smoke",
+    async populate() {},
+  });
+  const ctx = { kind: "session" as const, session: { id: "shared-1" }, storagePath };
+  const { connection, state } = await environment.start(ctx, undefined, artifact);
+
+  // /tmp belongs to the sandbox, not to one command.
+  await runOver(connection, "echo carried > /tmp/note");
+  assert.equal((await runOver(connection, "cat /tmp/note")).stdout, "carried\n");
+
+  // A process in its own session outlives the command that started it, and a
+  // later command can see it, signal it, and read what it wrote.
+  const marker = "302.25";
+  const launched = await runOver(
+    connection,
+    `setsid sh -c 'echo $$ > /tmp/bg.pid; exec sleep ${marker}' > /tmp/bg.out 2>&1 < /dev/null & ` +
+      "while [ ! -s /tmp/bg.pid ]; do sleep 0.05; done; cat /tmp/bg.pid",
+  );
+  assert.equal(launched.exitCode, 0);
+  const backgroundPid = launched.stdout.trim();
+  assert.match(backgroundPid, /^\d+$/);
+  assert.equal(
+    (await runOver(connection, `kill -0 ${backgroundPid} && echo alive`)).stdout,
+    "alive\n",
+    "a background process must outlive the command that started it",
+  );
+  assert.equal((await hostProcessesMatching(marker)).length, 1);
+
+  // eve's bash tool hands a long command off as a background job this way: a
+  // launcher waits on the job, and a second command signals the launcher by
+  // pid to let go of it. That needs both the shared /tmp and the shared
+  // process table.
+  const handoffMarker = "303.75";
+  const launcher = await connection.spawn({
+    command: [
+      "mkdir -p /tmp/job",
+      "trap 'exit 0' USR1",
+      'echo "$$" > /tmp/job/launcher',
+      "set -m",
+      `(sleep ${handoffMarker}; echo "$?" > /tmp/job/exit) < /dev/null > /tmp/job/stdout 2>&1 &`,
+      "pid=$!",
+      "set +m",
+      'echo "$pid" > /tmp/job/pid',
+      'wait "$pid"',
+    ].join("\n"),
+    env: {},
+    workingDirectory: "/workspace",
+  });
+  const claimed = await runOver(
+    connection,
+    "while [ ! -s /tmp/job/pid ]; do sleep 0.05; done; " +
+      'kill -USR1 "$(cat /tmp/job/launcher)" && cat /tmp/job/pid',
+  );
+  assert.equal(claimed.exitCode, 0, "a later command must be able to signal an earlier one");
+  const handedOff = await Promise.race([
+    launcher.wait().then(({ exitCode }) => exitCode),
+    sleep(5_000).then(() => "timeout" as const),
+  ]);
+  assert.equal(handedOff, 0, "the launcher must let go of its job when signalled");
+  assert.equal(
+    (await runOver(connection, `kill -0 -- -${claimed.stdout.trim()} && echo running`)).stdout,
+    "running\n",
+    "the handed-off job must keep running as its own process group",
+  );
+  assert.equal((await hostProcessesMatching(handoffMarker)).length, 1);
+
+  // Idle: the sandbox's processes end, its files stay, and nothing restarts.
+  await connection.writeFiles({
+    files: [{ path: "/workspace/kept.txt", content: new TextEncoder().encode("kept") }],
+  });
+  await environment.onSessionIdle(ctx, state, {});
+  await sleep(200);
+  assert.deepEqual(await hostProcessesMatching(marker), [], "idle must end background processes");
+  assert.deepEqual(await hostProcessesMatching(handoffMarker), []);
+  await environment.onSessionIdle(ctx, state, {});
+
+  // A resumed sandbox is a new one over the same workspace: fresh /tmp, same files.
+  const resumed = await environment.resume(ctx, artifact, state);
+  assert.equal((await runOver(resumed, "cat kept.txt")).stdout, "kept");
+  assert.notEqual(
+    (await runOver(resumed, "cat /tmp/note")).exitCode,
+    0,
+    "a new holder must start from an empty /tmp",
+  );
+
+  // Changing the network policy ends what the old one left running, so a
+  // process started with the network cannot keep it after deny-all.
+  const networked = "304.5";
+  await runOver(resumed, `setsid sleep ${networked} > /dev/null 2>&1 < /dev/null &`);
+  assert.equal((await hostProcessesMatching(networked)).length, 1);
+  await resumed.extensions.setNetworkPolicy("deny-all");
+  await sleep(200);
+  assert.deepEqual(
+    await hostProcessesMatching(networked),
+    [],
+    "deny-all must end processes started while the network was allowed",
+  );
+  const denied = await runOver(resumed, IFACE_COMMAND);
+  assert.equal(nonLoopbackInterfaces(denied.stdout).length, 0, "deny-all must hold after a switch");
+  await runOver(resumed, "echo isolated > /tmp/denied-note");
+  assert.equal((await runOver(resumed, "cat /tmp/denied-note")).stdout, "isolated\n");
+  await resumed.extensions.setNetworkPolicy("allow-all");
+  assert.ok(nonLoopbackInterfaces((await runOver(resumed, IFACE_COMMAND)).stdout).length > 0);
+
+  // A sandboxed command can kill the holder shell. That ends the sandbox's
+  // processes, the killer included; the next command gets a fresh holder.
+  const stray = "305.125";
+  await runOver(resumed, `setsid sleep ${stray} > /dev/null 2>&1 < /dev/null &`);
+  const suicide = await runOver(resumed, "kill -9 2; sleep 30");
+  assert.notEqual(suicide.exitCode, 0, "killing the holder must end the command that did it");
+  await sleep(200);
+  assert.deepEqual(await hostProcessesMatching(stray), [], "a dead holder takes its sandbox along");
+  assert.equal(
+    (await runOver(resumed, "echo back")).stdout,
+    "back\n",
+    "the next command must start a new holder",
+  );
+
+  // stop() ends background processes too, not only commands still awaited.
+  const stopped = "306.5";
+  await runOver(resumed, `setsid sleep ${stopped} > /dev/null 2>&1 < /dev/null &`);
+  assert.equal((await hostProcessesMatching(stopped)).length, 1);
+  await resumed.stop();
+  await sleep(200);
+  assert.deepEqual(await hostProcessesMatching(stopped), [], "stop must end background processes");
+
+  await environment.onSessionEnd(ctx, state, { reason: "deleted" });
+
+  // An idle sandbox must not keep its host alive. This one is left running on
+  // purpose: if its holder held the event loop, this process would never exit
+  // and the run would hang instead of printing its result and returning.
+  const lingering = { kind: "session" as const, session: { id: "shared-lingering" }, storagePath };
+  const left = await environment.start(lingering, undefined, artifact);
+  assert.equal((await runOver(left.connection, "echo up")).stdout, "up\n");
+  console.log(
+    "SHARED SANDBOX SMOKE: shared /tmp and process table, background hand-off, idle stop, policy switch, and holder loss held under real bwrap",
+  );
+}
+
+/**
  * What the sandbox itself guarantees, probed from inside a command: the
  * workspace and cwd, a read-only host root, no host environment, hidden cache
  * roots, a private PID table, the network switch, executable bits across the
@@ -301,13 +455,41 @@ async function boundarySmoke(appRoot: string, hostFilePath: string): Promise<voi
   assert.equal(cacheLs.stdout.trim(), "", "the sandbox cache root must be hidden by tmpfs");
 
   // PID NAMESPACE probe: --unshare-pid must give the sandbox its own private
-  // process table. A runner test double cannot fake a kernel namespace.
+  // process table, and a joined command must land in it. A runner test double
+  // cannot fake a kernel namespace. The table holds bwrap's init, the holder
+  // shell, and this command's own processes.
   const procCount = await runOver(connection, "ls /proc | grep -Ec '^[0-9]+$'");
   const sandboxPidCount = Number.parseInt(procCount.stdout.trim(), 10);
   assert.ok(
-    Number.isInteger(sandboxPidCount) && sandboxPidCount > 0 && sandboxPidCount <= 5,
+    Number.isInteger(sandboxPidCount) && sandboxPidCount > 0 && sandboxPidCount <= 8,
     `PID namespace isolation failed: /proc showed ${procCount.stdout.trim()} entries`,
   );
+  const hostPid = await runOver(connection, `test -e /proc/${process.pid}/cmdline; echo rc=$?`);
+  const init = await runOver(connection, "cat /proc/1/comm");
+  assert.ok(
+    hostPid.stdout.trim() === "rc=1" || process.pid <= 8,
+    "the host process must not be visible from the sandbox",
+  );
+  assert.equal(init.stdout.trim(), "bwrap", "the sandbox's init must be bwrap");
+
+  // A joined command drops every capability it held while entering the
+  // namespaces and has no-new-privileges set, as a bwrap child would.
+  const privileges = await runOver(connection, "grep -E '^(CapEff|NoNewPrivs)' /proc/self/status");
+  assert.match(privileges.stdout, /CapEff:\s+0+\n/, "a command must run without capabilities");
+  assert.match(privileges.stdout, /NoNewPrivs:\s+1\n/, "a command must not gain privileges");
+
+  const missingCwd = await connection.spawn({
+    command: "echo unreachable",
+    env: {},
+    workingDirectory: "/workspace/no-such-directory",
+  });
+  const [missingCwdOut, missingCwdExit] = await Promise.all([
+    new Response(missingCwd.stdout).text(),
+    missingCwd.wait(),
+    new Response(missingCwd.stderr).text(),
+  ]);
+  assert.equal(missingCwdExit.exitCode, 1, "a missing working directory must fail the command");
+  assert.equal(missingCwdOut, "", "a command must not run outside its working directory");
 
   // network: allow-all sees a non-loopback interface; deny-all does not.
   // /sys/class/net shows the namespace that mounted sysfs, so ask the kernel
@@ -327,14 +509,14 @@ async function boundarySmoke(appRoot: string, hostFilePath: string): Promise<voi
   await connection.extensions.setNetworkPolicy("allow-all");
 
   // Sustained short-command churn must not grow the host process table.
-  const zombiesBefore = await countBwrapZombies();
+  const zombiesBefore = await countSandboxZombies();
   for (let index = 0; index < 500; index += 1) {
     const short = await runOver(connection, "true");
     assert.equal(short.exitCode, 0, `short command ${index} failed`);
   }
   await sleep(200);
   assert.equal(
-    await countBwrapZombies(),
+    await countSandboxZombies(),
     zombiesBefore,
     "500 short commands must not leak zombies",
   );
@@ -402,6 +584,7 @@ async function boundarySmoke(appRoot: string, hostFilePath: string): Promise<voi
 
 async function main(): Promise<void> {
   assert.equal(isBwrapAvailable(), true, "bwrap must be installed");
+  assert.equal(isPythonAvailable(), true, "python3 with ctypes must be installed");
   process.env.SMOKE_SECRET = SECRET;
 
   const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-smoke-"));
@@ -413,6 +596,7 @@ async function main(): Promise<void> {
 
     await boundarySmoke(appRoot, hostFilePath);
     await connectionProviderSmoke(appRoot);
+    await sharedSandboxSmoke(appRoot);
 
     console.log("BWRAP SMOKE OK");
   } finally {
@@ -422,5 +606,7 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   console.error(error);
-  process.exitCode = 1;
+  // Exit now: a command still running in a sandbox would otherwise hold the
+  // process open until its run timeout.
+  process.exit(1);
 });
