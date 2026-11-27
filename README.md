@@ -118,7 +118,7 @@ eve calls the provider through its connection contract and builds the sandbox se
 - **connection.close** (end of every step): releases nothing. The compute generation outlives
   the step; `stop`, the idle stop, server exit, and bwrap's `--die-with-parent` end it.
 - **setNetworkPolicy**: `"allow-all"` runs in a holder that shares the host network, and
-  every other policy in one that has no network. A holder's network namespace is fixed when
+  every other policy in one with a network namespace of its own. A holder's network namespace is fixed when
   it starts, so moving between the two ends the holder and the next command starts another.
   Whatever was left running ends with it — a process started with the network cannot keep
   it after `"deny-all"` — and `/tmp` starts empty again; commands still running when the
@@ -174,11 +174,11 @@ of the cgroup the agent runs in until the sandbox stops.
 
 ### Network policy
 
-| Policy                                | What a command can reach                                  |
-| ------------------------------------- | --------------------------------------------------------- |
-| `"allow-all"` (default)               | Whatever the host can: the sandbox shares its network.    |
-| `"deny-all"`                          | Nothing. Only loopback exists inside the sandbox.         |
-| `{ allow, subnets: { allow, deny } }` | The listed domains and address ranges, through the proxy. |
+| Policy                                | What a command can reach                                 |
+| ------------------------------------- | -------------------------------------------------------- |
+| `"allow-all"` (default)               | Whatever the host can: the sandbox shares its network.   |
+| `"deny-all"`                          | Nothing. Only loopback exists inside the sandbox.        |
+| `{ allow, subnets: { allow, deny } }` | The listed domains and address ranges, and nothing else. |
 
 An allow-list denies by default. `allow` lists domains: `example.com` matches that host
 only, `*.example.com` every subdomain but not `example.com` itself, `www.*.com` one label in
@@ -187,23 +187,54 @@ domain needed, and `subnets.deny` lists CIDRs that are never reachable, even thr
 allowed domain or range. eve's record form, `{ allow: { "example.com": [] } }`, is accepted
 with empty rule lists.
 
-A sandbox under an allow-list has no network of its own. Its commands get `HTTP_PROXY`,
-`HTTPS_PROXY`, their lowercase forms, `NO_PROXY` for loopback, and `NODE_USE_ENV_PROXY=1`,
-all pointing at a forwarder on the sandbox's loopback. The forwarder relays to an HTTP proxy
-in the agent process, which opens a connection only to a destination the policy allows. The
-proxy resolves a name once and connects to the address it checked.
+A sandbox under an allow-list has a network namespace of its own, with no interface but
+loopback. A helper on the host enters that namespace and loads nftables rules into it, so
+the kernel hands every TCP connection a sandboxed program opens, and every DNS query it
+sends, to the helper. The helper relays each one to a gateway in the agent process, along
+with the destination the program asked for, and the gateway opens a connection only to a
+destination the policy allows.
 
-What follows from enforcing the policy in a proxy:
+No program is asked to cooperate. Nothing is set in a command's environment, and `ssh`, a
+database client, or a bare socket is captured exactly as `curl` is. The sandbox's processes
+hold no capability over their network namespace, so they cannot remove the rules.
 
-- Only programs that use an HTTP proxy reach anything: `curl`, `git` over https, `npm`,
-  `pip`, `gh`, and Node's `fetch` do. A program that opens its own sockets — `ssh`, a
-  database client, `git` over ssh — reaches nothing, including destinations the policy
-  allows. That fails closed.
-- A domain is matched for HTTPS and for plain HTTP alike, on any port.
-- TLS is tunnelled, never terminated, so the proxy sees a destination and not a request.
-  Rules on a domain — eve's header `transform` and `forwardURL` — need the request, and a
-  policy that carries one is rejected.
-- A refused destination gets a `403` from the proxy and a `network.denied` event.
+How a connection is matched:
+
+- **By domain.** The name is read from the connection itself: the server name in a TLS
+  handshake, or the `Host` header of a plain HTTP request, on any port. TLS is passed
+  through undecrypted. The gateway resolves the name itself and connects to an address it
+  resolved, not to the one the program chose, so naming an allowed domain while connecting
+  somewhere else reaches only the allowed domain.
+- **By address.** A destination in `subnets.allow` is reached whatever protocol is spoken to
+  it. That is how to allow a protocol that names no domain when it connects: SSH, or one
+  that starts TLS only after a plaintext exchange, as Postgres does by default and SMTP
+  does with `STARTTLS`. A connection that has not named a domain within five seconds is
+  treated as naming none.
+- **`*`** admits every destination, traffic that names no domain included.
+- **The host's own addresses** — loopback, link-local (where cloud metadata services live),
+  and the unspecified address — are reached only through a `subnets.allow` range that names
+  them, never through a domain or `*`. The gateway connects from the host's network, and a
+  domain that resolved to one of them would otherwise reach a service the host never meant
+  to publish.
+- **DNS.** A query to any server is answered by the gateway. A name the policy allows is
+  passed to the host's own resolvers; any other is answered as nonexistent and never leaves
+  the host. A policy with a `subnets.allow` range leaves every name resolvable, so that
+  names inside the range can be found.
+- **Everything else** — other UDP, ICMP — reaches nothing. HTTP/3 clients fall back to TCP.
+  IPv6 is captured like IPv4 where the kernel has nftables NAT for it; where it does not,
+  IPv6 destinations are unreachable and programs fall back to IPv4.
+
+A refused connection is answered in the protocol it spoke: a `403` for HTTP, a fatal
+`access_denied` alert for TLS, and a closed connection for anything else. Each refusal emits
+a `network.denied` event; a refused lookup reports the name with port 53.
+
+TLS is never terminated, so the gateway sees a destination and not a request. Rules on a
+domain — eve's header `transform` and `forwardURL` — need the request, and a policy that
+carries one is rejected.
+
+An allow-list needs `nft` and `ip` on the host; see [Requirements](#requirements). On a
+host that cannot enforce one, a command under an allow-list fails with the reason instead
+of running without a route, and a sandbox already running keeps the policy it had.
 
 ## Disk usage and cache management
 
@@ -285,13 +316,17 @@ telemetry, not part of the sandbox boundary.
   in a boundary that hides them (a systemd unit with `TemporaryFileSystem=`/`BindPaths=`,
   or a container); bwrap only re-exposes what the agent process can already see.
 - The network is shared with the host under `"allow-all"`, the default. `"deny-all"` leaves
-  only loopback. An allow-list also leaves only loopback, plus a proxy that connects to the
-  listed destinations on the sandbox's behalf. The proxy runs in the agent process and
-  connects from the host's network, so a name or range the policy allows is reached with
-  everything the host can reach at that address, a service on the host's own loopback
-  included; use `subnets.deny` to rule ranges out. A sandboxed program can connect to the
-  proxy's socket directly, which gains it nothing the forwarder does not already give it,
-  and cannot replace the socket: its directory is bound read-only.
+  only loopback. Under an allow-list the kernel hands everything that leaves the sandbox to
+  a gateway in the agent process, which connects from the host's network: a name or range
+  the policy allows is reached with whatever the host can reach at that address. The
+  host's own loopback and link-local addresses are excluded unless a `subnets.allow` range
+  names them; use `subnets.deny` to rule other ranges out. Three things an allow-list does
+  not do. It does not decrypt TLS, so a server that hosts several domains at one address
+  decides which of them a request inside the handshake reaches: allowing one domain on a
+  shared CDN can reach others on it. A `subnets.allow` range leaves DNS unrestricted, and a
+  lookup can carry data to whoever serves the name. And a sandboxed program that can see
+  the gateway's socket, which lives in the agent's temporary directory, can connect to it
+  directly; it is held to the same policy there.
 - The host-side `readFile` is deliberately **not** containment-checked: eve passes absolute
   paths through to the host filesystem, so a read can reach anything the agent process can
   read, including a sibling session's files. Only `writeFiles` and `removePath` are confined
@@ -356,6 +391,11 @@ telemetry, not part of the sandbox boundary.
   privilege beyond what bwrap already needs, because the agent's user owns the holder's
   user namespace. A missing Python fails with an actionable message before anything runs;
   an older kernel fails each command with exit code 125 and the reason on its stderr.
+- For an allow-list network policy only: `nft` (nftables) and `ip` (iproute2) in a standard
+  system directory such as `/usr/sbin`, and nftables NAT in the kernel. The helper that
+  loads the rules needs no privilege beyond what bwrap already needs: it enters the user
+  namespace bwrap created, which the agent's user owns. `"allow-all"` and `"deny-all"` need
+  neither.
 - `bash`, plus whatever tools the agent needs (`node`, `git`, …), on the host `PATH`.
 - Works under systemd hardening (`NoNewPrivileges=yes`, `ProtectSystem=strict`): the
   packaged `bwrap` is not setuid, so it needs no privilege escalation, only the AppArmor

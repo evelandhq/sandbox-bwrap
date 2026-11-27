@@ -10,7 +10,7 @@ import {
   type BwrapDirectoryCopier,
 } from "./cache.js";
 import { createBwrapConnection, sandboxHome } from "./connection.js";
-import type { EgressLookup } from "./egress-proxy.js";
+import type { EgressLookup } from "./egress-gateway.js";
 import { BwrapSandboxSessionGoneError, BwrapTemplateNotProvisionedError } from "./errors.js";
 import {
   resolveNetworkPolicy,
@@ -62,7 +62,7 @@ export interface CreateBwrapSandboxProviderDefinitionInput {
   readonly runner?: ProcessRunner;
   /** Injectable clone primitive for filesystem-capability tests. */
   readonly copyDirectory?: BwrapDirectoryCopier;
-  /** Injectable resolver for the egress proxy, so tests need no DNS. */
+  /** Injectable resolver for the egress gateway, so tests need no DNS. */
   readonly egressLookup?: EgressLookup;
 }
 

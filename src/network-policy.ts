@@ -42,6 +42,11 @@ export type ResolvedNetworkPolicy =
       readonly recorded: Exclude<RecordedNetworkPolicy, string>;
       /** Whether `host`, a DNS name, is on the domain allow-list. */
       allowsDomain(host: string): boolean;
+      /**
+       * Whether the list holds the catch-all `*`. It admits traffic that names
+       * no domain at all, which no other pattern can match.
+       */
+      readonly allowsAnyDomain: boolean;
       /** Whether `address`, an IP literal, is in an allowed range. */
       allowsAddress(address: string): boolean;
       /** Whether `address` is in a denied range, which overrides every allow. */
@@ -191,6 +196,7 @@ export function resolveNetworkPolicy(policy: unknown): ResolvedNetworkPolicy {
           }
         : {}),
     },
+    allowsAnyDomain: uniqueDomains.includes("*"),
     allowsDomain: (host) => {
       const name = host.toLowerCase().replace(/\.$/, "");
       return uniqueDomains.some((pattern) => matchesDomain(pattern, name));

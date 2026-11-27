@@ -53,11 +53,20 @@ non-obvious behaviors are deliberate and documented there:
   to a bwrap per command, and do not let a move away from `allow-all` keep
   the old holder: `/tmp`, the process table, and the guarantee that a
   restricted policy ends what ran with the network all depend on it.
-- An allow-list is enforced in the host process, by the proxy in
-  `src/egress-proxy.ts`; the forwarder inside the sandbox only relays. A
-  policy is applied as written or refused (`src/network-policy.ts`): never
-  accept a part of one, such as a rule on a domain, that the proxy would
-  then ignore.
+- An allow-list is enforced in the host process, by the gateway in
+  `src/egress-gateway.ts`. The capture helper (`src/capture.ts`) only makes
+  the kernel deliver the sandbox's traffic and relays it; it decides nothing.
+  It runs on the host and enters the user namespace that owns the sandbox's
+  network namespace, never the nested one the sandbox's processes run in:
+  that separation is why a sandboxed program cannot remove the rules. Do not
+  move the policy into the sandbox, and do not make it depend on a program's
+  cooperation (proxy variables). A policy is applied as written or refused
+  (`src/network-policy.ts`): never accept a part of one, such as a rule on a
+  domain, that the gateway would then ignore.
+- The gateway connects to an address it resolved for the name a connection
+  carries, never to the address the program chose, and never to the host's
+  own addresses unless a `subnets.allow` range names them. Both are what keep
+  an allowed domain from being a way to reach something else.
 - A joined command gets its environment from `env -i` and its working
   directory from a `cd` in the join script, because bwrap's `--clearenv` and
   `--chdir` belong to the holder. Nothing may reach a command through the

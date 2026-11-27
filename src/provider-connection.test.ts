@@ -284,7 +284,7 @@ describe("start, resume, and session end", () => {
 
     const holder = fakeHolders(runner)[0]!;
     expect(holder.argv).toContain("--unshare-net");
-    expect(holder.egressStarts).toBe(1);
+    expect(holder.captures).toHaveLength(1);
     await resumed.stop();
   });
 

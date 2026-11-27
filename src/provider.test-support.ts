@@ -1,7 +1,8 @@
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { EGRESS_READY_MARKER, HOLDER_READY_MARKER } from "./args.js";
+import { HOLDER_READY_MARKER } from "./args.js";
+import { CAPTURE_READY_MARKER, isNetworkCaptureArgs } from "./capture.js";
 import type { ProcessRunner } from "./process.js";
 
 export const empty = () => new ReadableStream<Uint8Array>({ start: (c) => c.close() });
@@ -66,13 +67,28 @@ export interface FakeHolder {
   readonly targetPid: number;
   /** The mount namespace id the fake reports for its sandbox. */
   readonly mountNamespace: number;
-  /** How many times the provider asked this holder to start its egress forwarder. */
-  egressStarts: number;
   killed: boolean;
+  /** The capture helpers the provider started against this holder, oldest first. */
+  readonly captures: FakeCapture[];
   /** Ends the holder the way a crash or an in-sandbox `kill` would. */
   exit(exitCode?: number): void;
 }
 
+/** A capture helper a fake runner started in place of a real one. */
+export interface FakeCapture {
+  /** The gateway socket the helper was told to relay to. */
+  readonly socketPath: string;
+  killed: boolean;
+  /** Ends the helper the way a crash would. */
+  exit(exitCode?: number): void;
+}
+
+/** Makes the next capture helper started through `runner` fail the way a host without nft does. */
+export function failNextCapture(runner: ProcessRunner, message: string): void {
+  captureFailures.set(withFakeHolder(runner), message);
+}
+
+const captureFailures = new WeakMap<ProcessRunner, string>();
 const holderAware = new WeakMap<ProcessRunner, ProcessRunner>();
 const holdersOf = new WeakMap<ProcessRunner, FakeHolder[]>();
 
@@ -87,9 +103,8 @@ function textStream(text: string): ReadableStream<Uint8Array> {
 
 /**
  * Wraps a fake runner so it answers a holder spawn the way bwrap does: the
- * pid of the in-sandbox init on stdout, the ready marker on stderr, the
- * egress marker when a line arrives on stdin, and a process that lives until
- * it is killed. The wrapped runner never sees holder
+ * pid of the in-sandbox init on stdout, the ready marker on stderr, and a
+ * process that lives until it is killed. The wrapped runner never sees holder
  * spawns, so its own call records and counters describe commands only.
  * Wrapping the same runner again returns the same wrapper, so a test can
  * reach the holders of a runner it handed to a helper.
@@ -100,49 +115,56 @@ export function withFakeHolder(runner: ProcessRunner): ProcessRunner {
   const holders: FakeHolder[] = [];
   const wrapped: ProcessRunner = {
     spawn(argv, options) {
+      if (isNetworkCaptureArgs(argv)) {
+        const target = holders.find((holder) => holder.targetPid === Number(argv[5]));
+        const failure = captureFailures.get(wrapped);
+        captureFailures.delete(wrapped);
+        let settleCapture!: (value: { exitCode: number }) => void;
+        const captureExit = new Promise<{ exitCode: number }>(
+          (resolve) => (settleCapture = resolve),
+        );
+        const capture: FakeCapture = {
+          socketPath: argv[7]!,
+          killed: false,
+          exit: (exitCode = 1) => settleCapture({ exitCode }),
+        };
+        if (failure === undefined) target?.captures.push(capture);
+        else settleCapture({ exitCode: 125 });
+        return {
+          pid: 7_000,
+          stdin: new WritableStream<Uint8Array>(),
+          stdout: textStream(""),
+          stderr: textStream(`${failure ?? CAPTURE_READY_MARKER}\n`),
+          wait: async () => await captureExit,
+          kill: async () => {
+            capture.killed = true;
+            settleCapture({ exitCode: 137 });
+          },
+        };
+      }
       if (!argv.includes("--info-fd")) return runner.spawn(argv, options);
       let settle!: (value: { exitCode: number }) => void;
       const exit = new Promise<{ exitCode: number }>((resolve) => (settle = resolve));
-      const encoder = new TextEncoder();
-      let stderr!: ReadableStreamDefaultController<Uint8Array>;
-      const end = (exitCode: number) => {
-        try {
-          stderr.close();
-        } catch {
-          // Already closed by an earlier exit.
-        }
-        settle({ exitCode });
-      };
       const holder: FakeHolder = {
         argv: [...argv],
         targetPid: 9_000 + holders.length + 1,
         mountNamespace: 4_026_530_000 + holders.length + 1,
-        egressStarts: 0,
         killed: false,
-        exit: (exitCode = 1) => end(exitCode),
+        captures: [],
+        exit: (exitCode = 1) => settle({ exitCode }),
       };
       holders.push(holder);
       return {
         pid: 8_000 + holders.length,
-        stdin: new WritableStream<Uint8Array>({
-          write() {
-            holder.egressStarts += 1;
-            stderr.enqueue(encoder.encode(`${EGRESS_READY_MARKER}\n`));
-          },
-        }),
+        stdin: new WritableStream<Uint8Array>(),
         stdout: textStream(
           `{\n    "child-pid": ${holder.targetPid},\n    "mnt-namespace": ${holder.mountNamespace}\n}\n`,
         ),
-        stderr: new ReadableStream<Uint8Array>({
-          start(controller) {
-            stderr = controller;
-            controller.enqueue(encoder.encode(`${HOLDER_READY_MARKER}\n`));
-          },
-        }),
+        stderr: textStream(`${HOLDER_READY_MARKER}\n`),
         wait: async () => await exit,
         kill: async () => {
           holder.killed = true;
-          end(137);
+          settle({ exitCode: 137 });
         },
       };
     },
@@ -181,4 +203,58 @@ export function parseJoin(argv: readonly string[]) {
     chdir: argv.at(-2),
     command: argv.at(-1),
   };
+}
+
+function u16(value: number): Buffer {
+  const bytes = Buffer.alloc(2);
+  bytes.writeUInt16BE(value);
+  return bytes;
+}
+
+/** A minimal TLS ClientHello record, with a `server_name` extension unless `serverName` is null. */
+export function clientHello(serverName: string | null): Buffer {
+  const name = Buffer.from(serverName ?? "", "latin1");
+  const extensions =
+    serverName === null
+      ? Buffer.alloc(0)
+      : Buffer.concat([
+          u16(0),
+          u16(name.length + 5),
+          u16(name.length + 3),
+          Buffer.from([0]),
+          u16(name.length),
+          name,
+        ]);
+  const body = Buffer.concat([
+    Buffer.from([3, 3]),
+    Buffer.alloc(32, 7),
+    Buffer.from([0]),
+    u16(2),
+    Buffer.from([0x13, 0x01]),
+    Buffer.from([1, 0]),
+    u16(extensions.length),
+    extensions,
+  ]);
+  const handshake = Buffer.concat([Buffer.from([1, 0]), u16(body.length), body]);
+  return Buffer.concat([Buffer.from([0x16, 3, 1]), u16(handshake.length), handshake]);
+}
+
+/** A DNS query for the A record of `name`, in wire format. */
+export function dnsQuery(name: string, id = 0x1234): Buffer {
+  const labels = name
+    .split(".")
+    .filter((label) => label !== "")
+    .map((label) => Buffer.concat([Buffer.from([label.length]), Buffer.from(label, "latin1")]));
+  return Buffer.concat([
+    u16(id),
+    u16(0x0100),
+    u16(1),
+    u16(0),
+    u16(0),
+    u16(0),
+    ...labels,
+    Buffer.from([0]),
+    u16(1),
+    u16(1),
+  ]);
 }

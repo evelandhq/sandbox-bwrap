@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { EGRESS_READY_MARKER, HOLDER_READY_MARKER } from "./args.js";
+import { HOLDER_READY_MARKER } from "./args.js";
 import { startBwrapHolder } from "./holder.js";
 import type { ProcessRunner, ProcessRunnerSpawnOptions, SpawnedProcess } from "./process.js";
 
@@ -12,7 +12,6 @@ function scriptedHolder() {
     options: undefined as ProcessRunnerSpawnOptions | undefined,
     killed: 0,
     unrefs: 0,
-    stdinWrites: [] as string[],
   };
   let stdout!: ReadableStreamDefaultController<Uint8Array>;
   let stderr!: ReadableStreamDefaultController<Uint8Array>;
@@ -33,9 +32,7 @@ function scriptedHolder() {
       state.options = options;
       return {
         pid: 100,
-        stdin: new WritableStream<Uint8Array>({
-          write: (chunk) => void state.stdinWrites.push(new TextDecoder().decode(chunk)),
-        }),
+        stdin: new WritableStream<Uint8Array>(),
         stdout: new ReadableStream({ start: (controller) => void (stdout = controller) }),
         stderr: new ReadableStream({ start: (controller) => void (stderr = controller) }),
         wait: async () => await exit,
@@ -148,57 +145,5 @@ describe("startBwrapHolder", () => {
     expect(started.alive()).toBe(false);
     await started.stop();
     expect(holder.state.killed).toBe(0);
-  });
-
-  describe("startEgress", () => {
-    async function readyHolder(egress: boolean) {
-      const holder = scriptedHolder();
-      const starting = startBwrapHolder({
-        runner: holder.runner,
-        argv,
-        shareNetwork: false,
-        egress,
-        startTimeoutMs: 50,
-      });
-      holder.reportPid(7);
-      holder.writeStderr(`${HOLDER_READY_MARKER}\n`);
-      return { holder, started: await starting };
-    }
-
-    test("asks the holder for a forwarder once and resolves when it accepts connections", async () => {
-      const { holder, started } = await readyHolder(true);
-      const first = started.startEgress();
-      const second = started.startEgress();
-      let settled = false;
-      void first.then(() => (settled = true));
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(settled).toBe(false);
-      expect(holder.state.stdinWrites).toEqual(["egress\n"]);
-
-      holder.writeStderr(`${EGRESS_READY_MARKER}\n`);
-      await Promise.all([first, second]);
-      await started.startEgress();
-      expect(holder.state.stdinWrites).toEqual(["egress\n"]);
-    });
-
-    /** Fail closed: a command must not run believing it has a route it lacks. */
-    test("a forwarder that does not start fails with what it wrote, and can be tried again", async () => {
-      const { holder, started } = await readyHolder(true);
-      const failing = started.startEgress();
-      holder.writeStderr("python3: No module named socket\n");
-      await expect(failing).rejects.toThrow(
-        /egress forwarder did not start.*No module named socket/s,
-      );
-
-      const retry = started.startEgress();
-      holder.writeStderr(`${EGRESS_READY_MARKER}\n`);
-      await retry;
-      expect(holder.state.stdinWrites).toHaveLength(2);
-    });
-
-    test("a holder started without an egress socket has no forwarder to start", async () => {
-      const { started } = await readyHolder(false);
-      await expect(started.startEgress()).rejects.toThrow(/without an egress proxy/);
-    });
   });
 });

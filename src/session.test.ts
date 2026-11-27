@@ -1,14 +1,15 @@
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { request } from "node:http";
+import { connect } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { EGRESS_PROXY_PORT, EGRESS_SOCKET_DIR } from "./args.js";
 import { resolveBwrapSandboxOptions } from "./options.js";
 import type { BwrapSandboxEvent } from "./events.js";
 import type { ProcessRunner, SpawnedProcess } from "./process.js";
 import {
+  clientHello,
+  failNextCapture,
   fakeHolders,
   parseJoin,
   readUntilSettled,
@@ -55,7 +56,7 @@ async function makeSession(result?: { exitCode?: number; stdout?: string; stderr
     runner,
     options: resolveBwrapSandboxOptions({ env: { FACTORY: "yes" } }),
   });
-  return { session, calls, workspaceDir, appRoot, holders: () => fakeHolders(runner) };
+  return { session, calls, workspaceDir, appRoot, runner, holders: () => fakeHolders(runner) };
 }
 
 describe("spawn", () => {
@@ -554,11 +555,12 @@ describe("network policy", () => {
   });
 
   /**
-   * An allow-list runs in a sandbox with no network of its own. What reaches
-   * the outside goes through the egress proxy in the host process, which a
-   * forwarder inside the sandbox relays to; the proxy is what decides.
+   * An allow-list runs in a sandbox with a network namespace of its own. A
+   * helper on the host hands everything that leaves it to the egress gateway
+   * in the host process, which is what decides. Nothing in the sandbox is
+   * asked to cooperate: no proxy variable, no socket bound into it.
    */
-  test("an allow-list runs commands without a network and points them at the egress forwarder", async () => {
+  test("an allow-list runs commands in their own network and hands its traffic to the gateway", async () => {
     const { session, calls, holders } = await makeSession();
     await session.setNetworkPolicy({ allow: ["api.example.com"] });
     await session.spawn({ command: "one" });
@@ -567,48 +569,43 @@ describe("network policy", () => {
     const holder = holders()[0]!;
     expect(holders()).toHaveLength(1);
     expect(holder.argv).toContain("--unshare-net");
-    const bind = holder.argv.indexOf(EGRESS_SOCKET_DIR) - 2;
-    expect(holder.argv[bind]).toBe("--ro-bind");
-    expect(existsSync(path.join(holder.argv[bind + 1]!, "proxy.sock"))).toBe(true);
-    // The forwarder is started once, however many commands use it.
-    expect(holder.egressStarts).toBe(1);
+    expect(holder.argv.filter((arg) => arg === "--ro-bind")).toHaveLength(1);
+    // One helper per sandbox, however many commands run in it.
+    expect(holder.captures).toHaveLength(1);
+    expect(existsSync(holder.captures[0]!.socketPath)).toBe(true);
     const join = parseJoin(calls[1]!);
     expect(join.joinsNetwork).toBe(true);
-    expect(join.env).toMatchObject({
-      HTTPS_PROXY: `http://127.0.0.1:${EGRESS_PROXY_PORT}`,
-      https_proxy: `http://127.0.0.1:${EGRESS_PROXY_PORT}`,
-      HTTP_PROXY: `http://127.0.0.1:${EGRESS_PROXY_PORT}`,
-      NO_PROXY: "localhost,127.0.0.1,::1",
-      NODE_USE_ENV_PROXY: "1",
-    });
+    expect(Object.keys(join.env).filter((name) => /proxy/i.test(name))).toEqual([]);
   });
 
-  test("deny-all starts no forwarder and sets no proxy", async () => {
-    const { session, calls, holders } = await makeSession();
+  test("deny-all starts no capture helper: the sandbox simply has no route", async () => {
+    const { session, holders } = await makeSession();
     await session.setNetworkPolicy("deny-all");
     await session.spawn({ command: "true" });
-    expect(holders()[0]!.egressStarts).toBe(0);
-    expect(Object.keys(parseJoin(calls[0]!).env).filter((name) => /proxy/i.test(name))).toEqual([]);
+    expect(holders()[0]!.argv).toContain("--unshare-net");
+    expect(holders()[0]!.captures).toHaveLength(0);
   });
 
   /**
-   * Both run without a network, so nothing has to be restarted: the proxy's
-   * policy is what changes, and with it what processes already running reach.
+   * Both run in a network namespace of their own, so nothing has to be
+   * restarted: the gateway's policy is what changes, and with it what
+   * processes already running reach.
    */
   test("moving between deny-all and an allow-list keeps the holder", async () => {
-    const { session, calls, holders } = await makeSession();
+    const { session, holders } = await makeSession();
     await session.setNetworkPolicy("deny-all");
     await session.spawn({ command: "true" });
     await session.setNetworkPolicy({ allow: ["example.com"] });
+    // Before any further command: what the first one left running is covered.
+    expect(holders()[0]!.captures).toHaveLength(1);
     await session.spawn({ command: "true" });
     await session.setNetworkPolicy("deny-all");
     await session.spawn({ command: "true" });
 
     expect(holders()).toHaveLength(1);
     expect(holders()[0]!.killed).toBe(false);
-    expect(holders()[0]!.egressStarts).toBe(1);
-    expect(parseJoin(calls[1]!).env.HTTPS_PROXY).toBeDefined();
-    expect(parseJoin(calls[2]!).env.HTTPS_PROXY).toBeUndefined();
+    expect(holders()[0]!.captures).toHaveLength(1);
+    expect(holders()[0]!.captures[0]!.killed).toBe(false);
   });
 
   test("moving from allow-all to an allow-list ends the holder that had the network", async () => {
@@ -618,13 +615,46 @@ describe("network policy", () => {
     await session.setNetworkPolicy({ allow: ["example.com"] });
     await session.spawn({ command: "true" });
     expect(holders().map((holder) => holder.killed)).toEqual([true, false]);
+    expect(holders().map((holder) => holder.captures.length)).toEqual([0, 1]);
   });
 
-  test("an authored proxy variable wins over the forwarder's", async () => {
-    const { session, calls } = await makeSession();
+  test("a capture helper that died is replaced by the next command", async () => {
+    const { session, holders } = await makeSession();
     await session.setNetworkPolicy({ allow: ["example.com"] });
-    await session.spawn({ command: "true", env: { HTTPS_PROXY: "http://corp.proxy:8080" } });
-    expect(parseJoin(calls[0]!).env.HTTPS_PROXY).toBe("http://corp.proxy:8080");
+    await session.spawn({ command: "true" });
+    holders()[0]!.captures[0]!.exit();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await session.spawn({ command: "true" });
+
+    expect(holders()).toHaveLength(1);
+    expect(holders()[0]!.captures).toHaveLength(2);
+  });
+
+  /**
+   * A host without nft, or a kernel without nftables NAT, cannot enforce an
+   * allow-list. A command then fails with the reason rather than run with no
+   * route to what it was allowed, and a running sandbox keeps its old policy.
+   */
+  test("an allow-list the host cannot enforce fails with the reason", async () => {
+    const reason =
+      "bwrap sandbox: cannot take over the sandbox's network: nft: No such file or directory";
+    const fresh = await makeSession();
+    await fresh.session.setNetworkPolicy({ allow: ["example.com"] });
+    failNextCapture(fresh.runner, reason);
+    await expect(fresh.session.spawn({ command: "true" })).rejects.toThrow(reason);
+    expect(fresh.calls).toHaveLength(0);
+
+    const running = await makeSession();
+    await running.session.setNetworkPolicy("deny-all");
+    await running.session.spawn({ command: "true" });
+    failNextCapture(running.runner, reason);
+    await expect(running.session.setNetworkPolicy({ allow: ["example.com"] })).rejects.toThrow(
+      reason,
+    );
+    // Still deny-all: the next command needs no helper and starts none.
+    await running.session.spawn({ command: "true" });
+    expect(running.holders()[0]!.captures).toHaveLength(0);
   });
 
   /**
@@ -632,7 +662,7 @@ describe("network policy", () => {
    * enforce throws and leaves the policy in force unchanged.
    */
   test("a policy that cannot be enforced is refused and changes nothing", async () => {
-    const { session, calls, holders } = await makeSession();
+    const { session, holders } = await makeSession();
     await session.setNetworkPolicy("deny-all");
     await expect(
       session.setNetworkPolicy({
@@ -642,10 +672,10 @@ describe("network policy", () => {
     await expect(session.setNetworkPolicy("allow-some")).rejects.toThrow(/allow-all.*deny-all/);
     await session.spawn({ command: "true" });
     expect(holders()[0]!.argv).toContain("--unshare-net");
-    expect(parseJoin(calls[0]!).env.HTTPS_PROXY).toBeUndefined();
+    expect(holders()[0]!.captures).toHaveLength(0);
   });
 
-  test("a destination the proxy turns away is reported as an event, and stop removes the proxy", async () => {
+  test("a destination the gateway turns away is reported as an event, and stop removes the gateway", async () => {
     const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-egress-events-"));
     const events: BwrapSandboxEvent[] = [];
     const runner = withFakeHolder(createFakeRunner().runner);
@@ -661,32 +691,24 @@ describe("network policy", () => {
       egressLookup: async () => ["127.0.0.1"],
     });
     await session.spawn({ command: "true" });
-    const holder = fakeHolders(runner)[0]!;
-    const socketDir = holder.argv[holder.argv.indexOf(EGRESS_SOCKET_DIR) - 1]!;
+    const capture = fakeHolders(runner)[0]!.captures[0]!;
 
-    const status = await new Promise<number>((resolve, reject) => {
-      const req = request(
-        {
-          socketPath: path.join(socketDir, "proxy.sock"),
-          method: "CONNECT",
-          path: "other.test:443",
-        },
-        () => {},
-      );
-      req.on("connect", (res, socket) => {
-        socket.destroy();
-        resolve(res.statusCode ?? 0);
-      });
-      req.on("error", reject);
-      req.end();
+    // What the capture helper relays for a sandboxed program's connection.
+    await new Promise<void>((resolve, reject) => {
+      const relayed = connect(capture.socketPath);
+      relayed.on("error", reject);
+      relayed.on("data", () => {});
+      relayed.on("close", () => resolve());
+      relayed.write("T 203.0.113.9 443\n");
+      relayed.write(clientHello("other.test"));
     });
 
-    expect(status).toBe(403);
     expect(events.filter((event) => event.type === "network.denied")).toEqual([
       expect.objectContaining({ host: "other.test", port: 443, sessionId: "s1" }),
     ]);
     await session.killAll();
-    expect(existsSync(socketDir)).toBe(false);
+    expect(capture.killed).toBe(true);
+    expect(existsSync(capture.socketPath)).toBe(false);
   });
 });
 

@@ -100,4 +100,12 @@ describe("resolveNetworkPolicy", () => {
     expect(() => resolveNetworkPolicy(policy)).toThrow(reason);
     expect(() => resolveNetworkPolicy(policy)).toThrow(/allow-all.*deny-all/);
   });
+
+  /** Only the catch-all admits traffic that names no domain; no other pattern can match it. */
+  test("allowsAnyDomain is true for a list holding the catch-all alone", () => {
+    const any = resolveNetworkPolicy({ allow: ["example.com", "*"] });
+    const some = resolveNetworkPolicy({ allow: ["*.example.com"] });
+    expect(any.kind === "allow-list" && any.allowsAnyDomain).toBe(true);
+    expect(some.kind === "allow-list" && some.allowsAnyDomain).toBe(false);
+  });
 });

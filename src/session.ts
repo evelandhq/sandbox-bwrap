@@ -7,10 +7,10 @@ import {
   buildBwrapHolderArgs,
   buildSandboxJoinArgs,
   DEFAULT_SANDBOX_PATH,
-  egressEnvironment,
   SANDBOX_AGENT_ENV,
 } from "./args.js";
-import { startEgressProxy, type EgressLookup, type EgressProxy } from "./egress-proxy.js";
+import { startNetworkCapture, type NetworkCapture } from "./capture.js";
+import { startEgressGateway, type EgressGateway, type EgressLookup } from "./egress-gateway.js";
 import { startBwrapHolder, type BwrapHolder } from "./holder.js";
 import { resolveNetworkPolicy, type ResolvedNetworkPolicy } from "./network-policy.js";
 import type { ResolvedBwrapSandboxOptions } from "./options.js";
@@ -41,7 +41,7 @@ export interface CreateBwrapSessionInput {
   readonly generationId?: string;
   readonly tags?: Readonly<Record<string, string>>;
   readonly onStopped?: () => void | Promise<void>;
-  /** Injectable resolver for the egress proxy, so tests need no DNS. */
+  /** Injectable resolver for the egress gateway, so tests need no DNS. */
   readonly egressLookup?: EgressLookup;
 }
 
@@ -93,11 +93,12 @@ export interface BwrapSession {
    * pass any of eve's policies, and one this provider cannot enforce throws.
    *
    * `"allow-all"` shares the host network; every other policy runs in a
-   * sandbox with no network of its own, where an allow-list is served by the
-   * egress proxy. Moving between those two kinds ends the holder and with it
-   * whatever was left running under the old policy, after commands still in
-   * flight have finished. Moving among the restricted policies takes effect
-   * at once, on processes already running too.
+   * sandbox with a network namespace of its own, where an allow-list is
+   * enforced on every connection the sandbox makes. Moving between those two
+   * kinds ends the holder and with it whatever was left running under the old
+   * policy, after commands still in flight have finished. Moving among the
+   * restricted policies takes effect at once, on processes already running
+   * too.
    */
   setNetworkPolicy(policy: unknown): Promise<void>;
   /**
@@ -165,6 +166,8 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
   interface HolderSlot {
     readonly shareNetwork: boolean;
     readonly ready: Promise<BwrapHolder>;
+    /** The helper that hands this holder's traffic to the egress gateway. */
+    capture?: Promise<NetworkCapture>;
     commands: number;
     retired: boolean;
     stopping?: Promise<void>;
@@ -174,18 +177,49 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
   let current: HolderSlot | undefined;
 
   /**
-   * The egress proxy of this generation, started with its first holder that
-   * has no network. Every such holder is bound to it, whatever the policy is
-   * then, so a later move to an allow-list needs no new sandbox.
+   * The egress gateway of this generation, started the first time an
+   * allow-list has to be enforced. It follows the policy from then on, so a
+   * sandbox whose traffic it has been given stays under the current one.
    */
-  let egress: Promise<EgressProxy> | undefined;
-  function ensureEgress(): Promise<EgressProxy> {
-    egress ??= startEgressProxy({
+  let egress: Promise<EgressGateway> | undefined;
+  function ensureEgress(): Promise<EgressGateway> {
+    egress ??= startEgressGateway({
       policy: networkPolicy,
       ...(input.egressLookup ? { lookup: input.egressLookup } : {}),
       onDenied: ({ host, port }) => emit({ type: "network.denied", host, port }),
     });
     return egress;
+  }
+
+  /**
+   * Hands a restricted holder's traffic to the egress gateway. Until this
+   * has happened the sandbox has no route at all, which is all `"deny-all"`
+   * needs; an allow-list needs it before anything in the sandbox can reach a
+   * destination it was allowed. A helper that has died is replaced once.
+   */
+  async function ensureCapture(slot: HolderSlot, holder: BwrapHolder): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      const pending = (slot.capture ??= (async () =>
+        await startNetworkCapture({
+          runner,
+          pythonPath: options.pythonPath,
+          targetPid: holder.targetPid,
+          ...(holder.mountNamespace === undefined ? {} : { mountNamespace: holder.mountNamespace }),
+          socketPath: (await ensureEgress()).socketPath,
+        }))());
+      let capture: NetworkCapture;
+      try {
+        capture = await pending;
+      } catch (error) {
+        if (slot.capture === pending) slot.capture = undefined;
+        throw error;
+      }
+      if (capture.alive()) return;
+      if (slot.capture === pending) slot.capture = undefined;
+      if (attempt > 0) {
+        throw new Error("bwrap sandbox: the sandbox's network helper exited as soon as it started");
+      }
+    }
   }
 
   function startSlot(shareNetwork: boolean): HolderSlot {
@@ -196,29 +230,16 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     );
     const slot: HolderSlot = {
       shareNetwork,
-      ready: (async () => {
-        const proxy = shareNetwork ? undefined : await ensureEgress();
-        return await startBwrapHolder({
-          runner,
+      ready: startBwrapHolder({
+        runner,
+        shareNetwork,
+        argv: buildBwrapHolderArgs({
+          bwrapPath: options.bwrapPath,
+          workspaceDir,
+          hidePaths,
           shareNetwork,
-          egress: proxy !== undefined,
-          argv: buildBwrapHolderArgs({
-            bwrapPath: options.bwrapPath,
-            workspaceDir,
-            hidePaths,
-            shareNetwork,
-            ...(proxy
-              ? {
-                  egress: {
-                    socketDir: proxy.socketDir,
-                    socketName: proxy.socketName,
-                    pythonPath: options.pythonPath,
-                  },
-                }
-              : {}),
-          }),
-        });
-      })(),
+        }),
+      }),
       commands: 0,
       retired: false,
     };
@@ -232,6 +253,8 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       // A holder that never started has nothing to stop.
       const holder = await slot.ready.catch(() => undefined);
       await holder?.stop();
+      const capture = await slot.capture?.catch(() => undefined);
+      await capture?.stop();
       slots.delete(slot);
     })();
     try {
@@ -495,13 +518,12 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       releaseSlot(slot);
       throw new Error(`bwrap sandbox: compute generation is ${lifecycle}; refusing to spawn`);
     }
-    // An allow-list is reached through the forwarder, which a sandbox gets
-    // the first time it needs one. If it cannot start, the command fails
+    // Under an allow-list the sandbox's traffic has to reach the gateway
+    // before the command runs. If that cannot be arranged, the command fails
     // rather than run with no route to the destinations it was allowed.
-    const proxied = !holder.shareNetwork && networkPolicy.kind === "allow-list";
-    if (proxied) {
+    if (!holder.shareNetwork && networkPolicy.kind === "allow-list") {
       try {
-        await holder.startEgress();
+        await ensureCapture(slot, holder);
       } catch (error) {
         releaseSlot(slot);
         throw error;
@@ -512,7 +534,6 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       HOME: WORKSPACE_ROOT,
       LANG: "C.UTF-8",
       ...SANDBOX_AGENT_ENV,
-      ...(proxied ? egressEnvironment() : {}),
       ...options.env,
       ...spawnOptions.env,
     };
@@ -634,6 +655,15 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
 
     async setNetworkPolicy(policy: unknown) {
       const next = resolveNetworkPolicy(policy);
+      // A sandbox already running under "deny-all" has no route, and what a
+      // command left running in it must be able to reach what the new policy
+      // allows. Arranged first, while the gateway still refuses everything:
+      // if it fails, the policy is left as it was.
+      if (next.kind === "allow-list" && current && !current.shareNetwork) {
+        const slot = current;
+        const holder = await slot.ready.catch(() => undefined);
+        if (holder?.alive()) await ensureCapture(slot, holder);
+      }
       networkPolicy = next;
       // First, so a connection the new policy does not allow is closed before
       // this resolves, including one a background process holds.
