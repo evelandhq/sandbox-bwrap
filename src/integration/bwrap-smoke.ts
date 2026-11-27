@@ -5,10 +5,14 @@
 // ProtectSystem=strict) to mirror a deployed eve agent.
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { createServer as createTcpServer, type AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { CAPTURE_READY_MARKER } from "../capture.js";
 import { EVE_SANDBOX_HOME_PROBE } from "../connection.js";
+import type { BwrapSandboxEvent } from "../events.js";
 import { isBwrapAvailable, isPythonAvailable } from "../process.js";
 import type { BwrapSandboxConnection } from "../provider-contract.js";
 import {
@@ -56,6 +60,21 @@ async function hostProcessesMatching(marker: string): Promise<number[]> {
     try {
       const cmdline = await readFile(`/proc/${entry}/cmdline`, "utf8");
       if (cmdline.split("\0").includes(marker)) pids.push(Number(entry));
+    } catch {
+      // The process can disappear between readdir and readFile.
+    }
+  }
+  return pids;
+}
+
+/** Host pids of capture helpers, which carry their marker inside the script they were given. */
+async function captureHelpers(): Promise<number[]> {
+  const pids: number[] = [];
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
+    try {
+      const cmdline = await readFile(`/proc/${entry}/cmdline`, "utf8");
+      if (cmdline.includes(CAPTURE_READY_MARKER)) pids.push(Number(entry));
     } catch {
       // The process can disappear between readdir and readFile.
     }
@@ -407,6 +426,240 @@ async function sharedSandboxSmoke(appRoot: string): Promise<void> {
 }
 
 /**
+ * An allow-list over the real binaries: bwrap, the capture helper, nft, and
+ * the gateway. The destinations run in this process and are reached at this
+ * host's own address, under a name only the gateway's resolver knows, so the
+ * test needs no outside network. Programs in the sandbox are given no proxy
+ * and deliberately connect to an address that does not exist: what reaches
+ * the destination is decided by the name the connection carries.
+ */
+async function egressSmoke(appRoot: string): Promise<void> {
+  const address = Object.values(os.networkInterfaces())
+    .flat()
+    .find((entry) => entry !== undefined && entry.family === "IPv4" && !entry.internal)?.address;
+  assert.ok(address, "the egress smoke needs a non-loopback IPv4 address on the host");
+
+  const web = createServer((req, res) => res.end(`reached ${req.url}`));
+  await new Promise<void>((resolve) => web.listen(0, "0.0.0.0", resolve));
+  const port = (web.address() as AddressInfo).port;
+  // A destination that speaks first, like SSH, and records how each client opened.
+  const openings: number[] = [];
+  const raw = createTcpServer((socket) => {
+    socket.on("error", () => {});
+    socket.write("SMOKE-BANNER\n");
+    socket.once("data", (chunk: Buffer) => void openings.push(chunk[0]!));
+  });
+  await new Promise<void>((resolve) => raw.listen(0, "0.0.0.0", resolve));
+  const rawPort = (raw.address() as AddressInfo).port;
+
+  const ALLOWED = "allowed.smoke.test";
+  const OTHER = "other.smoke.test";
+  // TEST-NET-2: an address nothing answers on.
+  const NOWHERE = "198.51.100.7";
+  const pinned = (name: string, to: number) => `--resolve ${name}:${to}:${NOWHERE}`;
+
+  const storagePath = path.join(appRoot, "egress-release", ".eve", "sandbox-cache");
+  const events: BwrapSandboxEvent[] = [];
+  const environment = createBwrapSandboxProviderDefinition({
+    egressLookup: async (host) => {
+      if (host === ALLOWED) return [address];
+      throw new Error(`no such host ${host}`);
+    },
+  }).environment({ onEvent: (event) => void events.push(event) });
+  const artifact = await environment.prepare({
+    storagePath,
+    log: () => {},
+    templateKey: () => "egress-smoke",
+    async populate() {},
+  });
+  const ctx = { kind: "session" as const, session: { id: "egress-1" }, storagePath };
+  const { connection } = await environment.start(
+    ctx,
+    { networkPolicy: { allow: [ALLOWED] } },
+    artifact,
+  );
+  const status = async (command: string) =>
+    (await runOver(connection, `${command} -s -o /dev/null -w '%{http_code}' --max-time 10`))
+      .stdout;
+  const denials = () =>
+    events.flatMap((event) =>
+      event.type === "network.denied" ? [`${event.host}:${event.port}`] : [],
+    );
+
+  // The sandbox has no interface but loopback and is told about no proxy.
+  const interfaces = await runOver(connection, IFACE_COMMAND);
+  assert.equal(nonLoopbackInterfaces(interfaces.stdout).length, 0, "an allow-list has no network");
+  const proxies = await runOver(connection, "env | grep -ci proxy || true");
+  assert.equal(proxies.stdout.trim(), "0", "no proxy variable may be set");
+
+  // An allowed name is reached whatever address the program connected to.
+  const allowed = await runOver(
+    connection,
+    `curl -sS --max-time 10 ${pinned(ALLOWED, port)} http://${ALLOWED}:${port}/plain`,
+  );
+  assert.equal(allowed.stdout, "reached /plain", "an allowed domain must be reachable");
+  // A program with no notion of a proxy: a bare socket from Node.
+  const fromNode = await runOver(
+    connection,
+    `node -e "const s=require('net').connect(${port},'${NOWHERE}',()=>s.end('GET /node HTTP/1.0\\r\\nHost: ${ALLOWED}\\r\\n\\r\\n'));s.pipe(process.stdout)"`,
+  );
+  assert.match(fromNode.stdout, /reached \/node$/, "a bare socket must be captured");
+  // IPv6 is captured like IPv4, whether or not the host has an IPv6 route.
+  const overV6 = await runOver(
+    connection,
+    `curl -sS --max-time 10 -H 'Host: ${ALLOWED}' 'http://[2001:db8::7]:${port}/v6'`,
+  );
+  assert.equal(overV6.stdout, "reached /v6", "an IPv6 connection must be captured");
+  // TLS is matched by the name in its handshake and passed on undecrypted.
+  await runOver(
+    connection,
+    `curl -sk --max-time 5 ${pinned(ALLOWED, rawPort)} https://${ALLOWED}:${rawPort}/`,
+  );
+  assert.deepEqual(openings, [0x16], "an allowed TLS handshake must reach its destination");
+
+  // Anything else is refused: another name by HTTP and by TLS, a bare
+  // address, and a protocol that names no domain.
+  assert.equal(
+    await status(`curl ${pinned(OTHER, port)} http://${OTHER}:${port}/`),
+    "403",
+    "an unlisted domain is refused",
+  );
+  const otherTls = await runOver(
+    connection,
+    `curl -sk --max-time 5 ${pinned(OTHER, rawPort)} https://${OTHER}:${rawPort}/`,
+  );
+  assert.notEqual(otherTls.exitCode, 0, "an unlisted TLS name is refused");
+  assert.equal(await status(`curl http://${address}:${port}/`), "403", "an address needs a range");
+  const banner = `timeout 5 bash -c 'exec 3<>/dev/tcp/${address}/${rawPort} && head -n 1 <&3'`;
+  assert.equal((await runOver(connection, banner)).stdout, "", "a nameless protocol is refused");
+  assert.deepEqual(openings, [0x16], "nothing refused may reach a destination");
+  assert.deepEqual(
+    denials(),
+    [`${OTHER}:${port}`, `${OTHER}:${rawPort}`, `${address}:${port}`, `${address}:${rawPort}`],
+    "refused destinations must be reported",
+  );
+
+  // DNS: a query to any server is answered by the gateway. An allowed name is
+  // passed to the host's resolver; any other is answered here and never
+  // leaves the host.
+  const dig = (name: string) =>
+    `python3 -I -c "
+import socket, struct
+q = struct.pack('!6H', 0x4242, 0x0100, 1, 0, 0, 0) + b''.join(bytes([len(l)]) + l.encode() for l in '${name}'.split('.')) + b'\\0' + struct.pack('!2H', 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(10); s.sendto(q, ('${NOWHERE}', 53))
+r, peer = s.recvfrom(4096)
+print(peer[0], struct.unpack('!H', r[:2])[0] == 0x4242, r[3] & 15)
+"`;
+  events.length = 0;
+  const [, matched] = (await runOver(connection, dig(ALLOWED))).stdout.trim().split(" ");
+  assert.equal(matched, "True", "a query for an allowed name must be answered");
+  assert.deepEqual(denials(), [], "a query for an allowed name is not a denial");
+  assert.equal(
+    (await runOver(connection, dig(OTHER))).stdout.trim(),
+    `${NOWHERE} True 3`,
+    "a query for an unlisted name is answered as nonexistent, from the address it was sent to",
+  );
+  assert.deepEqual(denials(), [`${OTHER}:53`], "a refused lookup must be reported");
+
+  // The sandbox cannot undo the capture: its processes hold no capability
+  // over their network namespace.
+  const tamper = await runOver(
+    connection,
+    "nft flush ruleset 2>&1; ip route flush table local 2>&1; ip link add x type dummy 2>&1; true",
+  );
+  assert.match(
+    tamper.stdout,
+    /not permitted/i,
+    "the sandbox must not be able to change its network",
+  );
+  assert.equal(
+    (
+      await runOver(
+        connection,
+        `curl -sS --max-time 10 ${pinned(ALLOWED, port)} http://${ALLOWED}:${port}/still`,
+      )
+    ).stdout,
+    "reached /still",
+  );
+  assert.equal(
+    await status(`curl ${pinned(OTHER, port)} http://${OTHER}:${port}/`),
+    "403",
+    "the policy must still hold after an attempt to remove it",
+  );
+
+  // Address ranges: an allowed one admits the address and whatever protocol
+  // is spoken to it, a denied one overrides both it and the allowed domain.
+  // Both take effect without a new sandbox.
+  await runOver(connection, "echo kept > /tmp/egress-note");
+  await connection.extensions.setNetworkPolicy({
+    allow: [ALLOWED],
+    subnets: { allow: [`${address}/32`] },
+  });
+  assert.equal(await status(`curl http://${address}:${port}/`), "200", "an allowed range admits");
+  assert.equal(
+    (await runOver(connection, banner)).stdout,
+    "SMOKE-BANNER\n",
+    "an allowed range admits a protocol that names no domain",
+  );
+  await connection.extensions.setNetworkPolicy({
+    allow: [ALLOWED],
+    subnets: { allow: [`${address}/32`], deny: [`${address}/32`] },
+  });
+  assert.equal(await status(`curl http://${address}:${port}/`), "403", "a denied range overrides");
+  assert.equal(
+    await status(`curl ${pinned(ALLOWED, port)} http://${ALLOWED}:${port}/`),
+    "403",
+    "a denied range overrides an allowed domain",
+  );
+
+  // A catch-all admits everything but the host's own addresses.
+  await connection.extensions.setNetworkPolicy({ allow: ["*"] });
+  assert.equal(await status(`curl http://${address}:${port}/`), "200", "a catch-all admits");
+  assert.equal(
+    (
+      await runOver(connection, `curl -s --max-time 5 http://127.0.0.1:${port}/ || echo unreached`)
+    ).stdout.trim(),
+    "unreached",
+    "loopback in the sandbox is the sandbox's own, not the host's",
+  );
+
+  // deny-all withdraws access from the same sandbox, at once, and an
+  // allow-list gives it back.
+  await connection.extensions.setNetworkPolicy("deny-all");
+  const afterDeny = await runOver(connection, `curl -s --max-time 5 http://${address}:${port}/`);
+  assert.notEqual(afterDeny.stdout, "reached /", "deny-all must withdraw access");
+  await connection.extensions.setNetworkPolicy({ allow: [ALLOWED] });
+  assert.equal(
+    await status(`curl ${pinned(ALLOWED, port)} http://${ALLOWED}:${port}/`),
+    "200",
+    "an allow-list after deny-all must restore access",
+  );
+  assert.equal(
+    (await runOver(connection, "cat /tmp/egress-note")).stdout,
+    "kept\n",
+    "moving among restricted policies must not restart the sandbox",
+  );
+
+  await assert.rejects(
+    connection.extensions.setNetworkPolicy({
+      allow: { [ALLOWED]: [{ transform: [{ headers: { authorization: "x" } }] }] },
+    } as never),
+    /rules on a domain/,
+  );
+
+  assert.equal((await captureHelpers()).length, 1, "one capture helper per sandbox");
+  await connection.stop();
+  await environment.onSessionEnd(ctx, null, { reason: "deleted" });
+  assert.deepEqual(await captureHelpers(), [], "stopping the sandbox must end its capture helper");
+  web.closeAllConnections();
+  await new Promise<void>((resolve) => web.close(() => resolve()));
+  await new Promise<void>((resolve) => raw.close(() => resolve()));
+  console.log(
+    "EGRESS SMOKE: capture of every connection and DNS query, allow-list by domain and range, refusal, tamper resistance, live policy change, and deny-all held under real bwrap",
+  );
+}
+
+/**
  * What the sandbox itself guarantees, probed from inside a command: the
  * workspace and cwd, a read-only host root, no host environment, hidden cache
  * roots, a private PID table, the network switch, executable bits across the
@@ -597,6 +850,7 @@ async function main(): Promise<void> {
     await boundarySmoke(appRoot, hostFilePath);
     await connectionProviderSmoke(appRoot);
     await sharedSandboxSmoke(appRoot);
+    await egressSmoke(appRoot);
 
     console.log("BWRAP SMOKE OK");
   } finally {

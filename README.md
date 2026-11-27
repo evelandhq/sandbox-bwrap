@@ -2,9 +2,9 @@
 
 A [bubblewrap](https://github.com/containers/bubblewrap) sandbox provider for
 [eve](https://www.npmjs.com/package/eve) agents. It gives agent-executed code a real Linux
-sandbox — actual binaries, an isolated writable workspace, background processes, coarse
-network control — with nothing but the `bwrap` binary, Python 3, and unprivileged user
-namespaces: no Docker daemon, no KVM.
+sandbox — actual binaries, an isolated writable workspace, background processes, network
+control down to an allow-list of domains — with nothing but the `bwrap` binary, Python 3,
+and unprivileged user namespaces: no Docker daemon, no KVM.
 
 ## Why
 
@@ -44,9 +44,10 @@ export default defineSandbox(() => environment.open());
 - eve records which provider prepared each sandbox and refuses to open it with a different
   one. Choose the provider from something that is the same at build and run time, not from
   `isBwrapAvailable()` on hosts that differ.
-- `environment.open({ networkPolicy: "deny-all" })` sets a session's initial network policy.
-  It is recorded in the session state and applied again after a restart. The session also
-  has `setNetworkPolicy("allow-all" | "deny-all")`.
+- `environment.open({ networkPolicy })` sets a session's initial network policy: `"allow-all"`,
+  `"deny-all"`, or an allow-list such as `{ allow: ["api.github.com", "*.npmjs.org"] }`. It is
+  recorded in the session state and applied again after a restart. The session also has
+  `setNetworkPolicy(policy)`. See [Network policy](#network-policy).
 - `idleTimeoutMs`, eve's standard environment option from eve 1.1 on, stops a session's
   sandbox once the session has been idle that long (5 minutes when omitted). The sandbox's
   processes end and its workspace stays; the next turn that uses it starts a new sandbox
@@ -64,7 +65,7 @@ export default defineSandbox(() => environment.open());
 | Option                   | Default                   | Meaning                                                                                                                                                                                                                                                                                                                                                                               |
 | ------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `env`                    | `{}`                      | Environment variables set for every sandboxed command, above `AI_AGENT=eve` and below each call's own `env`.                                                                                                                                                                                                                                                                          |
-| `networkPolicy`          | `"allow-all"`             | `"allow-all"` shares the host network; `"deny-all"` gives the sandbox no network (`--unshare-net`). Domain-level and header-rewriting policies are rejected, not weakened.                                                                                                                                                                                                            |
+| `networkPolicy`          | `"allow-all"`             | `"allow-all"` shares the host network, `"deny-all"` gives the sandbox none, and an allow-list of domains and subnets admits only those. A policy with rules on a domain is rejected, not weakened. See [Network policy](#network-policy).                                                                                                                                             |
 | `hidePaths`              | `[]`                      | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                                                                            |
 | `bwrapPath`              | `"bwrap"`                 | bwrap executable to invoke.                                                                                                                                                                                                                                                                                                                                                           |
 | `pythonPath`             | `"python3"`               | Python 3 executable. Every command joins its sandbox through a short helper it runs.                                                                                                                                                                                                                                                                                                  |
@@ -116,11 +117,13 @@ eve calls the provider through its connection contract and builds the sandbox se
   fresh compute generation over the same files.
 - **connection.close** (end of every step): releases nothing. The compute generation outlives
   the step; `stop`, the idle stop, server exit, and bwrap's `--die-with-parent` end it.
-- **setNetworkPolicy**: a holder's network namespace is fixed when it starts, so a different
-  policy ends the holder and the next command starts one under the new policy. Whatever was
-  left running under the old policy ends with it — a process started with the network cannot
-  keep it after `"deny-all"` — and `/tmp` starts empty again. Commands still running when the
-  policy changes finish first.
+- **setNetworkPolicy**: `"allow-all"` runs in a holder that shares the host network, and
+  every other policy in one with a network namespace of its own. A holder's network namespace is fixed when
+  it starts, so moving between the two ends the holder and the next command starts another.
+  Whatever was left running ends with it — a process started with the network cannot keep
+  it after `"deny-all"` — and `/tmp` starts empty again; commands still running when the
+  policy changes finish first. Moving among `"deny-all"` and allow-lists restarts nothing
+  and takes effect at once, on processes already running too.
 - **onSessionIdle** (the session has been idle for `idleTimeoutMs`, eve 1.1 and later): stops
   the live generation if this process holds one, as `connection.stop` does, and starts
   nothing otherwise.
@@ -161,13 +164,77 @@ sandbox's compute does:
 - the session goes idle for `idleTimeoutMs` (eve 1.1 and later; on eve 1.0 nothing stops an
   idle sandbox, so a background process there runs until one of the following);
 - `sandbox.stop()`, the session's end, or `sandbox.delete()`;
-- `setNetworkPolicy()` moves to a different policy;
+- `setNetworkPolicy()` moves between `"allow-all"` and a restricted policy;
 - the agent process exits.
 
 A command that runs past `runTimeoutMs` is killed together with its process group, which is
 everything it started that did not move to a process group of its own, as `setsid` or a job
 under `set -m` does. `/tmp` is a tmpfs, so what is written there counts against the memory
 of the cgroup the agent runs in until the sandbox stops.
+
+### Network policy
+
+| Policy                                | What a command can reach                                 |
+| ------------------------------------- | -------------------------------------------------------- |
+| `"allow-all"` (default)               | Whatever the host can: the sandbox shares its network.   |
+| `"deny-all"`                          | Nothing. Only loopback exists inside the sandbox.        |
+| `{ allow, subnets: { allow, deny } }` | The listed domains and address ranges, and nothing else. |
+
+An allow-list denies by default. `allow` lists domains: `example.com` matches that host
+only, `*.example.com` every subdomain but not `example.com` itself, `www.*.com` one label in
+that position, and `*` any domain. `subnets.allow` lists CIDRs reachable by address, with no
+domain needed, and `subnets.deny` lists CIDRs that are never reachable, even through an
+allowed domain or range. eve's record form, `{ allow: { "example.com": [] } }`, is accepted
+with empty rule lists.
+
+A sandbox under an allow-list has a network namespace of its own, with no interface but
+loopback. A helper on the host enters that namespace and loads nftables rules into it, so
+the kernel hands every TCP connection a sandboxed program opens, and every DNS query it
+sends, to the helper. The helper relays each one to a gateway in the agent process, along
+with the destination the program asked for, and the gateway opens a connection only to a
+destination the policy allows.
+
+No program is asked to cooperate. Nothing is set in a command's environment, and `ssh`, a
+database client, or a bare socket is captured exactly as `curl` is. The sandbox's processes
+hold no capability over their network namespace, so they cannot remove the rules.
+
+How a connection is matched:
+
+- **By domain.** The name is read from the connection itself: the server name in a TLS
+  handshake, or the `Host` header of a plain HTTP request, on any port. TLS is passed
+  through undecrypted. The gateway resolves the name itself and connects to an address it
+  resolved, not to the one the program chose, so naming an allowed domain while connecting
+  somewhere else reaches only the allowed domain.
+- **By address.** A destination in `subnets.allow` is reached whatever protocol is spoken to
+  it. That is how to allow a protocol that names no domain when it connects: SSH, or one
+  that starts TLS only after a plaintext exchange, as Postgres does by default and SMTP
+  does with `STARTTLS`. A connection that has not named a domain within five seconds is
+  treated as naming none.
+- **`*`** admits every destination, traffic that names no domain included.
+- **The host's own addresses** — loopback, link-local (where cloud metadata services live),
+  and the unspecified address — are reached only through a `subnets.allow` range that names
+  them, never through a domain or `*`. The gateway connects from the host's network, and a
+  domain that resolved to one of them would otherwise reach a service the host never meant
+  to publish.
+- **DNS.** A query to any server is answered by the gateway. A name the policy allows is
+  passed to the host's own resolvers; any other is answered as nonexistent and never leaves
+  the host. A policy with a `subnets.allow` range leaves every name resolvable, so that
+  names inside the range can be found.
+- **Everything else** — other UDP, ICMP — reaches nothing. HTTP/3 clients fall back to TCP.
+  IPv6 is captured like IPv4 where the kernel has nftables NAT for it; where it does not,
+  IPv6 destinations are unreachable and programs fall back to IPv4.
+
+A refused connection is answered in the protocol it spoke: a `403` for HTTP, a fatal
+`access_denied` alert for TLS, and a closed connection for anything else. Each refusal emits
+a `network.denied` event; a refused lookup reports the name with port 53.
+
+TLS is never terminated, so the gateway sees a destination and not a request. Rules on a
+domain — eve's header `transform` and `forwardURL` — need the request, and a policy that
+carries one is rejected.
+
+An allow-list needs `nft` and `ip` on the host; see [Requirements](#requirements). On a
+host that cannot enforce one, a command under an allow-list fails with the reason instead
+of running without a route, and a sandbox already running keeps the policy it had.
 
 ## Disk usage and cache management
 
@@ -216,7 +283,9 @@ positive.
 ## Lifecycle observability
 
 `onEvent` receives discriminated `generation.started`, `command.started`,
-`command.finished`, `cleanup.started`, `cleanup.completed`, and `cleanup.failed` events.
+`command.finished`, `network.denied`, `cleanup.started`, `cleanup.completed`, and
+`cleanup.failed` events. `network.denied` carries the host and port the network policy
+turned away, never a path, a header, or a body.
 They include session/generation/command identities, tags, PID/process-group identity when
 available, duration, output byte counts, live-process counts, finish reason (`exit`,
 `abort`, `timeout`, `output-limit`, `killed`, `cleanup`), and cleanup errors. Events omit
@@ -247,7 +316,17 @@ telemetry, not part of the sandbox boundary.
   in a boundary that hides them (a systemd unit with `TemporaryFileSystem=`/`BindPaths=`,
   or a container); bwrap only re-exposes what the agent process can already see.
 - The network is shared with the host under `"allow-all"`, the default. `"deny-all"` leaves
-  only loopback. There is nothing in between.
+  only loopback. Under an allow-list the kernel hands everything that leaves the sandbox to
+  a gateway in the agent process, which connects from the host's network: a name or range
+  the policy allows is reached with whatever the host can reach at that address. The
+  host's own loopback and link-local addresses are excluded unless a `subnets.allow` range
+  names them; use `subnets.deny` to rule other ranges out. Three things an allow-list does
+  not do. It does not decrypt TLS, so a server that hosts several domains at one address
+  decides which of them a request inside the handshake reaches: allowing one domain on a
+  shared CDN can reach others on it. A `subnets.allow` range leaves DNS unrestricted, and a
+  lookup can carry data to whoever serves the name. And a sandboxed program that can see
+  the gateway's socket, which lives in the agent's temporary directory, can connect to it
+  directly; it is held to the same policy there.
 - The host-side `readFile` is deliberately **not** containment-checked: eve passes absolute
   paths through to the host filesystem, so a read can reach anything the agent process can
   read, including a sibling session's files. Only `writeFiles` and `removePath` are confined
@@ -312,6 +391,11 @@ telemetry, not part of the sandbox boundary.
   privilege beyond what bwrap already needs, because the agent's user owns the holder's
   user namespace. A missing Python fails with an actionable message before anything runs;
   an older kernel fails each command with exit code 125 and the reason on its stderr.
+- For an allow-list network policy only: `nft` (nftables) and `ip` (iproute2) in a standard
+  system directory such as `/usr/sbin`, and nftables NAT in the kernel. The helper that
+  loads the rules needs no privilege beyond what bwrap already needs: it enters the user
+  namespace bwrap created, which the agent's user owns. `"allow-all"` and `"deny-all"` need
+  neither.
 - `bash`, plus whatever tools the agent needs (`node`, `git`, …), on the host `PATH`.
 - Works under systemd hardening (`NoNewPrivileges=yes`, `ProtectSystem=strict`): the
   packaged `bwrap` is not setuid, so it needs no privilege escalation, only the AppArmor

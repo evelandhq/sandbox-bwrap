@@ -9,7 +9,10 @@ import {
   DEFAULT_SANDBOX_PATH,
   SANDBOX_AGENT_ENV,
 } from "./args.js";
+import { startNetworkCapture, type NetworkCapture } from "./capture.js";
+import { startEgressGateway, type EgressGateway, type EgressLookup } from "./egress-gateway.js";
 import { startBwrapHolder, type BwrapHolder } from "./holder.js";
+import { resolveNetworkPolicy, type ResolvedNetworkPolicy } from "./network-policy.js";
 import type { ResolvedBwrapSandboxOptions } from "./options.js";
 import {
   isWithinWorkspaceReal,
@@ -38,6 +41,8 @@ export interface CreateBwrapSessionInput {
   readonly generationId?: string;
   readonly tags?: Readonly<Record<string, string>>;
   readonly onStopped?: () => void | Promise<void>;
+  /** Injectable resolver for the egress gateway, so tests need no DNS. */
+  readonly egressLookup?: EgressLookup;
 }
 
 function isMissingFileError(error: unknown): boolean {
@@ -83,11 +88,17 @@ export interface BwrapSession {
     readonly recursive?: boolean;
   }): Promise<void>;
   /**
-   * Coarse egress switch. Only `"allow-all"` and `"deny-all"` are accepted,
-   * checked at run time because callers can pass any of eve's policies. A
-   * holder's network namespace cannot change, so a different policy ends the
-   * holder and with it whatever was left running under the old one; commands
-   * still in flight finish first.
+   * Replaces the network policy: `"allow-all"`, `"deny-all"`, or an allow-list
+   * of domains and subnets. It is checked at run time because callers can
+   * pass any of eve's policies, and one this provider cannot enforce throws.
+   *
+   * `"allow-all"` shares the host network; every other policy runs in a
+   * sandbox with a network namespace of its own, where an allow-list is
+   * enforced on every connection the sandbox makes. Moving between those two
+   * kinds ends the holder and with it whatever was left running under the old
+   * policy, after commands still in flight have finished. Moving among the
+   * restricted policies takes effect at once, on processes already running
+   * too.
    */
   setNetworkPolicy(policy: unknown): Promise<void>;
   /**
@@ -103,7 +114,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
   const { id, workspaceDir, cacheRoots, runner, options } = input;
   const generationId = input.generationId ?? randomUUID();
   const tags = input.tags ?? {};
-  let networkPolicy: "allow-all" | "deny-all" = options.networkPolicy;
+  let networkPolicy: ResolvedNetworkPolicy = resolveNetworkPolicy(options.networkPolicy);
 
   function emit(event: BwrapSandboxEventPayload) {
     try {
@@ -155,6 +166,8 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
   interface HolderSlot {
     readonly shareNetwork: boolean;
     readonly ready: Promise<BwrapHolder>;
+    /** The helper that hands this holder's traffic to the egress gateway. */
+    capture?: Promise<NetworkCapture>;
     commands: number;
     retired: boolean;
     stopping?: Promise<void>;
@@ -162,6 +175,52 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
   /** Every holder not yet stopped: the current one and any still draining. */
   const slots = new Set<HolderSlot>();
   let current: HolderSlot | undefined;
+
+  /**
+   * The egress gateway of this generation, started the first time an
+   * allow-list has to be enforced. It follows the policy from then on, so a
+   * sandbox whose traffic it has been given stays under the current one.
+   */
+  let egress: Promise<EgressGateway> | undefined;
+  function ensureEgress(): Promise<EgressGateway> {
+    egress ??= startEgressGateway({
+      policy: networkPolicy,
+      ...(input.egressLookup ? { lookup: input.egressLookup } : {}),
+      onDenied: ({ host, port }) => emit({ type: "network.denied", host, port }),
+    });
+    return egress;
+  }
+
+  /**
+   * Hands a restricted holder's traffic to the egress gateway. Until this
+   * has happened the sandbox has no route at all, which is all `"deny-all"`
+   * needs; an allow-list needs it before anything in the sandbox can reach a
+   * destination it was allowed. A helper that has died is replaced once.
+   */
+  async function ensureCapture(slot: HolderSlot, holder: BwrapHolder): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      const pending = (slot.capture ??= (async () =>
+        await startNetworkCapture({
+          runner,
+          pythonPath: options.pythonPath,
+          targetPid: holder.targetPid,
+          ...(holder.mountNamespace === undefined ? {} : { mountNamespace: holder.mountNamespace }),
+          socketPath: (await ensureEgress()).socketPath,
+        }))());
+      let capture: NetworkCapture;
+      try {
+        capture = await pending;
+      } catch (error) {
+        if (slot.capture === pending) slot.capture = undefined;
+        throw error;
+      }
+      if (capture.alive()) return;
+      if (slot.capture === pending) slot.capture = undefined;
+      if (attempt > 0) {
+        throw new Error("bwrap sandbox: the sandbox's network helper exited as soon as it started");
+      }
+    }
+  }
 
   function startSlot(shareNetwork: boolean): HolderSlot {
     // Evaluated when the sandbox starts, not per command: a path that appears
@@ -194,6 +253,8 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       // A holder that never started has nothing to stop.
       const holder = await slot.ready.catch(() => undefined);
       await holder?.stop();
+      const capture = await slot.capture?.catch(() => undefined);
+      await capture?.stop();
       slots.delete(slot);
     })();
     try {
@@ -229,7 +290,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
    */
   async function acquireHolder(): Promise<{ slot: HolderSlot; holder: BwrapHolder }> {
     for (let attempt = 0; ; attempt += 1) {
-      const shareNetwork = networkPolicy === "allow-all";
+      const shareNetwork = networkPolicy.kind === "allow-all";
       if (current && current.shareNetwork !== shareNetwork) {
         void retireSlot(current).catch(() => {});
       }
@@ -442,14 +503,6 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
         `bwrap sandbox: concurrent process limit of ${options.maxConcurrentProcesses} reached`,
       );
     }
-    const env = {
-      PATH: DEFAULT_SANDBOX_PATH,
-      HOME: WORKSPACE_ROOT,
-      LANG: "C.UTF-8",
-      ...SANDBOX_AGENT_ENV,
-      ...options.env,
-      ...spawnOptions.env,
-    };
     const chdir = resolveWorkspacePath(spawnOptions.workingDirectory ?? WORKSPACE_ROOT);
     // Counted from here, before the holder is ready, so commands issued
     // together are admitted against the limit together.
@@ -465,6 +518,25 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       releaseSlot(slot);
       throw new Error(`bwrap sandbox: compute generation is ${lifecycle}; refusing to spawn`);
     }
+    // Under an allow-list the sandbox's traffic has to reach the gateway
+    // before the command runs. If that cannot be arranged, the command fails
+    // rather than run with no route to the destinations it was allowed.
+    if (!holder.shareNetwork && networkPolicy.kind === "allow-list") {
+      try {
+        await ensureCapture(slot, holder);
+      } catch (error) {
+        releaseSlot(slot);
+        throw error;
+      }
+    }
+    const env = {
+      PATH: DEFAULT_SANDBOX_PATH,
+      HOME: WORKSPACE_ROOT,
+      LANG: "C.UTF-8",
+      ...SANDBOX_AGENT_ENV,
+      ...options.env,
+      ...spawnOptions.env,
+    };
     const argv = buildSandboxJoinArgs({
       pythonPath: options.pythonPath,
       targetPid: holder.targetPid,
@@ -514,6 +586,18 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
         results.push(
           ...(await Promise.allSettled([...slots].map(async (slot) => await stopSlot(slot)))),
         );
+        if (egress) {
+          const proxy = egress;
+          egress = undefined;
+          results.push(
+            ...(await Promise.allSettled([
+              proxy.then(
+                async (started) => await started.close(),
+                () => {},
+              ),
+            ])),
+          );
+        }
         const failures = results.flatMap((result) =>
           result.status === "rejected" ? [result.reason] : [],
         );
@@ -570,15 +654,25 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     },
 
     async setNetworkPolicy(policy: unknown) {
-      if (policy !== "allow-all" && policy !== "deny-all") {
-        throw new Error(
-          'bwrap sandbox supports only the "allow-all" and "deny-all" network policies',
-        );
+      const next = resolveNetworkPolicy(policy);
+      // A sandbox already running under "deny-all" has no route, and what a
+      // command left running in it must be able to reach what the new policy
+      // allows. Arranged first, while the gateway still refuses everything:
+      // if it fails, the policy is left as it was.
+      if (next.kind === "allow-list" && current && !current.shareNetwork) {
+        const slot = current;
+        const holder = await slot.ready.catch(() => undefined);
+        if (holder?.alive()) await ensureCapture(slot, holder);
       }
-      networkPolicy = policy;
-      // Awaited, so that once `deny-all` has resolved nothing an earlier
-      // command left running still has the network.
-      if (current && current.shareNetwork !== (policy === "allow-all")) await retireSlot(current);
+      networkPolicy = next;
+      // First, so a connection the new policy does not allow is closed before
+      // this resolves, including one a background process holds.
+      if (egress) (await egress).setPolicy(next);
+      // Awaited, so that once a restricted policy has resolved nothing an
+      // earlier command left running still has the host network.
+      if (current && current.shareNetwork !== (next.kind === "allow-all")) {
+        await retireSlot(current);
+      }
     },
 
     async readFile({ path }) {

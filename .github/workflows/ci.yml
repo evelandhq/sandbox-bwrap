@@ -190,7 +190,7 @@ jobs:
       - name: Provision bwrap prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y apparmor bubblewrap python3
+          sudo apt-get install -y apparmor bubblewrap iproute2 nftables python3
           sudo install -d -m 0755 /workspace
           sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
           abi <abi/4.0>,

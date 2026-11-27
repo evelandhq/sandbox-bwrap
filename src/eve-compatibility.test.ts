@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import type { SandboxEnvironment, SandboxSession } from "eve/sandbox";
+import type { SandboxEnvironment, SandboxNetworkPolicy, SandboxSession } from "eve/sandbox";
 import { SANDBOX_AGENT_ENV as EVE_SANDBOX_AGENT_ENV } from "eve/sandbox/provider";
 import type {
   SandboxConnection,
@@ -12,7 +12,7 @@ import type {
 } from "eve/sandbox/provider";
 import { SANDBOX_AGENT_ENV } from "./args.js";
 import { EVE_SANDBOX_HOME_PROBE } from "./connection.js";
-import type { BwrapSandboxEnvironmentOptions } from "./options.js";
+import type { BwrapNetworkPolicy, BwrapSandboxEnvironmentOptions } from "./options.js";
 import type {
   BwrapConnectionExtensions,
   BwrapSandboxConnection,
@@ -78,6 +78,16 @@ describe("eve sandbox provider contract", () => {
     ] = [true, true, true, true, true];
 
     expect(declared.every(Boolean)).toBe(true);
+  });
+
+  /**
+   * `setNetworkPolicy` and the open options take any policy eve's type allows.
+   * What this provider cannot enforce is refused when it is applied, so the
+   * local type must not be narrower than eve's.
+   */
+  test("every network policy eve's type allows is one the provider's type takes", () => {
+    const fromEve = (policy: SandboxNetworkPolicy): BwrapNetworkPolicy => policy;
+    expect(fromEve("deny-all")).toBe("deny-all");
   });
 
   /**

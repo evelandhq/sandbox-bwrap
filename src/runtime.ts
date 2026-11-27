@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { createBwrapCacheLease, registerActiveCachePath } from "./cache.js";
+import type { EgressLookup } from "./egress-gateway.js";
 import type { ResolvedBwrapSandboxOptions } from "./options.js";
 import { WORKSPACE_ROOT } from "./paths.js";
 import type { ProcessRunner } from "./process.js";
@@ -53,6 +54,8 @@ export function createBwrapRuntime(input: {
   readonly options: ResolvedBwrapSandboxOptions;
   /** Injectable process launcher so logic is testable without bwrap. */
   readonly runner?: ProcessRunner;
+  /** Injectable resolver for the egress gateway, so tests need no DNS. */
+  readonly egressLookup?: EgressLookup;
 }): BwrapRuntime {
   const { options } = input;
   const runner = input.runner ?? createNodeProcessRunner();
@@ -75,6 +78,7 @@ export function createBwrapRuntime(input: {
       tags: location.tags,
       generationId,
       onStopped,
+      ...(input.egressLookup ? { egressLookup: input.egressLookup } : {}),
     });
   }
 

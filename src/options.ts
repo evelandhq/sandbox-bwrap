@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
 import type { BwrapSandboxEventSink } from "./events.js";
+import {
+  resolveNetworkPolicy,
+  type BwrapNetworkPolicy,
+  type RecordedNetworkPolicy,
+} from "./network-policy.js";
 
-/** Coarse egress control, matching what eve's Docker provider supports. */
-export type BwrapNetworkPolicy = "allow-all" | "deny-all";
+export type { BwrapNetworkPolicy } from "./network-policy.js";
 
 /** Default wall-clock limit for every sandboxed command, `spawn()` included. */
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
@@ -57,7 +61,8 @@ export interface BwrapSandboxEnvironmentOptions {
 /** Fully-defaulted options. */
 export interface ResolvedBwrapSandboxOptions {
   readonly env: Readonly<Record<string, string>>;
-  readonly networkPolicy: BwrapNetworkPolicy;
+  /** Validated and in its recorded form, so equal policies hash equally. */
+  readonly networkPolicy: RecordedNetworkPolicy;
   readonly hidePaths: readonly string[];
   readonly bwrapPath: string;
   readonly pythonPath: string;
@@ -95,7 +100,7 @@ export function resolveBwrapSandboxOptions(
 ): ResolvedBwrapSandboxOptions {
   return {
     env: options.env ?? {},
-    networkPolicy: options.networkPolicy ?? "allow-all",
+    networkPolicy: resolveNetworkPolicy(options.networkPolicy ?? "allow-all").recorded,
     hidePaths: options.hidePaths ?? [],
     bwrapPath: options.bwrapPath ?? "bwrap",
     pythonPath: options.pythonPath ?? "python3",
