@@ -23,7 +23,14 @@ export type {
   BwrapSessionIdleOptions,
 } from "./provider-contract.js";
 export type { BwrapNetworkPolicy, BwrapSandboxEnvironmentOptions } from "./options.js";
-export type { BwrapNetworkAllowList, RecordedNetworkPolicy } from "./network-policy.js";
+export type {
+  BwrapNetworkAllowList,
+  BwrapNetworkEntryMatcher,
+  BwrapNetworkMatch,
+  BwrapNetworkMatcher,
+  BwrapNetworkRule,
+  RecordedNetworkPolicy,
+} from "./network-policy.js";
 export type {
   BwrapCommandFinishReason,
   BwrapSandboxEvent,

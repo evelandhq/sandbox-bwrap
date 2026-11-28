@@ -1,10 +1,6 @@
 import { createHash } from "node:crypto";
 import type { BwrapSandboxEventSink } from "./events.js";
-import {
-  resolveNetworkPolicy,
-  type BwrapNetworkPolicy,
-  type RecordedNetworkPolicy,
-} from "./network-policy.js";
+import { resolveNetworkPolicy, type BwrapNetworkPolicy } from "./network-policy.js";
 
 export type { BwrapNetworkPolicy } from "./network-policy.js";
 
@@ -32,6 +28,12 @@ export interface BwrapSandboxEnvironmentOptions {
    * short helper it runs. Defaults to `"python3"` resolved via PATH.
    */
   readonly pythonPath?: string;
+  /**
+   * OpenSSL executable path, used only by a network policy whose domains
+   * carry rules: it issues the certificates the sandbox's requests are read
+   * under. Defaults to `"openssl"` resolved via PATH.
+   */
+  readonly opensslPath?: string;
   /**
    * Absolute directory holding durable session workspaces. Defaults to the
    * storage directory eve gives the provider, which belongs to one build. Pin
@@ -61,11 +63,15 @@ export interface BwrapSandboxEnvironmentOptions {
 /** Fully-defaulted options. */
 export interface ResolvedBwrapSandboxOptions {
   readonly env: Readonly<Record<string, string>>;
-  /** Validated and in its recorded form, so equal policies hash equally. */
-  readonly networkPolicy: RecordedNetworkPolicy;
+  /**
+   * As written, and validated. Its rules can carry credentials, so only its
+   * recorded form is hashed or stored.
+   */
+  readonly networkPolicy: BwrapNetworkPolicy;
   readonly hidePaths: readonly string[];
   readonly bwrapPath: string;
   readonly pythonPath: string;
+  readonly opensslPath: string;
   readonly cacheDir: string | null;
   readonly runTimeoutMs: number | null;
   readonly maxConcurrentProcesses: number | null;
@@ -98,12 +104,15 @@ function resolvePositiveLimit(
 export function resolveBwrapSandboxOptions(
   options: BwrapSandboxEnvironmentOptions = {},
 ): ResolvedBwrapSandboxOptions {
+  const networkPolicy = options.networkPolicy ?? "allow-all";
+  resolveNetworkPolicy(networkPolicy);
   return {
     env: options.env ?? {},
-    networkPolicy: resolveNetworkPolicy(options.networkPolicy ?? "allow-all").recorded,
+    networkPolicy,
     hidePaths: options.hidePaths ?? [],
     bwrapPath: options.bwrapPath ?? "bwrap",
     pythonPath: options.pythonPath ?? "python3",
+    opensslPath: options.opensslPath ?? "openssl",
     cacheDir: options.cacheDir ?? null,
     runTimeoutMs: resolveRunTimeoutMs(options.runTimeoutMs),
     maxConcurrentProcesses: resolvePositiveLimit(
@@ -132,7 +141,8 @@ export function createBwrapOptionsHash(options: ResolvedBwrapSandboxOptions): st
     hidePaths: [...options.hidePaths],
     maxConcurrentProcesses: options.maxConcurrentProcesses,
     maxOutputBytes: options.maxOutputBytes,
-    networkPolicy: options.networkPolicy,
+    // The recorded form: equal policies hash equally, and no credential is hashed.
+    networkPolicy: resolveNetworkPolicy(options.networkPolicy).recorded,
     pythonPath: options.pythonPath,
     runTimeoutMs: options.runTimeoutMs,
   });

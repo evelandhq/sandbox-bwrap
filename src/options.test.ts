@@ -9,6 +9,7 @@ describe("resolveBwrapSandboxOptions", () => {
       hidePaths: [],
       bwrapPath: "bwrap",
       pythonPath: "python3",
+      opensslPath: "openssl",
       cacheDir: null,
       runTimeoutMs: 600_000,
       maxConcurrentProcesses: 64,
@@ -110,5 +111,42 @@ describe("process and output limit options", () => {
 
     expect(processBound).not.toBe(defaults);
     expect(outputBound).not.toBe(defaults);
+  });
+});
+
+/**
+ * A rule's header value is a credential. The options keep it, because the
+ * gateway needs it, and nothing derived from the options may: the hash names
+ * a template directory on disk.
+ */
+describe("a network policy with rules", () => {
+  const withToken = (token: string) => ({
+    networkPolicy: {
+      allow: { "github.com": [{ transform: [{ headers: { authorization: token } }] }] },
+    },
+  });
+
+  test("is kept as written", () => {
+    expect(resolveBwrapSandboxOptions(withToken("Bearer one")).networkPolicy).toEqual(
+      withToken("Bearer one").networkPolicy,
+    );
+  });
+
+  test("hashes by the domains that have rules, not by what the rules hold", () => {
+    const one = createBwrapOptionsHash(resolveBwrapSandboxOptions(withToken("Bearer one")));
+    const two = createBwrapOptionsHash(resolveBwrapSandboxOptions(withToken("Bearer two")));
+    const none = createBwrapOptionsHash(
+      resolveBwrapSandboxOptions({ networkPolicy: { allow: ["github.com"] } }),
+    );
+    expect(one).toBe(two);
+    expect(one).not.toBe(none);
+  });
+
+  test("is refused when it is written, if it cannot be enforced", () => {
+    expect(() =>
+      resolveBwrapSandboxOptions({
+        networkPolicy: { allow: { "github.com": [{ forwardURL: "https://proxy.test" }] } },
+      }),
+    ).toThrow(/forwardURL/);
   });
 });

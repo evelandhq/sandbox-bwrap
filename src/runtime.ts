@@ -56,6 +56,8 @@ export function createBwrapRuntime(input: {
   readonly runner?: ProcessRunner;
   /** Injectable resolver for the egress gateway, so tests need no DNS. */
   readonly egressLookup?: EgressLookup;
+  /** Authorities the egress gateway trusts besides the host's own, so tests need no public one. */
+  readonly egressUpstreamRoots?: readonly string[];
 }): BwrapRuntime {
   const { options } = input;
   const runner = input.runner ?? createNodeProcessRunner();
@@ -79,6 +81,7 @@ export function createBwrapRuntime(input: {
       generationId,
       onStopped,
       ...(input.egressLookup ? { egressLookup: input.egressLookup } : {}),
+      ...(input.egressUpstreamRoots ? { egressUpstreamRoots: input.egressUpstreamRoots } : {}),
     });
   }
 

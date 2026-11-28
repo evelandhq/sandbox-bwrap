@@ -65,10 +65,11 @@ export default defineSandbox(() => environment.open());
 | Option                   | Default                   | Meaning                                                                                                                                                                                                                                                                                                                                                                               |
 | ------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `env`                    | `{}`                      | Environment variables set for every sandboxed command, above `AI_AGENT=eve` and below each call's own `env`.                                                                                                                                                                                                                                                                          |
-| `networkPolicy`          | `"allow-all"`             | `"allow-all"` shares the host network, `"deny-all"` gives the sandbox none, and an allow-list of domains and subnets admits only those. A policy with rules on a domain is rejected, not weakened. See [Network policy](#network-policy).                                                                                                                                             |
+| `networkPolicy`          | `"allow-all"`             | `"allow-all"` shares the host network, `"deny-all"` gives the sandbox none, and an allow-list of domains and subnets admits only those; a domain can carry rules that set headers on its requests. A policy the provider cannot enforce is rejected, not weakened. See [Network policy](#network-policy).                                                                             |
 | `hidePaths`              | `[]`                      | Extra host paths hidden from the sandbox (each covered by an empty tmpfs).                                                                                                                                                                                                                                                                                                            |
 | `bwrapPath`              | `"bwrap"`                 | bwrap executable to invoke.                                                                                                                                                                                                                                                                                                                                                           |
 | `pythonPath`             | `"python3"`               | Python 3 executable. Every command joins its sandbox through a short helper it runs.                                                                                                                                                                                                                                                                                                  |
+| `opensslPath`            | `"openssl"`               | OpenSSL executable, used only by a network policy whose domains carry rules.                                                                                                                                                                                                                                                                                                          |
 | `cacheDir`               | eve's sandbox storage dir | Absolute directory holding durable session workspaces. Templates always stay in eve's storage directory, where eve records them. Pin this outside the release directory: eve keys sandboxes per durable session, not per deployment, so a build-relative default loses every session's `/workspace` on the next redeploy.                                                             |
 | `runTimeoutMs`           | `600000`                  | Hard wall-clock limit for every command a caller starts. At the limit the command's process group is killed and `wait()` rejects with `command timed out after <n> ms`. A long-running process started with `spawn()` (a dev server, a watcher) is bounded too. A process a command leaves behind in its own process group is not; see [Background processes](#background-processes). |
 | `maxConcurrentProcesses` | `64`                      | Maximum commands running at once in one session's sandbox. A spawned process counts until it actually exits, even when its caller never waits. Processes left running in the background are not counted. Set `null` to disable.                                                                                                                                                       |
@@ -184,8 +185,9 @@ An allow-list denies by default. `allow` lists domains: `example.com` matches th
 only, `*.example.com` every subdomain but not `example.com` itself, `www.*.com` one label in
 that position, and `*` any domain. `subnets.allow` lists CIDRs reachable by address, with no
 domain needed, and `subnets.deny` lists CIDRs that are never reachable, even through an
-allowed domain or range. eve's record form, `{ allow: { "example.com": [] } }`, is accepted
-with empty rule lists.
+allowed domain or range. eve's record form, `{ allow: { "example.com": [] } }`, maps each
+domain to the [rules](#rules-on-a-domain) applied to its requests; an empty list allows the
+domain as it is.
 
 A sandbox under an allow-list has a network namespace of its own, with no interface but
 loopback. A helper on the host enters that namespace and loads nftables rules into it, so
@@ -202,7 +204,7 @@ How a connection is matched:
 
 - **By domain.** The name is read from the connection itself: the server name in a TLS
   handshake, or the `Host` header of a plain HTTP request, on any port. TLS is passed
-  through undecrypted. The gateway resolves the name itself and connects to an address it
+  through undecrypted, unless the domain carries rules. The gateway resolves the name itself and connects to an address it
   resolved, not to the one the program chose, so naming an allowed domain while connecting
   somewhere else reaches only the allowed domain.
 - **By address.** A destination in `subnets.allow` is reached whatever protocol is spoken to
@@ -228,13 +230,89 @@ A refused connection is answered in the protocol it spoke: a `403` for HTTP, a f
 `access_denied` alert for TLS, and a closed connection for anything else. Each refusal emits
 a `network.denied` event; a refused lookup reports the name with port 53.
 
-TLS is never terminated, so the gateway sees a destination and not a request. Rules on a
-domain — eve's header `transform` and `forwardURL` — need the request, and a policy that
-carries one is rejected.
-
 An allow-list needs `nft` and `ip` on the host; see [Requirements](#requirements). On a
 host that cannot enforce one, a command under an allow-list fails with the reason instead
 of running without a route, and a sandbox already running keeps the policy it had.
+
+#### Rules on a domain
+
+A rule sets headers on the requests a domain receives. It is how a credential reaches a
+service without entering the sandbox: the sandboxed program sends a placeholder, or
+nothing, and the gateway puts the real value on the request as it leaves the host.
+
+```ts
+await sandbox.setNetworkPolicy({
+  allow: {
+    "api.github.com": [
+      {
+        match: {
+          headers: [{ key: { exact: "authorization" }, value: { exact: "Bearer placeholder" } }],
+        },
+        transform: [{ headers: { authorization: `Bearer ${token}` } }],
+      },
+    ],
+    "*": [],
+  },
+});
+```
+
+- **Which rule applies.** A domain's rules are those of the most specific pattern that
+  matches it: `github.com` decides over `*.github.com`, and that over `*`. The first rule
+  whose `match` a request satisfies handles it, and no other; a rule without `match` handles
+  every request. A request no rule matches goes out as the program sent it.
+- **`match`.** Every part given must hold. `method` lists methods, any one of which matches.
+  `path` is the request path without its query string. `headers` and `queryString` list
+  matchers, each of which some header or parameter must satisfy by its `key`, its `value`,
+  or both. A matcher is one of `exact`, `startsWith`, or `regex`; comparison is
+  case-sensitive except against a header name. `regex` is a JavaScript regular expression,
+  which is not the RE2 syntax Vercel Sandbox documents: a pattern can run in more than
+  linear time, and it runs in the agent process against input the sandbox chose.
+- **`transform`.** Each step's `headers` are set on the request, replacing any header of
+  the same name. Headers that frame a request (`content-length`, `transfer-encoding`,
+  `connection`, and the like) cannot be set.
+- **`forwardURL`** is not supported, and a policy that uses it is rejected.
+
+To apply a rule the gateway has to read the request, so it answers the program's TLS
+handshake itself, with a certificate issued for the name the program asked for by a
+certificate authority made for that one sandbox. It then sends the request on over a TLS
+connection of its own, verifying the service's certificate against the host's roots as any
+client would. What follows from that:
+
+- **Trust.** A command started while the policy has rules is told to trust the sandbox's
+  authority through the variables common clients read: `SSL_CERT_FILE`, `CURL_CA_BUNDLE`,
+  `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `NPM_CONFIG_CAFILE`, `AWS_CA_BUNDLE`,
+  `CARGO_HTTP_CAINFO`, `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`, and `NODE_EXTRA_CA_CERTS`. They
+  name files under `/tmp/.bwrap-sandbox`, which hold the host's roots and the authority's
+  certificate. The call's own `env` and the environment's `env` still decide over them. A
+  process started before the policy had rules, or a client that reads none of these
+  variables (a JVM, for one), does not trust the authority and fails its handshake with a
+  domain that has rules.
+- **HTTP/1.1 over TLS only.** The gateway offers HTTP/1.1 in the handshake, so a client that
+  would use HTTP/2 falls back and one that speaks only HTTP/2, as gRPC does, cannot connect.
+  A domain with rules is not reachable over plain HTTP at all: a rule sets credentials, and
+  those do not go out over a connection anyone can read. Protocol switches such as
+  WebSocket are passed through, with the rules applied to the opening request.
+- **One host per connection.** A request whose `Host` names anything but the domain the
+  connection was made to is refused with a `421`. Otherwise a program could have a
+  credential, set for one domain, delivered to another site served from the same address.
+- **Addresses bypass rules.** A destination reached through a `subnets.allow` range is
+  passed on unread, as that range promises, so no rule applies to it. Beside a `*`, a
+  connection that names no domain is passed on unread too, after a wait of at most one
+  second to see whether it names one.
+- **Changing rules.** Each request gets the rules in force when it arrives. A connection
+  open when a domain gains or loses its rules is closed, so none carries on being handled
+  the old way.
+- **What is recorded.** Rules hold credentials, so the state eve persists for a session
+  names the domains that had rules and nothing of what the rules held. A sandbox started
+  again for the session, after an idle stop or a restart of the agent, gets the
+  environment's own `networkPolicy` with its rules when that is the policy it was opened
+  under. Rules passed to `environment.open()` or set with `setNetworkPolicy` last only for
+  the running sandbox: after a restart their domains are allowed without rules until the
+  session sets them again.
+
+Rules need OpenSSL 3 on the host; see [Requirements](#requirements). On a host without it a
+policy with rules is refused with the reason, and a sandbox already running keeps the
+policy it had.
 
 ## Disk usage and cache management
 
@@ -321,12 +399,19 @@ telemetry, not part of the sandbox boundary.
   the policy allows is reached with whatever the host can reach at that address. The
   host's own loopback and link-local addresses are excluded unless a `subnets.allow` range
   names them; use `subnets.deny` to rule other ranges out. Three things an allow-list does
-  not do. It does not decrypt TLS, so a server that hosts several domains at one address
-  decides which of them a request inside the handshake reaches: allowing one domain on a
-  shared CDN can reach others on it. A `subnets.allow` range leaves DNS unrestricted, and a
+  not do. It does not decrypt TLS for a domain without rules, so a server that hosts several
+  domains at one address decides which of them a request inside the handshake reaches:
+  allowing one domain on a shared CDN can reach others on it. A `subnets.allow` range leaves DNS unrestricted, and a
   lookup can carry data to whoever serves the name. And a sandboxed program that can see
   the gateway's socket, which lives in the agent's temporary directory, can connect to it
   directly; it is held to the same policy there.
+- A rule's header values stay in the agent process: they are set on a request after it has
+  left the sandbox, and are never written to the sandbox's environment, its files, session
+  state, or an event. The sandbox does trust a certificate authority of its own while a
+  policy has rules, and its programs' requests to those domains are read in the agent
+  process. The authority's key is kept in a directory hidden from the sandbox, and nothing
+  outside that sandbox trusts the authority. A rule constrains nothing by itself: a program
+  that sends a request no rule matches reaches the domain all the same, without the header.
 - The host-side `readFile` is deliberately **not** containment-checked: eve passes absolute
   paths through to the host filesystem, so a read can reach anything the agent process can
   read, including a sibling session's files. Only `writeFiles` and `removePath` are confined
@@ -396,6 +481,8 @@ telemetry, not part of the sandbox boundary.
   loads the rules needs no privilege beyond what bwrap already needs: it enters the user
   namespace bwrap created, which the agent's user owns. `"allow-all"` and `"deny-all"` need
   neither.
+- For rules on a domain only: `openssl`, version 3 or newer, on the agent's `PATH` (or at
+  `opensslPath`). It issues the certificates the sandbox's requests are read under.
 - `bash`, plus whatever tools the agent needs (`node`, `git`, …), on the host `PATH`.
 - Works under systemd hardening (`NoNewPrivileges=yes`, `ProtectSystem=strict`): the
   packaged `bwrap` is not setuid, so it needs no privilege escalation, only the AppArmor
@@ -410,7 +497,8 @@ telemetry, not part of the sandbox boundary.
 ## Testing
 
 - `pnpm test` — unit tests, run anywhere, including macOS: process execution is injected,
-  so no bwrap is needed. `pnpm typecheck` runs the type-level contract checks against the
+  so no bwrap is needed. The tests that answer a TLS handshake under a domain's rules use
+  the host's `openssl` and are skipped where it is older than version 3. `pnpm typecheck` runs the type-level contract checks against the
   installed eve in `src/eve-compatibility.test.ts`.
 - `bash infra/smoke.sh` — the contract test against **real** bwrap, on macOS or Linux. It
   provisions a Lima VM (`brew install lima`), streams this worktree in, and runs the test as

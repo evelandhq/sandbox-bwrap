@@ -1,4 +1,5 @@
 import { WORKSPACE_ROOT } from "./paths.js";
+import { SANDBOX_TRUST_DIR } from "./trust.js";
 
 /** PATH the sandbox sees; the host rootfs is visible read-only, so the standard dirs apply. */
 export const DEFAULT_SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -39,6 +40,13 @@ export interface BwrapHolderInput {
   /** Host paths mounted over with an empty tmpfs. Caller filters to existing paths. */
   readonly hidePaths: readonly string[];
   readonly shareNetwork: boolean;
+  /**
+   * Host directory shown read-only at `SANDBOX_TRUST_DIR`, where the sandbox
+   * finds the certificates a policy with rules needs it to trust. The mounts
+   * of a sandbox are fixed when it starts and a policy can gain rules later,
+   * so the directory is mounted from the start and filled when needed.
+   */
+  readonly trustDir?: string;
 }
 
 /**
@@ -70,6 +78,9 @@ export function buildBwrapHolderArgs(input: BwrapHolderInput): string[] {
   // the host filesystem, so a later bind punches through an earlier tmpfs.
   for (const path of input.hidePaths) {
     args.push("--tmpfs", path);
+  }
+  if (input.trustDir !== undefined) {
+    args.push("--ro-bind", input.trustDir, SANDBOX_TRUST_DIR);
   }
   args.push("--bind", input.workspaceDir, WORKSPACE_ROOT);
   if (!input.shareNetwork) {

@@ -5,6 +5,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { BlockList, connect, createServer, isIP, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import type { EgressAuthority } from "./authority.js";
+import { createEgressInterceptor } from "./egress-intercept.js";
 import {
   answerDnsQuery,
   DNS_NAME_ERROR,
@@ -35,7 +37,10 @@ export interface EgressDenial {
  * gateway opens a connection only to a destination the current policy allows.
  *
  * A domain is taken from the connection itself: the server name of a TLS
- * handshake or the `Host` header of an HTTP request. Nothing is decrypted.
+ * handshake or the `Host` header of an HTTP request. A connection is passed
+ * on as it is, encrypted end to end, unless its domain carries rules: those
+ * connections the gateway answers itself, so it can apply the rules to each
+ * request before sending it on (`egress-intercept.ts`).
  */
 export interface EgressGateway {
   /** Host path of the socket the capture helper relays to. */
@@ -55,6 +60,14 @@ export interface StartEgressGatewayInput {
   readonly onDenied?: (denial: EgressDenial) => void;
   /** How long a connection may take to show which domain it is for. */
   readonly sniffTimeoutMs?: number;
+  /**
+   * The sandbox's certificate authority, asked for when a connection to a
+   * domain with rules first has to be answered. Without one such a connection
+   * is refused.
+   */
+  readonly authority?: () => Promise<EgressAuthority>;
+  /** Authorities trusted for a destination's certificate besides the host's own, PEM. */
+  readonly upstreamRoots?: readonly string[];
 }
 
 const SOCKET_NAME = "egress.sock";
@@ -68,11 +81,22 @@ const DNS_ATTEMPT_TIMEOUT_MS = 5_000;
 /** A TLS or HTTP client speaks first and at once; one that has not by now names no domain. */
 const DEFAULT_SNIFF_TIMEOUT_MS = 5_000;
 
+/**
+ * How long a connection the policy already admits by its address is watched
+ * for a domain, which decides only whether rules apply to it. A TLS client
+ * sends its handshake at once; a protocol in which the server speaks first
+ * waits this long for its connection.
+ */
+const ADMITTED_SNIFF_TIMEOUT_MS = 1_000;
+
 /** How long the capture helper may take to say what a relayed connection is. */
 const HEADER_TIMEOUT_MS = 5_000;
 
 /** A fatal `access_denied` TLS alert: what a refused handshake is answered with. */
 const TLS_ACCESS_DENIED = Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x31]);
+
+/** A fatal `internal_error` TLS alert: a handshake the gateway could not answer. */
+const TLS_INTERNAL_ERROR = Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x50]);
 
 /**
  * Addresses that mean the host itself or its link: loopback, link-local
@@ -251,8 +275,18 @@ export async function startEgressGateway(input: StartEgressGatewayInput): Promis
   // bytes, which a path under a deep cache directory can exceed.
   const socketDir = await mkdtemp(path.join(os.tmpdir(), "bwrap-egress-"));
   const socketPath = path.join(socketDir, SOCKET_NAME);
-  const open = new Set<{ name: string | undefined; address: string; close(): void }>();
+  /** Connections passed on or answered, each able to say whether the policy still wants it. */
+  const open = new Set<{ allowed(): boolean; close(): void }>();
   const relayed = new Set<Socket>();
+  const interceptor = createEgressInterceptor({
+    authority:
+      input.authority ??
+      (async () => {
+        throw new Error("no certificate authority");
+      }),
+    rulesFor: (name) => (policy.kind === "allow-list" ? policy.rulesFor(name) : []),
+    ...(input.upstreamRoots === undefined ? {} : { upstreamRoots: input.upstreamRoots }),
+  });
 
   /**
    * Whether `address` may be connected to, for a connection that named the
@@ -266,6 +300,11 @@ export async function startEgressGateway(input: StartEgressGatewayInput): Promis
     if (policy.allowsAddress(address)) return true;
     if (isHostLocal(address)) return false;
     return name === undefined ? policy.allowsAnyDomain : policy.allowsDomain(name);
+  }
+
+  /** Whether connections to `name` are answered here, so its rules can be applied. */
+  function intercepts(name: string): boolean {
+    return policy.kind === "allow-list" && policy.rulesFor(name).length > 0;
   }
 
   /** Whether a query for `name` is passed on. An allowed range leaves every name resolvable. */
@@ -288,10 +327,11 @@ export async function startEgressGateway(input: StartEgressGatewayInput): Promis
     protocol: "tls" | "http" | undefined,
     host: string,
     port: number,
+    reason = `the network policy does not allow ${host}`,
   ) {
     report(host, port);
     if (protocol === "http") {
-      const body = `bwrap sandbox: the network policy does not allow ${host}\n`;
+      const body = `bwrap sandbox: ${reason}\n`;
       client.end(
         `HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
         () => client.destroy(),
@@ -334,8 +374,8 @@ export async function startEgressGateway(input: StartEgressGatewayInput): Promis
       return;
     }
     const entry = {
-      name,
-      address,
+      // A connection passed on as it is has no place under rules made since.
+      allowed: () => admits(name, address) && (name === undefined || !intercepts(name)),
       close: () => {
         upstream.destroy();
         client.destroy();
@@ -354,15 +394,53 @@ export async function startEgressGateway(input: StartEgressGatewayInput): Promis
     client.pipe(upstream);
   }
 
+  /**
+   * Answers a connection to a domain with rules. The program's handshake is
+   * completed here, and what it sends is read, changed as the rules say, and
+   * sent on to one of `addresses`.
+   */
+  async function intercept(
+    client: Socket,
+    intake: Intake,
+    name: string,
+    addresses: readonly string[],
+    port: number,
+  ) {
+    const head = intake.release();
+    let connection;
+    try {
+      connection = await interceptor.accept(client, head, { name, port, addresses });
+    } catch {
+      if (!client.destroyed) client.end(TLS_INTERNAL_ERROR, () => client.destroy());
+      return;
+    }
+    const entry = {
+      allowed: () => intercepts(name) && addresses.every((address) => admits(name, address)),
+      close: connection.close,
+    };
+    // The policy may have changed while the certificate was being issued.
+    if (!entry.allowed()) return connection.close();
+    open.add(entry);
+    void connection.closed.then(() => open.delete(entry));
+  }
+
   async function serveTcp(client: Socket, intake: Intake, address: string, port: number) {
-    // An allowed range, or a catch-all, admits the address whatever it is for.
-    if (admits(undefined, address)) {
+    const byAddress = admits(undefined, address);
+    if (policy.kind !== "allow-list") {
+      if (!byAddress) return refuse(client, undefined, address, port);
       return await forward(client, intake, undefined, [address], port, undefined);
     }
-    if (policy.kind !== "allow-list" || policy.recorded.allow.length === 0) {
+    // An allowed range admits the address whatever it is for, and so does a
+    // catch-all when no domain has rules a connection could fall under.
+    if (byAddress && (policy.allowsAddress(address) || !policy.hasRules)) {
+      return await forward(client, intake, undefined, [address], port, undefined);
+    }
+    if (!byAddress && policy.recorded.allow.length === 0) {
       return refuse(client, undefined, address, port);
     }
-    const deadline = Date.now() + sniffTimeoutMs;
+    const deadline =
+      Date.now() +
+      (byAddress ? Math.min(sniffTimeoutMs, ADMITTED_SNIFF_TIMEOUT_MS) : sniffTimeoutMs);
     let sniffed: Sniffed;
     for (;;) {
       sniffed = sniffServerName(intake.bytes());
@@ -374,11 +452,19 @@ export async function startEgressGateway(input: StartEgressGatewayInput): Promis
     }
     if (client.destroyed) return;
     if (sniffed.kind !== "name") {
+      // Only a catch-all admits a connection that names no domain.
+      if (admits(undefined, address)) {
+        return await forward(client, intake, undefined, [address], port, undefined);
+      }
       return refuse(client, sniffed.kind === "none" ? sniffed.protocol : undefined, address, port);
     }
     const { name, protocol } = sniffed;
     if (policy.kind !== "allow-list" || !policy.allowsDomain(name)) {
       return refuse(client, protocol, name, port);
+    }
+    const ruled = intercepts(name);
+    if (!ruled && admits(undefined, address)) {
+      return await forward(client, intake, name, [address], port, protocol);
     }
     // The name is resolved here and the connection goes to one of these
     // addresses, not to the one the program chose: a program cannot reach an
@@ -394,7 +480,18 @@ export async function startEgressGateway(input: StartEgressGatewayInput): Promis
     const ordered = allowed.includes(address)
       ? [address, ...allowed.filter((candidate) => candidate !== address)]
       : allowed;
-    await forward(client, intake, name, ordered, port, protocol);
+    if (!ruled) return await forward(client, intake, name, ordered, port, protocol);
+    if (protocol !== "tls") {
+      // A rule sets credentials, which do not go out over a connection anyone can read.
+      return refuse(
+        client,
+        protocol,
+        name,
+        port,
+        `the network policy has rules for ${name}, which is reachable over TLS only`,
+      );
+    }
+    await intercept(client, intake, name, ordered, port);
   }
 
   async function serveDns(client: Socket, intake: Intake) {
@@ -475,11 +572,12 @@ export async function startEgressGateway(input: StartEgressGatewayInput): Promis
     setPolicy(next) {
       policy = next;
       for (const connection of open) {
-        if (!admits(connection.name, connection.address)) connection.close();
+        if (!connection.allowed()) connection.close();
       }
     },
     async close() {
       for (const connection of open) connection.close();
+      interceptor.close();
       for (const client of relayed) client.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(socketDir, { force: true, recursive: true });
