@@ -21,9 +21,11 @@ import {
   exitingRunner,
   fakeHolders,
   makeRelease,
+  parseJoin,
   readUntilSettled,
   withFakeHolder,
 } from "./provider.test-support.js";
+import { SANDBOX_TRUST_ENV } from "./trust.js";
 
 /**
  * eve's sandbox provider contract. eve derives the session from the
@@ -288,6 +290,137 @@ describe("start, resume, and session end", () => {
     await resumed.stop();
   });
 
+  /**
+   * A rule's header value is a credential, and eve persists the state `start`
+   * returns. The state therefore names the domains that had rules and nothing
+   * of what the rules held; a later sandbox gets them back from the
+   * environment, which is code and has them again in every process.
+   */
+  describe("a policy with rules", () => {
+    const token = "Bearer ghp_real-token";
+    const rules = (authorization = token) => ({
+      allow: {
+        "*": [],
+        "github.com": [{ transform: [{ headers: { authorization } }] }],
+      },
+    });
+    /** Whether the last command was told to trust the sandbox's authority, as one under rules is. */
+    const underRules = (calls: readonly (readonly string[])[]) =>
+      parseJoin(calls.at(-1)!).env.GIT_SSL_CAINFO === SANDBOX_TRUST_ENV.GIT_SSL_CAINFO;
+    const run = async (connection: BwrapSandboxConnection) =>
+      await connection.spawn({ command: "true", env: {}, workingDirectory: "/workspace" });
+
+    test("is recorded without what its rules hold", async () => {
+      const { storagePath } = await makeRelease();
+      const live = createLiveRunner();
+      const env = environment({ networkPolicy: rules() }, live.runner);
+      const artifact = await env.prepare(prepareContext(storagePath));
+      const { connection, state } = await env.start(
+        sessionContext(storagePath, "s"),
+        undefined,
+        artifact,
+      );
+      await run(connection);
+
+      expect(state.networkPolicy).toEqual({ allow: ["*", "github.com"], rules: ["github.com"] });
+      expect(state.environmentPolicy).toBe(true);
+      expect(JSON.stringify(state)).not.toContain("ghp_real-token");
+      expect(JSON.parse(JSON.stringify(state))).toEqual(state);
+      expect(underRules(live.calls)).toBe(true);
+      await connection.stop();
+    });
+
+    test("comes back with its rules when the environment it was opened under still has them", async () => {
+      const { storagePath } = await makeRelease();
+      const first = environment({ networkPolicy: rules() });
+      const artifact = await first.prepare(prepareContext(storagePath));
+      const before = await first.start(sessionContext(storagePath, "s"), undefined, artifact);
+      await before.connection.stop();
+
+      // A new process, after a deploy that rotated the credential.
+      const live = createLiveRunner();
+      const resumed = await environment(
+        { networkPolicy: rules("Bearer rotated") },
+        live.runner,
+      ).resume(sessionContext(storagePath, "s"), artifact, before.state);
+      await run(resumed);
+
+      expect(underRules(live.calls)).toBe(true);
+      await resumed.stop();
+    });
+
+    test("passed to open() lasts for the sandbox it opened, and is allowed without rules after", async () => {
+      const { storagePath } = await makeRelease();
+      const first = environment({ networkPolicy: rules("Bearer shared") });
+      const artifact = await first.prepare(prepareContext(storagePath));
+      const before = await first.start(
+        sessionContext(storagePath, "s"),
+        { networkPolicy: rules("Bearer this-user-only") },
+        artifact,
+      );
+      expect(before.state.environmentPolicy).toBeUndefined();
+      expect(JSON.stringify(before.state)).not.toContain("this-user-only");
+      await before.connection.stop();
+
+      // The environment has rules for the same domain, with another
+      // credential. They are not this session's and are not lent to it.
+      const live = createLiveRunner();
+      const resumed = await environment(
+        { networkPolicy: rules("Bearer shared") },
+        live.runner,
+      ).resume(sessionContext(storagePath, "s"), artifact, before.state);
+      await run(resumed);
+
+      expect(underRules(live.calls)).toBe(false);
+      // Still the same allow-list: its own network, handed to the gateway.
+      const holder = fakeHolders(live.runner)[0]!;
+      expect(holder.argv).toContain("--unshare-net");
+      expect(holder.captures).toHaveLength(1);
+      await resumed.stop();
+    });
+
+    test("is not restored from an environment whose policy has changed since", async () => {
+      const { storagePath } = await makeRelease();
+      const first = environment({ networkPolicy: rules() });
+      const artifact = await first.prepare(prepareContext(storagePath));
+      const before = await first.start(sessionContext(storagePath, "s"), undefined, artifact);
+      await before.connection.stop();
+
+      const live = createLiveRunner();
+      const changed = {
+        allow: { ...rules().allow, "api.github.com": rules().allow["github.com"] },
+      };
+      const resumed = await environment({ networkPolicy: changed }, live.runner).resume(
+        sessionContext(storagePath, "s"),
+        artifact,
+        before.state,
+      );
+      await run(resumed);
+
+      expect(underRules(live.calls)).toBe(false);
+      await resumed.stop();
+    });
+
+    test("state that names rules for a domain it does not allow is not state this provider wrote", async () => {
+      const { storagePath } = await makeRelease();
+      const env = environment();
+      const artifact = await env.prepare(prepareContext(storagePath));
+      const { connection, state } = await env.start(
+        sessionContext(storagePath, "s"),
+        undefined,
+        artifact,
+      );
+      await connection.stop();
+
+      await expect(
+        env.resume(sessionContext(storagePath, "s"), artifact, {
+          ...state,
+          networkPolicy: { allow: ["a.test"], rules: ["b.test"] },
+        }),
+      ).rejects.toThrow(/invalid session state/);
+    });
+  });
+
   test("a policy that cannot be enforced fails the open before a workspace is created", async () => {
     const { storagePath } = await makeRelease();
     const env = environment();
@@ -299,7 +432,7 @@ describe("start, resume, and session end", () => {
         { networkPolicy: { allow: { "github.com": [{ forwardURL: "https://x.test" }] } } as never },
         artifact,
       ),
-    ).rejects.toThrow(/rules on a domain/);
+    ).rejects.toThrow(/forwardURL/);
     expect(existsSync(sessionPathIn(path.join(storagePath, "bwrap"), "session:s"))).toBe(false);
   });
 

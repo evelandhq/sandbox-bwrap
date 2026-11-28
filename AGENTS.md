@@ -67,6 +67,23 @@ non-obvious behaviors are deliberate and documented there:
   carries, never to the address the program chose, and never to the host's
   own addresses unless a `subnets.allow` range names them. Both are what keep
   an allowed domain from being a way to reach something else.
+- Rules on a domain are applied in the host process too
+  (`src/egress-intercept.ts`): the gateway answers the sandbox's TLS
+  handshake with a certificate from the sandbox's own authority
+  (`src/authority.ts`), reads each request, and sends it on over a connection
+  whose certificate it verifies. A rule's header values are credentials. They
+  live in the resolved policy and nowhere else: never in a command's
+  environment, a file the sandbox can read, session state, the options hash,
+  an event, or an error message (`resolveNetworkPolicy` names where a policy
+  is wrong, never what a header held). Keep the `Host` check that ties a
+  request to the domain its connection was made to, and keep a domain with
+  rules unreachable over plain HTTP: either one, dropped, sends a credential
+  somewhere it was not set for.
+- A sandbox's mounts are fixed when its holder starts, and a policy can gain
+  rules later. That is why the directory of certificates to trust is mounted
+  into every restricted holder from the start and filled only when needed,
+  and why trust reaches a command through variables set at join time
+  (`src/trust.ts`) rather than through a file mounted over the host's roots.
 - A joined command gets its environment from `env -i` and its working
   directory from a `cd` in the join script, because bwrap's `--clearenv` and
   `--chdir` belong to the holder. Nothing may reach a command through the

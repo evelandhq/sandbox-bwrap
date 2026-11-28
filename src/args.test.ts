@@ -76,6 +76,36 @@ describe("buildBwrapHolderArgs", () => {
   });
 
   /**
+   * `/tmp` is the sandbox's own, so bwrap can make a mount point there; and
+   * a host directory under a hidden path must still show, so the bind comes
+   * after every tmpfs.
+   */
+  test("the directory of certificates to trust is bound read-only, after everything that hides", () => {
+    const args = buildBwrapHolderArgs({
+      bwrapPath: "bwrap",
+      workspaceDir: "/data/cache/sessions/s1",
+      hidePaths: ["/data/cache"],
+      shareNetwork: false,
+      trustDir: "/data/cache/trust-1",
+    });
+    const bind = args.lastIndexOf("--ro-bind");
+    expect(args.slice(bind, bind + 3)).toEqual([
+      "--ro-bind",
+      "/data/cache/trust-1",
+      "/tmp/.bwrap-sandbox",
+    ]);
+    expect(bind).toBeGreaterThan(args.lastIndexOf("--tmpfs"));
+    expect(
+      buildBwrapHolderArgs({
+        bwrapPath: "bwrap",
+        workspaceDir: "/w",
+        hidePaths: [],
+        shareNetwork: true,
+      }),
+    ).not.toContain("/tmp/.bwrap-sandbox");
+  });
+
+  /**
    * The holder carries none of the session's environment: every command sets
    * its own when it joins, so a secret in a per-call `env` never sits in a
    * long-lived process's environment.

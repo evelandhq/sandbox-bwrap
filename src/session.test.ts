@@ -9,13 +9,17 @@ import type { BwrapSandboxEvent } from "./events.js";
 import type { ProcessRunner, SpawnedProcess } from "./process.js";
 import {
   clientHello,
+  FAKE_CERTIFICATE,
+  failNextAuthority,
   failNextCapture,
+  fakeAuthorityRuns,
   fakeHolders,
   parseJoin,
   readUntilSettled,
   withFakeHolder,
 } from "./provider.test-support.js";
 import { createBwrapSession } from "./session.js";
+import { SANDBOX_TRUST_DIR, SANDBOX_TRUST_ENV } from "./trust.js";
 
 function stringStream(text: string): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -561,7 +565,7 @@ describe("network policy", () => {
    * asked to cooperate: no proxy variable, no socket bound into it.
    */
   test("an allow-list runs commands in their own network and hands its traffic to the gateway", async () => {
-    const { session, calls, holders } = await makeSession();
+    const { session, calls, holders, runner } = await makeSession();
     await session.setNetworkPolicy({ allow: ["api.example.com"] });
     await session.spawn({ command: "one" });
     await session.spawn({ command: "two" });
@@ -569,13 +573,18 @@ describe("network policy", () => {
     const holder = holders()[0]!;
     expect(holders()).toHaveLength(1);
     expect(holder.argv).toContain("--unshare-net");
-    expect(holder.argv.filter((arg) => arg === "--ro-bind")).toHaveLength(1);
+    // Beside the root, the one thing bound in is the directory of certificates to trust.
+    expect(holder.argv.filter((arg) => arg === "--ro-bind")).toHaveLength(2);
+    expect(holder.argv[holder.argv.lastIndexOf("--ro-bind") + 2]).toBe(SANDBOX_TRUST_DIR);
     // One helper per sandbox, however many commands run in it.
     expect(holder.captures).toHaveLength(1);
     expect(existsSync(holder.captures[0]!.socketPath)).toBe(true);
     const join = parseJoin(calls[1]!);
     expect(join.joinsNetwork).toBe(true);
     expect(Object.keys(join.env).filter((name) => /proxy/i.test(name))).toEqual([]);
+    // Nothing is read on the way, so nothing new has to be trusted.
+    expect(Object.keys(join.env).filter((name) => name in SANDBOX_TRUST_ENV)).toEqual([]);
+    expect(fakeAuthorityRuns(runner)).toHaveLength(0);
   });
 
   test("deny-all starts no capture helper: the sandbox simply has no route", async () => {
@@ -666,9 +675,9 @@ describe("network policy", () => {
     await session.setNetworkPolicy("deny-all");
     await expect(
       session.setNetworkPolicy({
-        allow: { "github.com": [{ transform: [{ headers: { authorization: "x" } }] }] },
+        allow: { "github.com": [{ forwardURL: "https://proxy.test" }] },
       }),
-    ).rejects.toThrow(/rules on a domain/);
+    ).rejects.toThrow(/forwardURL/);
     await expect(session.setNetworkPolicy("allow-some")).rejects.toThrow(/allow-all.*deny-all/);
     await session.spawn({ command: "true" });
     expect(holders()[0]!.argv).toContain("--unshare-net");
@@ -709,6 +718,146 @@ describe("network policy", () => {
     await session.killAll();
     expect(capture.killed).toBe(true);
     expect(existsSync(capture.socketPath)).toBe(false);
+  });
+});
+
+/**
+ * A domain's rules set headers on its requests, which the gateway can only do
+ * by answering the sandbox's TLS handshakes itself. The sandbox therefore has
+ * to trust an authority of its own, and a command is told so only while rules
+ * are in force.
+ */
+describe("network policy with rules", () => {
+  const rules = {
+    allow: {
+      "*": [],
+      "github.com": [{ transform: [{ headers: { authorization: "Bearer real-token" } }] }],
+    },
+  };
+  const trusted = (argv: readonly string[]) => {
+    const { env } = parseJoin(argv);
+    return Object.fromEntries(Object.entries(env).filter(([name]) => name in SANDBOX_TRUST_ENV));
+  };
+  const trustDirOf = (holder: { argv: readonly string[] }) =>
+    holder.argv[holder.argv.indexOf(SANDBOX_TRUST_DIR) - 1]!;
+
+  test("a command run under rules is told to trust the sandbox's authority", async () => {
+    const { session, calls, holders, runner } = await makeSession();
+    await session.setNetworkPolicy(rules);
+    await session.spawn({ command: "git fetch" });
+    await session.spawn({ command: "git push" });
+
+    expect(trusted(calls[0]!)).toEqual(SANDBOX_TRUST_ENV);
+    // One authority for the sandbox, signed once.
+    expect(fakeAuthorityRuns(runner)).toHaveLength(1);
+    expect(fakeAuthorityRuns(runner)[0]![0]).toBe("openssl");
+    // What the variables name is there to be read, with the host's roots kept.
+    const directory = trustDirOf(holders()[0]!);
+    expect(await readFile(path.join(directory, "authority.pem"), "utf8")).toBe(FAKE_CERTIFICATE);
+    const roots = await readFile(path.join(directory, "roots.pem"), "utf8");
+    expect(roots.endsWith(FAKE_CERTIFICATE)).toBe(true);
+    expect(roots.match(/BEGIN CERTIFICATE/g)!.length).toBeGreaterThan(1);
+  });
+
+  test("the caller's own environment still decides over the provider's", async () => {
+    const { session, calls } = await makeSession();
+    await session.setNetworkPolicy(rules);
+    await session.spawn({ command: "true", env: { SSL_CERT_FILE: "/workspace/own.pem" } });
+
+    expect(parseJoin(calls[0]!).env.SSL_CERT_FILE).toBe("/workspace/own.pem");
+    expect(parseJoin(calls[0]!).env.GIT_SSL_CAINFO).toBe(SANDBOX_TRUST_ENV.GIT_SSL_CAINFO);
+  });
+
+  /** eve leases a credential around one command: rules arrive, a command runs, rules go. */
+  test("rules arrive and leave without restarting the sandbox", async () => {
+    const { session, calls, holders } = await makeSession();
+    await session.setNetworkPolicy({ allow: ["*"] });
+    await session.spawn({ command: "before" });
+    await session.setNetworkPolicy(rules);
+    await session.spawn({ command: "during" });
+    await session.setNetworkPolicy({ allow: ["*"] });
+    await session.spawn({ command: "after" });
+
+    expect(holders()).toHaveLength(1);
+    expect(holders()[0]!.killed).toBe(false);
+    expect(calls.map((argv) => Object.keys(trusted(argv)).length > 0)).toEqual([
+      false,
+      true,
+      false,
+    ]);
+  });
+
+  test("a sandbox that shares the host network is never given the directory", async () => {
+    const { session, holders } = await makeSession();
+    await session.spawn({ command: "true" });
+    expect(holders()[0]!.argv).not.toContain(SANDBOX_TRUST_DIR);
+  });
+
+  /**
+   * A host that cannot issue certificates cannot apply rules. The policy is
+   * refused with the reason and the one in force stays, rather than each
+   * connection to a domain with rules failing with nothing to explain it.
+   */
+  test("rules the host cannot apply are refused with the reason and change nothing", async () => {
+    const running = await makeSession();
+    await running.session.setNetworkPolicy("deny-all");
+    await running.session.spawn({ command: "true" });
+    failNextAuthority(running.runner, "req: Unknown option: -CA");
+    await expect(running.session.setNetworkPolicy(rules)).rejects.toThrow(
+      /cannot issue a certificate for the network policy's rules: req: Unknown option: -CA .*OpenSSL 3/,
+    );
+    // Still deny-all: no helper is started for the next command.
+    await running.session.spawn({ command: "true" });
+    expect(running.holders()[0]!.captures).toHaveLength(0);
+    expect(trusted(running.calls[1]!)).toEqual({});
+
+    // The failure is not kept: once the host can, the policy applies.
+    await running.session.setNetworkPolicy(rules);
+    await running.session.spawn({ command: "true" });
+    expect(trusted(running.calls[2]!)).toEqual(SANDBOX_TRUST_ENV);
+  });
+
+  test("an environment opened under rules fails its first command the same way", async () => {
+    const appRoot = await mkdtemp(path.join(os.tmpdir(), "bwrap-rules-"));
+    const commands = createFakeRunner();
+    const runner = withFakeHolder(commands.runner);
+    const session = createBwrapSession({
+      id: "s1",
+      workspaceDir: appRoot,
+      cacheRoots: [],
+      runner,
+      options: resolveBwrapSandboxOptions({ networkPolicy: rules }),
+    });
+    failNextAuthority(runner, "openssl: not found");
+    await expect(session.spawn({ command: "true" })).rejects.toThrow(/openssl: not found/);
+    expect(commands.calls).toHaveLength(0);
+
+    await session.spawn({ command: "true" });
+    expect(trusted(commands.calls[0]!)).toEqual(SANDBOX_TRUST_ENV);
+  });
+
+  test("stop removes the directory and everything the authority wrote", async () => {
+    const { session, holders, runner } = await makeSession();
+    await session.setNetworkPolicy(rules);
+    await session.spawn({ command: "true" });
+    const directory = trustDirOf(holders()[0]!);
+    const authorityDirectory = path.dirname(fakeAuthorityRuns(runner)[0]![5]!);
+    expect(existsSync(path.join(authorityDirectory, "authority.key"))).toBe(true);
+    // The keys sit beside the directory the sandbox is shown, under a parent
+    // that is hidden from it wherever the host's temporary directory is.
+    expect(path.dirname(authorityDirectory)).toBe(path.dirname(directory));
+    const { argv } = holders()[0]!;
+    const hidden = argv.flatMap((arg, index) => (arg === "--tmpfs" ? [argv[index + 1]] : []));
+    expect(
+      hidden.some(
+        (entry) =>
+          path.dirname(directory).startsWith(`${entry}/`) || entry === path.dirname(directory),
+      ),
+    ).toBe(true);
+
+    await session.killAll();
+
+    expect(existsSync(path.dirname(directory))).toBe(false);
   });
 });
 

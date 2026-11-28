@@ -13,7 +13,9 @@ import { createBwrapConnection, sandboxHome } from "./connection.js";
 import type { EgressLookup } from "./egress-gateway.js";
 import { BwrapSandboxSessionGoneError, BwrapTemplateNotProvisionedError } from "./errors.js";
 import {
+  readRecordedNetworkPolicy,
   resolveNetworkPolicy,
+  restorableNetworkPolicy,
   type BwrapNetworkPolicy,
   type RecordedNetworkPolicy,
 } from "./network-policy.js";
@@ -53,8 +55,17 @@ export type BwrapPreparedArtifact = {
 export type BwrapSessionState = {
   readonly version: 1;
   readonly sessionKey: string;
-  /** The open-time policy in its recorded form: a string, or an allow-list. */
+  /**
+   * The open-time policy in its recorded form: a string, or an allow-list.
+   * Rules carry credentials, so the form only names the domains that had some.
+   */
   readonly networkPolicy: RecordedNetworkPolicy;
+  /**
+   * Set when the sandbox was opened under the environment's own policy rather
+   * than one passed to `open()`. Only then can a later sandbox for the session
+   * be given its rules again: the environment still has them.
+   */
+  readonly environmentPolicy?: true;
 };
 
 export interface CreateBwrapSandboxProviderDefinitionInput {
@@ -64,6 +75,8 @@ export interface CreateBwrapSandboxProviderDefinitionInput {
   readonly copyDirectory?: BwrapDirectoryCopier;
   /** Injectable resolver for the egress gateway, so tests need no DNS. */
   readonly egressLookup?: EgressLookup;
+  /** Authorities the egress gateway trusts besides the host's own, so tests need no public one. */
+  readonly egressUpstreamRoots?: readonly string[];
 }
 
 /** One environment's lifecycle, as eve's sandbox provider contract calls it. */
@@ -119,6 +132,7 @@ export function createBwrapSandboxProviderDefinition(
         options,
         runner: input.runner,
         egressLookup: input.egressLookup,
+        egressUpstreamRoots: input.egressUpstreamRoots,
       });
 
       // Templates live beside eve's own prepared artifacts; sessions follow
@@ -273,6 +287,25 @@ export function createBwrapSandboxProviderDefinition(
         });
       }
 
+      /**
+       * The policy a new sandbox for a recorded session starts under. Rules
+       * are never recorded, so they come back only from the environment, and
+       * only when the sandbox was opened under the environment's policy and
+       * that policy still names the same domains and ranges. Otherwise the
+       * domains that had rules are allowed without them: their requests go
+       * out as the program sends them until the session sets its rules again.
+       */
+      function recordedPolicy(state: BwrapSessionState): BwrapNetworkPolicy {
+        const environment = resolveNetworkPolicy(options.networkPolicy).recorded;
+        if (
+          state.environmentPolicy === true &&
+          JSON.stringify(environment) === JSON.stringify(state.networkPolicy)
+        ) {
+          return options.networkPolicy;
+        }
+        return restorableNetworkPolicy(state.networkPolicy);
+      }
+
       async function start(
         ctx: BwrapSessionContext,
         openOptions: Readonly<BwrapSandboxOpenOptions> | undefined,
@@ -283,14 +316,14 @@ export function createBwrapSandboxProviderDefinition(
       }> {
         // Resolved before anything is created, so a policy this provider
         // cannot enforce fails the open instead of the first command.
-        const networkPolicy = resolveNetworkPolicy(
-          openOptions?.networkPolicy ?? options.networkPolicy,
-        ).recorded;
+        const networkPolicy = openOptions?.networkPolicy ?? options.networkPolicy;
+        const { recorded } = resolveNetworkPolicy(networkPolicy);
         const workspace = await ensureWorkspace(ctx.storagePath, ctx.session.id, preparedArtifact);
         const state: BwrapSessionState = {
           version: 1,
           sessionKey: workspace.sessionKey,
-          networkPolicy,
+          networkPolicy: recorded,
+          ...(openOptions?.networkPolicy === undefined ? { environmentPolicy: true } : {}),
         };
         // `start` is an idempotent upsert: open options apply only to a
         // sandbox this call creates. A live generation another caller started,
@@ -335,7 +368,7 @@ export function createBwrapSandboxProviderDefinition(
           state.sessionKey,
           "existing",
           async (opened, created) => {
-            if (created) await opened.setNetworkPolicy(state.networkPolicy);
+            if (created) await opened.setNetworkPolicy(recordedPolicy(state));
           },
         );
         return connectionFor(session);
@@ -408,9 +441,14 @@ function requireSessionState(value: unknown): BwrapSessionState {
   }
   let networkPolicy: RecordedNetworkPolicy;
   try {
-    networkPolicy = resolveNetworkPolicy(value.networkPolicy).recorded;
+    networkPolicy = readRecordedNetworkPolicy(value.networkPolicy);
   } catch {
     throw new Error("bwrap sandbox: invalid session state");
   }
-  return { version: 1, sessionKey: value.sessionKey, networkPolicy };
+  return {
+    version: 1,
+    sessionKey: value.sessionKey,
+    networkPolicy,
+    ...(value.environmentPolicy === true ? { environmentPolicy: true } : {}),
+  };
 }

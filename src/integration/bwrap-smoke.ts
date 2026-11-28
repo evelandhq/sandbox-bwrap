@@ -6,14 +6,16 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { createServer as createTcpServer, type AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { createEgressAuthority } from "../authority.js";
 import { CAPTURE_READY_MARKER } from "../capture.js";
 import { EVE_SANDBOX_HOME_PROBE } from "../connection.js";
 import type { BwrapSandboxEvent } from "../events.js";
-import { isBwrapAvailable, isPythonAvailable } from "../process.js";
+import { createNodeProcessRunner, isBwrapAvailable, isPythonAvailable } from "../process.js";
 import type { BwrapSandboxConnection } from "../provider-contract.js";
 import {
   createBwrapSandboxProviderDefinition,
@@ -454,6 +456,25 @@ async function egressSmoke(appRoot: string): Promise<void> {
 
   const ALLOWED = "allowed.smoke.test";
   const OTHER = "other.smoke.test";
+  const RULED = "rules.smoke.test";
+  // A service over TLS, with a certificate from an authority standing in for
+  // the public ones: the gateway is told to trust it, the sandbox is not.
+  const publicAuthority = await createEgressAuthority({
+    runner: createNodeProcessRunner(),
+    opensslPath: "openssl",
+  });
+  const serviceCertificate = await publicAuthority.issue(RULED);
+  const serviceSaw: string[] = [];
+  const service = createHttpsServer(
+    { cert: serviceCertificate.certificate, key: serviceCertificate.key },
+    (req, res) => {
+      const line = `${req.method} ${req.url} authorization=${req.headers.authorization ?? "none"}`;
+      serviceSaw.push(line);
+      res.end(line);
+    },
+  );
+  await new Promise<void>((resolve) => service.listen(0, "0.0.0.0", resolve));
+  const servicePort = (service.address() as AddressInfo).port;
   // TEST-NET-2: an address nothing answers on.
   const NOWHERE = "198.51.100.7";
   const pinned = (name: string, to: number) => `--resolve ${name}:${to}:${NOWHERE}`;
@@ -462,9 +483,10 @@ async function egressSmoke(appRoot: string): Promise<void> {
   const events: BwrapSandboxEvent[] = [];
   const environment = createBwrapSandboxProviderDefinition({
     egressLookup: async (host) => {
-      if (host === ALLOWED) return [address];
+      if (host === ALLOWED || host === RULED) return [address];
       throw new Error(`no such host ${host}`);
     },
+    egressUpstreamRoots: [publicAuthority.certificate],
   }).environment({ onEvent: (event) => void events.push(event) });
   const artifact = await environment.prepare({
     storagePath,
@@ -640,11 +662,124 @@ print(peer[0], struct.unpack('!H', r[:2])[0] == 0x4242, r[3] & 15)
     "moving among restricted policies must not restart the sandbox",
   );
 
+  // Rules. The sandbox holds a placeholder; the gateway answers the
+  // handshake itself, swaps the placeholder for the credential, and sends the
+  // request on. This is the shape eve's GitHub tools lease a token in.
+  const REAL = "Bearer smoke-real-token";
+  const lease = {
+    allow: {
+      [ALLOWED]: [],
+      [RULED]: [
+        {
+          match: { path: { startsWith: "/repo.git/" } },
+          transform: [{ headers: { authorization: "Basic smoke-git-token" } }],
+        },
+        {
+          match: {
+            headers: [{ key: { exact: "authorization" }, value: { exact: "Bearer placeholder" } }],
+          },
+          transform: [{ headers: { authorization: REAL } }],
+        },
+      ],
+    },
+  };
+  await connection.extensions.setNetworkPolicy(lease);
+  const ruled = `${pinned(RULED, servicePort)} https://${RULED}:${servicePort}`;
+  const withPlaceholder = `curl -sS --max-time 10 -H 'Authorization: Bearer placeholder'`;
+  assert.equal(
+    (await runOver(connection, `${withPlaceholder} ${ruled}/api?x=1`)).stdout,
+    `GET /api?x=1 authorization=${REAL}`,
+    "a matching request must reach the service with the rule's header",
+  );
+  assert.equal(
+    (
+      await runOver(
+        connection,
+        `curl -sS --max-time 10 -H 'Authorization: Bearer mine' -d body ${ruled}/api`,
+      )
+    ).stdout,
+    "POST /api authorization=Bearer mine",
+    "a request no rule matches must go out as it was sent",
+  );
+  // Node trusts the authority through its own variable.
+  const fromNodeTls = await runOver(
+    connection,
+    `node -e "require('https').get({host:'${NOWHERE}',port:${servicePort},servername:'${RULED}',path:'/node',headers:{host:'${RULED}:${servicePort}',authorization:'Bearer placeholder'}},r=>r.pipe(process.stdout))"`,
+  );
+  assert.equal(
+    fromNodeTls.stdout,
+    `GET /node authorization=${REAL}`,
+    "Node must trust the authority",
+  );
+  // git, which sends no credential of its own: the rule adds one.
+  await runOver(
+    connection,
+    `GIT_TERMINAL_PROMPT=0 git -c http.curloptResolve=${RULED}:${servicePort}:${NOWHERE} ls-remote https://${RULED}:${servicePort}/repo.git 2>&1; true`,
+  );
+  assert.ok(
+    serviceSaw.includes(
+      "GET /repo.git/info/refs?service=git-upload-pack authorization=Basic smoke-git-token",
+    ),
+    `git must reach the service with the rule's credential; the service saw ${JSON.stringify(serviceSaw)}`,
+  );
+  // The credential is nowhere the sandbox can read.
+  const leaked = await runOver(
+    connection,
+    "{ env; cat /tmp/.bwrap-sandbox/* /proc/self/environ; } 2>/dev/null | grep -ac smoke-real-token || true",
+  );
+  assert.equal(leaked.stdout.trim(), "0", "a rule's credential must not be visible in the sandbox");
+  // The handshake is the gateway's: a client that does not trust the sandbox
+  // authority refuses it, and the service's own authority is not one the
+  // sandbox was given.
+  const untrusting = await runOver(
+    connection,
+    `env -u CURL_CA_BUNDLE -u SSL_CERT_FILE ${withPlaceholder} ${ruled}/untrusted; echo "exit=$?"`,
+  );
+  assert.match(
+    untrusting.stdout,
+    /exit=60$/m,
+    "only the sandbox authority's certificate is offered",
+  );
+  assert.notEqual(
+    (await runOver(connection, "touch /tmp/.bwrap-sandbox/x")).exitCode,
+    0,
+    "the sandbox must not be able to change what it is told to trust",
+  );
+  // A credential is set for one domain and goes nowhere else: not to another
+  // host named on the same connection, and not over a connection anyone can read.
+  assert.equal(
+    await status(`${withPlaceholder} -H 'Host: ${OTHER}' ${ruled}/fronted`),
+    "421",
+    "a request that names another host must be refused",
+  );
+  assert.equal(
+    await status(`curl ${pinned(RULED, port)} http://${RULED}:${port}/`),
+    "403",
+    "a domain with rules must not be reachable in the clear",
+  );
+  assert.ok(
+    !serviceSaw.some((line) => /fronted|untrusted/.test(line)),
+    "a refused request must not reach the service",
+  );
+  // The lease ends: the same domain is passed on as it is, and the program
+  // is back to talking to the service itself.
+  await connection.extensions.setNetworkPolicy({ allow: [ALLOWED, RULED] });
+  assert.equal(
+    (await runOver(connection, `${withPlaceholder} -k ${ruled}/after`)).stdout,
+    "GET /after authorization=Bearer placeholder",
+    "without rules a request must reach the service unread",
+  );
+  assert.equal(
+    (await runOver(connection, "cat /tmp/egress-note")).stdout,
+    "kept\n",
+    "rules must come and go without restarting the sandbox",
+  );
+
   await assert.rejects(
     connection.extensions.setNetworkPolicy({
-      allow: { [ALLOWED]: [{ transform: [{ headers: { authorization: "x" } }] }] },
-    } as never),
-    /rules on a domain/,
+      allow: { [ALLOWED]: [{ forwardURL: "https://proxy.smoke.test" }] },
+    }),
+    /forwardURL/,
   );
 
   assert.equal((await captureHelpers()).length, 1, "one capture helper per sandbox");
@@ -654,8 +789,11 @@ print(peer[0], struct.unpack('!H', r[:2])[0] == 0x4242, r[3] & 15)
   web.closeAllConnections();
   await new Promise<void>((resolve) => web.close(() => resolve()));
   await new Promise<void>((resolve) => raw.close(() => resolve()));
+  service.closeAllConnections();
+  await new Promise<void>((resolve) => service.close(() => resolve()));
+  await publicAuthority.close();
   console.log(
-    "EGRESS SMOKE: capture of every connection and DNS query, allow-list by domain and range, refusal, tamper resistance, live policy change, and deny-all held under real bwrap",
+    "EGRESS SMOKE: capture of every connection and DNS query, allow-list by domain and range, refusal, tamper resistance, live policy change, deny-all, and header rules applied to curl, Node, and git held under real bwrap",
   );
 }
 

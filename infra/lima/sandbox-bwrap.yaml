@@ -41,7 +41,7 @@ provision:
 
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
-      apt-get install -y apparmor bash bubblewrap ca-certificates curl iproute2 nftables python3
+      apt-get install -y apparmor bash bubblewrap ca-certificates curl git iproute2 nftables openssl python3
       curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
       apt-get install -y nodejs
       corepack enable

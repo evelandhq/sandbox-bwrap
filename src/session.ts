@@ -1,7 +1,8 @@
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, mkdtempSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import os from "node:os";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import {
   buildBwrapHolderArgs,
@@ -9,6 +10,7 @@ import {
   DEFAULT_SANDBOX_PATH,
   SANDBOX_AGENT_ENV,
 } from "./args.js";
+import { createEgressAuthority, type EgressAuthority } from "./authority.js";
 import { startNetworkCapture, type NetworkCapture } from "./capture.js";
 import { startEgressGateway, type EgressGateway, type EgressLookup } from "./egress-gateway.js";
 import { startBwrapHolder, type BwrapHolder } from "./holder.js";
@@ -21,6 +23,7 @@ import {
   WORKSPACE_ROOT,
 } from "./paths.js";
 import type { ProcessRunner, SpawnedProcess } from "./process.js";
+import { publishAuthority, readHostRoots, SANDBOX_TRUST_ENV } from "./trust.js";
 import type {
   BwrapCommandFinishReason,
   BwrapSandboxEvent,
@@ -43,6 +46,8 @@ export interface CreateBwrapSessionInput {
   readonly onStopped?: () => void | Promise<void>;
   /** Injectable resolver for the egress gateway, so tests need no DNS. */
   readonly egressLookup?: EgressLookup;
+  /** Authorities the egress gateway trusts besides the host's own, so tests need no public one. */
+  readonly egressUpstreamRoots?: readonly string[];
 }
 
 function isMissingFileError(error: unknown): boolean {
@@ -99,6 +104,11 @@ export interface BwrapSession {
    * policy, after commands still in flight have finished. Moving among the
    * restricted policies takes effect at once, on processes already running
    * too.
+   *
+   * A policy whose domains carry rules has the sandbox trust a certificate
+   * authority of its own, through variables set for each command started
+   * while such a policy is in force. A process started before then does not
+   * trust it, and its connections to those domains fail.
    */
   setNetworkPolicy(policy: unknown): Promise<void>;
   /**
@@ -186,9 +196,58 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     egress ??= startEgressGateway({
       policy: networkPolicy,
       ...(input.egressLookup ? { lookup: input.egressLookup } : {}),
+      ...(input.egressUpstreamRoots ? { upstreamRoots: input.egressUpstreamRoots } : {}),
+      authority: ensureAuthority,
       onDenied: ({ host, port }) => emit({ type: "network.denied", host, port }),
     });
     return egress;
+  }
+
+  /**
+   * A host directory for what this generation keeps beside its workspace. It
+   * is hidden from the generation's sandboxes, like the cache roots, except
+   * for `trust` inside it: every restricted sandbox sees that directory
+   * read-only at `SANDBOX_TRUST_DIR`. It is empty until a policy with rules
+   * needs an authority.
+   */
+  let privateDirectory: string | undefined;
+  function privateDir(): string {
+    if (privateDirectory === undefined) {
+      privateDirectory = mkdtempSync(join(os.tmpdir(), "bwrap-generation-"));
+      mkdirSync(join(privateDirectory, "trust"));
+    }
+    return privateDirectory;
+  }
+  const trustDir = () => join(privateDir(), "trust");
+
+  /**
+   * The certificate authority of this generation, created the first time a
+   * policy has rules and published where its sandboxes read what to trust.
+   * A failure is not kept: the next policy that needs one tries again.
+   */
+  let authority: Promise<EgressAuthority> | undefined;
+  function ensureAuthority(): Promise<EgressAuthority> {
+    if (authority === undefined) {
+      const pending = (async () => {
+        const created = await createEgressAuthority({
+          runner,
+          opensslPath: options.opensslPath,
+          parentDirectory: privateDir(),
+        });
+        try {
+          await publishAuthority(trustDir(), created.certificate, await readHostRoots());
+        } catch (error) {
+          await created.close().catch(() => {});
+          throw error;
+        }
+        return created;
+      })();
+      authority = pending;
+      pending.catch(() => {
+        if (authority === pending) authority = undefined;
+      });
+    }
+    return authority;
   }
 
   /**
@@ -225,9 +284,18 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
   function startSlot(shareNetwork: boolean): HolderSlot {
     // Evaluated when the sandbox starts, not per command: a path that appears
     // on the host afterwards is not hidden until the next holder.
-    const hidePaths = [...new Set([...cacheRoots, ...options.hidePaths])].filter((path) =>
-      existsSync(path),
-    );
+    // Only a sandbox with a network of its own can come under rules.
+    const trust = shareNetwork ? undefined : trustDir();
+    const hidePaths = [
+      ...new Set([
+        ...cacheRoots,
+        ...options.hidePaths,
+        // Under `/tmp` the sandbox's own `/tmp` already covers it.
+        ...(privateDirectory === undefined || privateDirectory.startsWith("/tmp/")
+          ? []
+          : [privateDirectory]),
+      ]),
+    ].filter((path) => existsSync(path));
     const slot: HolderSlot = {
       shareNetwork,
       ready: startBwrapHolder({
@@ -238,6 +306,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
           workspaceDir,
           hidePaths,
           shareNetwork,
+          ...(trust === undefined ? {} : { trustDir: trust }),
         }),
       }),
       commands: 0,
@@ -521,9 +590,16 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
     // Under an allow-list the sandbox's traffic has to reach the gateway
     // before the command runs. If that cannot be arranged, the command fails
     // rather than run with no route to the destinations it was allowed.
+    // Rules need more: the gateway answers the sandbox's handshakes itself,
+    // so the command has to be told to trust the authority it answers with.
+    let ruled = false;
     if (!holder.shareNetwork && networkPolicy.kind === "allow-list") {
       try {
         await ensureCapture(slot, holder);
+        if (networkPolicy.hasRules) {
+          await ensureAuthority();
+          ruled = true;
+        }
       } catch (error) {
         releaseSlot(slot);
         throw error;
@@ -534,6 +610,7 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
       HOME: WORKSPACE_ROOT,
       LANG: "C.UTF-8",
       ...SANDBOX_AGENT_ENV,
+      ...(ruled ? SANDBOX_TRUST_ENV : {}),
       ...options.env,
       ...spawnOptions.env,
     };
@@ -598,6 +675,25 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
             ])),
           );
         }
+        if (authority) {
+          const issuing = authority;
+          authority = undefined;
+          results.push(
+            ...(await Promise.allSettled([
+              issuing.then(
+                async (created) => await created.close(),
+                () => {},
+              ),
+            ])),
+          );
+        }
+        if (privateDirectory !== undefined) {
+          const directory = privateDirectory;
+          privateDirectory = undefined;
+          results.push(
+            ...(await Promise.allSettled([rm(directory, { force: true, recursive: true })])),
+          );
+        }
         const failures = results.flatMap((result) =>
           result.status === "rejected" ? [result.reason] : [],
         );
@@ -655,10 +751,14 @@ export function createBwrapSession(input: CreateBwrapSessionInput): BwrapSession
 
     async setNetworkPolicy(policy: unknown) {
       const next = resolveNetworkPolicy(policy);
+      // Whatever the new policy needs is arranged first, while the gateway
+      // still holds the old one: if any of it fails, the policy is left as it
+      // was. Rules need an authority to answer under, and a host that cannot
+      // issue certificates refuses the policy instead of the connections.
+      if (next.kind === "allow-list" && next.hasRules) await ensureAuthority();
       // A sandbox already running under "deny-all" has no route, and what a
       // command left running in it must be able to reach what the new policy
-      // allows. Arranged first, while the gateway still refuses everything:
-      // if it fails, the policy is left as it was.
+      // allows.
       if (next.kind === "allow-list" && current && !current.shareNetwork) {
         const slot = current;
         const holder = await slot.ready.catch(() => undefined);

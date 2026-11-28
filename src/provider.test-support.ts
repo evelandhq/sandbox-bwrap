@@ -2,6 +2,7 @@ import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { HOLDER_READY_MARKER } from "./args.js";
+import { isAuthorityArgs } from "./authority.js";
 import { CAPTURE_READY_MARKER, isNetworkCaptureArgs } from "./capture.js";
 import type { ProcessRunner } from "./process.js";
 
@@ -88,6 +89,22 @@ export function failNextCapture(runner: ProcessRunner, message: string): void {
   captureFailures.set(withFakeHolder(runner), message);
 }
 
+/** What a fake `openssl` prints for a certificate: enough to be taken for one, and no more. */
+export const FAKE_CERTIFICATE =
+  "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n";
+
+/** Makes the next `openssl` run through `runner` fail the way a host with an old OpenSSL does. */
+export function failNextAuthority(runner: ProcessRunner, message: string): void {
+  authorityFailures.set(withFakeHolder(runner), message);
+}
+
+/** The `openssl` runs made through a runner `withFakeHolder` wrapped, oldest first. */
+export function fakeAuthorityRuns(runner: ProcessRunner): readonly (readonly string[])[] {
+  return authorityRunsOf.get(withFakeHolder(runner)) ?? [];
+}
+
+const authorityFailures = new WeakMap<ProcessRunner, string>();
+const authorityRunsOf = new WeakMap<ProcessRunner, string[][]>();
 const captureFailures = new WeakMap<ProcessRunner, string>();
 const holderAware = new WeakMap<ProcessRunner, ProcessRunner>();
 const holdersOf = new WeakMap<ProcessRunner, FakeHolder[]>();
@@ -113,8 +130,21 @@ export function withFakeHolder(runner: ProcessRunner): ProcessRunner {
   const known = holderAware.get(runner);
   if (known !== undefined) return known;
   const holders: FakeHolder[] = [];
+  const authorityRuns: string[][] = [];
   const wrapped: ProcessRunner = {
     spawn(argv, options) {
+      if (isAuthorityArgs(argv)) {
+        authorityRuns.push([...argv]);
+        const failure = authorityFailures.get(wrapped);
+        authorityFailures.delete(wrapped);
+        return {
+          pid: 6_000,
+          stdout: textStream(failure === undefined ? FAKE_CERTIFICATE : ""),
+          stderr: textStream(failure ?? ""),
+          wait: async () => ({ exitCode: failure === undefined ? 0 : 1 }),
+          kill: async () => {},
+        };
+      }
       if (isNetworkCaptureArgs(argv)) {
         const target = holders.find((holder) => holder.targetPid === Number(argv[5]));
         const failure = captureFailures.get(wrapped);
@@ -172,6 +202,7 @@ export function withFakeHolder(runner: ProcessRunner): ProcessRunner {
   holderAware.set(runner, wrapped);
   holderAware.set(wrapped, wrapped);
   holdersOf.set(wrapped, holders);
+  authorityRunsOf.set(wrapped, authorityRuns);
   return wrapped;
 }
 
